@@ -74,9 +74,13 @@ index identifies the culprit. Run `pmmu-safe` to completion first.
 
 Bootable ADFs for the Minimig TG68K-030/MMU build and real 68030+MMU
 Amigas — **68030+MMU only** (startup gate refuses anything else). Raw
-disk layout, no filesystem; full design + bring-up findings in
-`AMIGA_TESTBENCH.md`. On MiSTer, mount the ADF directly; on a real
-Amiga use a Gotek or write a physical floppy.
+disk layout, no filesystem; design in `AMIGA_TESTBENCH.md`, usage in
+`preboot/amiga/README.md`, troubleshooting in
+`preboot/amiga/DEBUGGING.md`. **The raw `.adf` files are committed
+right here** (`amiga-*.adf`) — copy straight to the MiSTer SD card;
+per-fixture tgz alongside, and
+`maciivi-testbench-all-<date>.tgz` bundles every image (12 Mac
+.hda/.dsk + 3 ADFs) in one download.
 
 | Fixture | Suite |
 |---|---|

@@ -76,6 +76,7 @@ if [[ "${1:-}" == "--package" ]]; then
           tar czf "amiga-$fx-$STAMP.tgz" "amiga-$fx.adf"
       done
       sha256sum amiga-*.tgz amiga-*.adf > SHA256SUMS.amiga )
-    cp -f "$STAGE"/amiga-*-"$STAMP".tgz "$STAGE/SHA256SUMS.amiga" "$OUTDIR/"
+    # raw ADFs are committed too — directly mountable from a checkout
+    cp -f "$STAGE"/amiga-*.adf "$STAGE"/amiga-*-"$STAMP".tgz "$STAGE/SHA256SUMS.amiga" "$OUTDIR/"
     ls -la "$OUTDIR" | grep amiga
 fi
