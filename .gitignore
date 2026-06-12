@@ -1,0 +1,9 @@
+# verilator build outputs
+SingleStepTests/*/obj_dir/
+# preboot / macos_bench build dirs (each also has a local .gitignore)
+SingleStepTests/preboot/*/build/
+SingleStepTests/macos_bench/build/
+# corpus generator binaries
+SingleStepTests/gen/gen
+*.o
+*.elf
