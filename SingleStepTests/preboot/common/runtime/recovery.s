@@ -29,10 +29,14 @@ g_resume_sp:    .long 0
 g_resume_pc:    .long 0
 g_last_vector:  .long 0     | set by recovery_stub before jumping back
 g_tc_disable:   .long 0     | PMOVE source that forces TC.E=0 (PMMU builds)
+orig_vbr:       .long 0     | the OS's VBR at install_vbr time
+g_vbr_ready:    .word 0     | nonzero once vbr_table is populated
 
     .bss
     .align 4
+    .global vbr_table
 vbr_table:      .space 1024     | 256 vectors * 4 bytes
+orig_vec_32_63: .space 128      | OS originals of vectors 32..63
 
     .text
 
@@ -40,9 +44,17 @@ vbr_table:      .space 1024     | 256 vectors * 4 bytes
 install_vbr:
     movem.l %d0-%d2/%a0-%a2, -(%sp)
 
+    | Idempotent: the Amiga payload calls this from the gate AND from
+    | the shared bench_main. A second run would re-capture orig_vbr as
+    | OUR OWN table and copy it onto itself — poisoning the platform
+    | I/O bracket's use_os_vbr with a stubbed table.
+    tst.w   g_vbr_ready
+    bne     install_vbr_done
+
     | 0x4E7A 8801: movec VBR, A0 (bit 15 of operand word = An, bits 11..0 = $801 for VBR)
     .short  0x4E7A
     .short  0x8801
+    move.l  %a0, orig_vbr
     lea     vbr_table, %a1
     move.w  #255, %d0
 1:
@@ -77,6 +89,19 @@ install_vbr:
     | that IRQ into recovery_core jumped to a stale resume PC, so the
     | write never returned. (iotest never installed these and writes
     | fine; that was the tell.)
+
+    | Save the OS originals of vectors 32..63 first. On AmigaOS the
+    | exec SuperState()/Supervisor() path itself goes through a TRAP
+    | vector — stealing 32..47 wholesale hangs the next exec call
+    | (found the hard way under FS-UAE; the Mac twin of this lesson is
+    | vector 10 / Line A above). The platform I/O bracket restores
+    | these originals around every OS call via restore_os_traps /
+    | install_recovery_traps below.
+    lea     (32*4)(%a1), %a0
+    lea     orig_vec_32_63, %a2
+    moveq   #31, %d0
+2:  move.l  (%a0)+, (%a2)+
+    dbra    %d0, 2b
 
     | TRAP #0..#15 (vectors 32..47). Exception tests issue TRAP #N to
     | verify the trap vector; without these overrides they fall through
@@ -122,12 +147,98 @@ install_vbr:
     move.l  #recovery_stub_v63, (63*4)(%a1)
 
     | Now switch VBR to our table.
+    move.w  #1, g_vbr_ready
     lea     vbr_table, %a0
     | 0x4E7B 8801: movec A0, VBR
     .short  0x4E7B
     .short  0x8801
 
+install_vbr_done:
     movem.l (%sp)+, %d0-%d2/%a0-%a2
+    rts
+
+| ---- use_os_vbr / use_recovery_vbr -----------------------------------
+| Swap the WHOLE vector base between the OS's original table and ours.
+| Lesson from FS-UAE bring-up: restoring only the TRAP vectors is not
+| enough — exec's Supervisor()/SuperState() reach supervisor mode by
+| deliberately faulting from user mode (privilege violation, vector 8),
+| so ANY stubbed exception vector poisons OS calls with a stale-context
+| longjmp. The platform I/O bracket flips the entire VBR instead.
+    .global use_os_vbr
+use_os_vbr:
+    move.l  %a0, -(%sp)
+    move.l  orig_vbr, %a0
+    .short  0x4E7B
+    .short  0x8801
+    move.l  (%sp)+, %a0
+    rts
+
+    .global use_recovery_vbr
+use_recovery_vbr:
+    move.l  %a0, -(%sp)
+    | Never point VBR at an unpopulated table (1 KB of zero vectors).
+    tst.w   g_vbr_ready
+    beq     1f
+    lea     vbr_table, %a0
+    .short  0x4E7B
+    .short  0x8801
+1:  move.l  (%sp)+, %a0
+    rts
+
+| ---- restore_os_traps / install_recovery_traps ----------------------
+| Swap vectors 32..63 between the OS originals and the recovery stubs.
+| The platform jsonl/diagnostic bracket wraps every OS call with these
+| so exec's own TRAP-based plumbing works while the bench still owns
+| the vectors during test execution.
+    .global restore_os_traps
+restore_os_traps:
+    movem.l %d0/%a0-%a1, -(%sp)
+    lea     orig_vec_32_63, %a0
+    lea     vbr_table, %a1
+    lea     (32*4)(%a1), %a1
+    moveq   #31, %d0
+1:  move.l  (%a0)+, (%a1)+
+    dbra    %d0, 1b
+    movem.l (%sp)+, %d0/%a0-%a1
+    rts
+
+    .global install_recovery_traps
+install_recovery_traps:
+    movem.l %a1, -(%sp)
+    lea     vbr_table, %a1
+    move.l  #recovery_stub_v32, (32*4)(%a1)
+    move.l  #recovery_stub_v33, (33*4)(%a1)
+    move.l  #recovery_stub_v34, (34*4)(%a1)
+    move.l  #recovery_stub_v35, (35*4)(%a1)
+    move.l  #recovery_stub_v36, (36*4)(%a1)
+    move.l  #recovery_stub_v37, (37*4)(%a1)
+    move.l  #recovery_stub_v38, (38*4)(%a1)
+    move.l  #recovery_stub_v39, (39*4)(%a1)
+    move.l  #recovery_stub_v40, (40*4)(%a1)
+    move.l  #recovery_stub_v41, (41*4)(%a1)
+    move.l  #recovery_stub_v42, (42*4)(%a1)
+    move.l  #recovery_stub_v43, (43*4)(%a1)
+    move.l  #recovery_stub_v44, (44*4)(%a1)
+    move.l  #recovery_stub_v45, (45*4)(%a1)
+    move.l  #recovery_stub_v46, (46*4)(%a1)
+    move.l  #recovery_stub_v47, (47*4)(%a1)
+    move.l  #recovery_stub_v48, (48*4)(%a1)
+    move.l  #recovery_stub_v49, (49*4)(%a1)
+    move.l  #recovery_stub_v50, (50*4)(%a1)
+    move.l  #recovery_stub_v51, (51*4)(%a1)
+    move.l  #recovery_stub_v52, (52*4)(%a1)
+    move.l  #recovery_stub_v53, (53*4)(%a1)
+    move.l  #recovery_stub_v54, (54*4)(%a1)
+    move.l  #recovery_stub_v55, (55*4)(%a1)
+    move.l  #recovery_stub_v56, (56*4)(%a1)
+    move.l  #recovery_stub_v57, (57*4)(%a1)
+    move.l  #recovery_stub_v58, (58*4)(%a1)
+    move.l  #recovery_stub_v59, (59*4)(%a1)
+    move.l  #recovery_stub_v60, (60*4)(%a1)
+    move.l  #recovery_stub_v61, (61*4)(%a1)
+    move.l  #recovery_stub_v62, (62*4)(%a1)
+    move.l  #recovery_stub_v63, (63*4)(%a1)
+    movem.l (%sp)+, %a1
     rts
 
 | ---- recovery_stub_vN ----------------------------------------------
@@ -219,10 +330,15 @@ recovery_core:
 | Writing 0x00 = solid white pixel block, 0xFF = black; we write 0x00.
 | Five distinct rows here so each phase paints a distinct dot column.
 | DOT macro uses A1 so it doesn't disturb the A0 we're setting up for jsr.
+| NO_SCRNBASE_DOT (--defsym): the DOTs read Mac low-mem $0824, which on
+| a non-Mac (Amiga) is arbitrary chip RAM -> the write could land
+| anywhere. Assemble them away on other platforms.
     .macro DOT col
+    .ifndef NO_SCRNBASE_DOT
     move.l  0x0824, %a1
     add.l   #(52 * 80 + 16 + \col), %a1
     move.b  #0x00, (%a1)
+    .endif
     .endm
 
 invoke_test_with_recovery:

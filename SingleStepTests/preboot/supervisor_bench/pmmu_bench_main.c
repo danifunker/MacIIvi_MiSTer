@@ -95,7 +95,15 @@ extern int  invoke_test_with_recovery(u8 *entry);
 extern void paint_string(u32 row, u32 col_byte, const char *s, u32 max_chars);
 extern void display_wipe(u32 rows);
 
+extern char _payload_start;         /* from the entry shim */
 extern char _payload_bss_end;       /* from payload.ld */
+
+/* 64K blocks the payload occupies — identity-mapped during live rows
+ * and masked out of the emitted levb window (runner artifact, not
+ * corpus state). Mac payloads load at $40000 (blocks 4..6 historically);
+ * the Amiga payload loads at $80000 (blocks 8+). */
+static u32 payload_block_first(void) { return ((u32)&_payload_start) >> 16; }
+static u32 payload_block_last(void)  { return (((u32)&_payload_bss_end) - 1) >> 16; }
 
 /* ---- Relocated corpus regions ------------------------------------- */
 #define ALIGN16   __attribute__((aligned(16)))
@@ -410,11 +418,13 @@ static void apply_test(const PmmuTestSpec *t)
 
     /* Runner-owned identity mappings for the payload's own 64K blocks
      * (needed while TC.E=1; harmless otherwise). Masked to zero when
-     * the levb window is emitted. Blocks 4..6 cover $40000-$6FFFF;
-     * bench_main warns if the payload outgrows that. */
-    g_levb[4] = 0x00040001u;
-    g_levb[5] = 0x00050001u;
-    g_levb[6] = 0x00060001u;
+     * the levb window is emitted. Must stay clear of the corpus-owned
+     * slots 0 and 7 — bench_main warns if they collide. */
+    {
+        u32 b;
+        for (b = payload_block_first(); b <= payload_block_last() && b < 16; b++)
+            g_levb[b] = (b << 16) | 1u;
+    }
 
     /* MMU staging (aptrs relocated). */
     g_mmu_init[0] = t->tc;
@@ -475,7 +485,15 @@ static void write_reloc_header(JsonlWriter *w)
     jw_puts(w, ",\"remap2\":");   jw_putul(w, (u32)g_remap2);
     jw_puts(w, ",\"stack_top\":");jw_putul(w, STACK_TOP_EQ);
     jw_puts(w, ",\"tc_off\":");   jw_putul(w, (u32)&g_tc_off_slot);
-    jw_puts(w, ",\"masked_levb_slots\":[4,5,6]");
+    {
+        u32 b; int first = 1;
+        jw_puts(w, ",\"masked_levb_slots\":[");
+        for (b = payload_block_first(); b <= payload_block_last() && b < 16; b++) {
+            if (!first) jw_putc(w, ',');
+            jw_putul(w, b); first = 0;
+        }
+        jw_putc(w, ']');
+    }
     jw_puts(w, ",\"rom_tc\":");        jw_putul(w, g_rom_mmu[0]);
     jw_puts(w, ",\"rom_tt0\":");       jw_putul(w, g_rom_mmu[1]);
     jw_puts(w, ",\"rom_tt1\":");       jw_putul(w, g_rom_mmu[2]);
@@ -536,9 +554,9 @@ void bench_main(void)
      * $40000-$5FFFF. If it ever grows past that, refuse live rows
      * rather than double-fault mid-test. */
     {
-        u32 bss_end = (u32)&_payload_bss_end;
-        if (bss_end > 0x70000u)
-            paint_string(8, 4, "WARN payload > $70000: live rows unsafe", 44);
+        u32 b0 = payload_block_first(), b1 = payload_block_last();
+        if (b1 >= 16 || b0 == 0 || (b0 <= 7 && b1 >= 7))
+            paint_string(8, 4, "WARN payload blocks collide w/ corpus map", 44);
     }
 
     write_reloc_header(w);
@@ -623,8 +641,10 @@ void bench_main(void)
              * runner-owned levb slots */
             {
                 u32 levb_copy[16];
+                u32 b;
                 for (i = 0; i < 16; i++) levb_copy[i] = g_levb[i];
-                levb_copy[4] = 0; levb_copy[5] = 0; levb_copy[6] = 0;
+                for (b = payload_block_first(); b <= payload_block_last() && b < 16; b++)
+                    levb_copy[b] = 0;
                 jw_puts(w, ",\"windows\":[");
                 write_window(w, 0x1800, g_data, 0x40, 1);
                 write_window(w, 0x3000, (const u8 *)g_root, 0x40, 0);

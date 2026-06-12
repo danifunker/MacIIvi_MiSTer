@@ -70,6 +70,36 @@ index identifies the culprit. Run `pmmu-safe` to completion first.
 | `.dsk` floppy boot | ⏳ not MAME-verifiable headless (known MAME floppy-boot limitation); same payload bytes as `.hda` |
 | V8/VASP `autovideo` stride on real hardware | ⏳ pending LC II; falls back to 80 B if ScrnRow is implausible |
 
+## Amiga fixtures (2026-06-12)
+
+Bootable ADFs for the Minimig TG68K-030/MMU build and real 68030+MMU
+Amigas — **68030+MMU only** (startup gate refuses anything else). Raw
+disk layout, no filesystem; full design + bring-up findings in
+`AMIGA_TESTBENCH.md`. On MiSTer, mount the ADF directly; on a real
+Amiga use a Gotek or write a physical floppy.
+
+| Fixture | Suite |
+|---|---|
+| `amiga-cpu` | CPU corpus (721 rows incl. 030 discriminators) |
+| `amiga-pmmu-safe` | PMMU hw-safe rows (32 of 40) — **run first** |
+| `amiga-pmmu-full` | all 40 PMMU rows incl. live translation + faults |
+
+Extract results from byte offset `0x78000` of the ADF (no tooling
+needed): `python3 -c "open('out.jsonl','wb').write(open('x.adf','rb').read()[0x78000:0xDC000].rstrip(b'\x00'))"`,
+then diff with `gen/pmmu_diff_corpus.py`. Diagnostic marker slots at
+`0xD8000+` identify exactly how far a failed boot got (see
+AMIGA_TESTBENCH.md §2).
+
+Verification status: all three boot-verified end-to-end on FS-UAE
+A3000 (68030+MMU, KS 3.2). PMMU-full: 32/40 vs the MAME baseline with
+all live-translation and fault rows passing; the 8 divergent rows are
+documented FS-UAE↔MAME emulator-model disagreements
+(AMIGA_TESTBENCH.md §5b) awaiting real-silicon adjudication. CPU: 720
+rows, EXC vectors as designed; CACR mask reads `$3313` (vs MAME
+`$FF13`) and RTM traps vec 4 (vs MAME no-op) — both supporting the
+real-silicon predictions against MAME. Archived runs:
+`results/amiga/`.
+
 ## Rebuilding
 
 ```

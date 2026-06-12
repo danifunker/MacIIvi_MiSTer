@@ -62,25 +62,38 @@ halts. On the custom Minimig core, a failing probe is itself signal
 
 ### Payload placement
 
-Linked at a fixed chip-RAM address (`0x40000`, mirroring the Mac
-layout) and claimed via `AllocAbs()` right after boot — at bootblock
-time essentially nothing else is allocated; a failed `AllocAbs` paints
-an error rather than stomping Exec. Corpus low-address relocation is
+Linked at a fixed chip-RAM address (**`0x80000`** — clear of the OS's
+early bottom-up allocations and, for the PMMU runner's dynamic
+identity mapping, of the corpus-owned levb slots 0/7) and claimed via
+`AllocAbs()` from the bootblock; a failed `AllocAbs` flashes the
+screen rather than stomping Exec. Corpus low-address relocation is
 already handled by the existing runner design (payload statics), so
 Exec's low chip-RAM structures are never touched by tests.
 
-### Disk format
+### Disk format (implemented: raw layout — simpler than the FFS plan)
 
-ADF (880 KB), formatted **FFS** so data blocks are raw 512-byte
-sectors (OFS blocks carry 24-byte headers — would break sector-offset
-writing). Our custom bootblock executes regardless of the FS flag
-(the strap validates `DOS` magic + checksum only; we never start a
-DOS handler), but FFS *extraction tooling* and KS-1.3-era quirks make
-**Kickstart 2.0+ (3.1 recommended)** the supported floor — all agreed
-targets (Minimig 3.1, A3000, FS-UAE) qualify. Build-time check: the
-payload and `/Results.jsonl` block runs must be contiguous on the
-fresh ADF (they are, on a just-formatted volume; the build script
-verifies and fails otherwise — same trick as the Mac `rb-cli` flow).
+ADF (880 KB) with **no filesystem at all**: the strap only validates
+the bootblock's `DOS` magic + checksum, and we never start a DOS
+handler, so the disk needs no volume structure. Fixed raw layout:
+
+| bytes | contents |
+|---|---|
+| `0x00000-0x003FF` | boot block (checksummed; `PAYLLEN!`/`ALLOCLN!` patch slots) |
+| `0x00400-...` | payload flat binary |
+| `0x78000-0xDBFFF` | results region — raw `Results.jsonl` stream (400 KB) |
+| `0xD8000-0xD9FFF` | diagnostic marker slots (overlap the results tail; see below) |
+
+This eliminates the FFS-extension-block contiguity problem outright;
+host-side extraction is a `dd`/python slice at `0x78000` (and on
+MiSTer the ADF is just a file on SD). Kickstart floor stays 2.0+
+(3.1/3.2 on all agreed targets).
+
+**Diagnostic marker slots** (512 B each, written via the same takeover
+bracket as the results writer — gold for headless/MiSTer bring-up):
+slot 0 `0xD8000` bootblock ran + writes land; slot 1 `0xD8200` payload
+entry reached; slot 2 GAT0 bracket works; slot 4 `'ATN'`+AttnFlags;
+slot 5 VBRI vectors installed; slot 6 `'VEC'`+probe vector; slot 3
+GATE gate passed.
 
 ## 3. Deliverables
 
@@ -158,6 +171,40 @@ package tgz.
 
 **P5 — docs + commit:** MANIFEST section, README next-steps update,
 results archived with provenance.
+
+## 5b. Bring-up findings (FS-UAE, 2026-06-12) — read before touching the bracket
+
+1. **exec reaches supervisor mode by deliberately faulting.**
+   `SuperState()`/`Supervisor()` work by trapping from user mode, so
+   *any* exception vector stolen by the recovery table poisons the
+   next OS call with a stale-context longjmp (zombie execution that
+   scribbled 397 KB of junk before diagnosis). The I/O bracket
+   therefore swaps the **entire VBR** back to the OS original around
+   every `DoIO` (`use_os_vbr`/`use_recovery_vbr` in recovery.s) — the
+   Amiga twin of the Mac lesson "leave Line-A alone".
+2. **VBR lifecycle ordering**: `install_vbr()` must run before any
+   bracketed I/O (else the bracket exits onto an unpopulated, all-zero
+   vector table), and must be idempotent (the gate and the shared
+   bench both call it; a second capture would snapshot our own stubbed
+   table as the "OS original"). Both now enforced in recovery.s
+   (`g_vbr_ready`).
+3. **Verified end-to-end on FS-UAE A3000 (68030+MMU, KS 3.2):**
+   boot → gate (AttnFlags `0xCE37`, PMOVE probe vec=0) → identity
+   probe ok → full corpus → results extracted from the ADF.
+   - **pmmu-safe: 25/32 executed rows match the MAME baseline** (8
+     hw_unsafe skipped as designed).
+   - **pmmu-full: 32/40** — including **all live-translation rows**
+     (identity/remap stores and loads, M/U descriptor bits, ATC
+     staleness ± PFLUSHA) **and both bus-error fault rows**.
+4. **Cross-oracle divergences (FS-UAE/WinUAE vs MAME)** — the 7-8
+   failing rows are emulator-model disagreements, not bench bugs;
+   real silicon (A3000 / LC II) adjudicates:
+   | Row class | MAME | FS-UAE (WinUAE core) |
+   |---|---|---|
+   | PTEST multi-level walk (N=3, An writeback, WP, invalid) | full walk; PSR N/W/I as PRM | stops early: PSR `I\|N=2`, descriptor addr = level-B entry |
+   | PTEST root-limit violation | PSR `I\|N=1` (no L bit) | limit ignored: PSR `0x1` |
+   | PTEST through enabled TT0 | PSR `T` (0x40) | no T bit |
+   | PMOVE TC bad geometry (E=1) | MMU-config exception, vector 56 | **F-line, vector 11** |
 
 ## 6. Risks / open items
 

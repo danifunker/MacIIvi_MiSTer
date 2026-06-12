@@ -22,6 +22,19 @@
 
 #include "bench_types.h"
 
+/* Framebuffer base. Mac builds read the ROM's ScrnBase low-mem global
+ * ($0824, validated > 1 MB since Mac framebuffers live in VRAM/NuBus
+ * space). Amiga builds (-DDISPLAY_FB_EXTERN) paint into a chip-RAM
+ * bitplane the payload owns; the entry shim sets g_display_fb. */
+#ifdef DISPLAY_FB_EXTERN
+u8 *g_display_fb;
+static u32 fb_base(void) { return (u32)g_display_fb; }
+static int fb_ok(u32 fb)  { return fb != 0; }
+#else
+static u32 fb_base(void) { return *(u32 *)0x0824; }
+static int fb_ok(u32 fb)  { return fb != 0 && fb >= 0x00100000; }
+#endif
+
 static const u8 g_font[95 * 8] = {
     /* 0x20 ' ' */ 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
     /* 0x21 '!' */ 0x18,0x18,0x18,0x18,0x18,0x00,0x18,0x00,
@@ -168,10 +181,10 @@ void paint_glyph_at(u8 *fb_ptr, char c)
  * characters (= bytes), whichever first. */
 void paint_string(u32 row, u32 col_byte, const char *s, u32 max_chars)
 {
-    u32 fb = *(u32 *)0x0824;
+    u32 fb = fb_base();
     u8 *p;
     u32 n;
-    if (fb == 0 || fb < 0x00100000) return;
+    if (!fb_ok(fb)) return;
     p = (u8 *)fb + row * display_row_bytes() + col_byte;
     for (n = 0; n < max_chars && *s; n++) {
         paint_glyph_at(p, *s++);
@@ -190,9 +203,9 @@ void paint_string(u32 row, u32 col_byte, const char *s, u32 max_chars)
  * (within 512K VRAM), VASP 480*2048=960K (within 1MB VRAM). */
 void display_wipe(u32 rows)
 {
-    u32 fb = *(u32 *)0x0824;
+    u32 fb = fb_base();
     u32 *p = (u32 *)fb;
     u32 i, longs = rows * display_row_bytes() / 4;
-    if (fb == 0 || fb < 0x00100000) return;
+    if (!fb_ok(fb)) return;
     for (i = 0; i < longs; i++) *p++ = 0xFFFFFFFF;
 }

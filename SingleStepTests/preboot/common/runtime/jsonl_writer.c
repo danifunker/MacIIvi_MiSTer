@@ -14,6 +14,13 @@
 
 static u8 g_pb[PB_SIZE];
 
+#ifdef JW_BACKEND_EXTERN
+/* Platform-provided batch writer (e.g. Amiga trackdisk.device). Same
+ * contract as the Mac _Write path below: write JW_BATCH_BYTES from buf
+ * to ctx->base_offset + sector_idx*JW_BATCH_BYTES; return 0 on ok. */
+extern i16 jw_backend_write(const JwCtx *ctx, u32 sector_idx, const u8 *buf);
+#define driver_write_sector jw_backend_write
+#else
 /* Single-sector _Write at byte offset (ctx.base_offset + sector_idx * 512).
  * Returns ioResult (0 = noErr). Inline asm calls $A003 _Write. */
 static i16 driver_write_sector(const JwCtx *ctx, u32 sector_idx, const u8 *buf)
@@ -38,6 +45,7 @@ static i16 driver_write_sector(const JwCtx *ctx, u32 sector_idx, const u8 *buf)
 
     return *(i16 *)(pb + PB_OFF_IORESULT);
 }
+#endif /* JW_BACKEND_EXTERN */
 
 void jw_init(JsonlWriter *w, const JwCtx *ctx)
 {
