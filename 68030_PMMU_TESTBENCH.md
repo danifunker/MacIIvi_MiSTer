@@ -268,6 +268,14 @@ Ordered so each step de-risks the next; artifacts named per repo paths.
 | M6 | Video: V8/VASP module | golden-frame bench green in all depth×monitor combos; mdc824 regression green |
 | M7 | LC II PMMU Phase B | live/fault rows match real silicon; `hw_unsafe` flags cleared |
 
+## 8b. Amiga front (added 2026-06-12)
+
+The TG68K-68030+MMU modifications debut in a custom MiSTer Minimig
+build before the IIvi core exists. A parallel set of bootable Amiga
+test floppies (same corpora, same diff tools, 68030+MMU-only) gates
+that work and adds a third real-silicon oracle — see
+[AMIGA_TESTBENCH.md](AMIGA_TESTBENCH.md).
+
 ## 9. Risks / open questions
 
 - **TG68K 030-parity drift:** the kernel's known bugs (documented

@@ -77,6 +77,16 @@ detail in [68030_PMMU_TESTBENCH.md §7](68030_PMMU_TESTBENCH.md).
    silicon), then the **CPU image**, archiving everything under
    `SingleStepTests/results/`.
 
+### 1b. Amiga campaign — the TG68K-030/MMU hardware gate
+
+The custom Minimig build carrying the TG68K-68030+MMU modifications is
+the *first hardware home* of the CPU that will drive this core. Three
+bootable ADFs (CPU / PMMU-safe / PMMU-full, 68030+MMU only) run the
+same corpora there and on a real-030 Amiga — plan settled in
+**[AMIGA_TESTBENCH.md](AMIGA_TESTBENCH.md)**. Needs: `pip install
+amitools`, `apt install fs-uae`, and Kickstart ROM files copied from
+the MiSTer SD card.
+
 ### 2. Local tooling gaps (one-time)
 
 - `sudo apt install verilator` — the tg68k bench builds but can't
