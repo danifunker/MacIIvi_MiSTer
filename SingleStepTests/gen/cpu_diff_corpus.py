@@ -44,6 +44,7 @@ Categories:
   - unknown        : uncategorized divergence
 """
 import json
+import re
 import sys
 from collections import defaultdict
 
@@ -64,10 +65,41 @@ COMPARE_AREGS = list(range(6))   # A0..A5
 
 
 def is_zeroed(snap):
-    if any(snap['d']) or any(snap['a']): return False
+    # Tolerant of a missing/empty snapshot: the real-hardware bench omits
+    # the "initial" snapshot entirely (it is fully determined by the
+    # harness preamble), so callers may pass {} here.
+    if any(snap.get('d', [])) or any(snap.get('a', [])): return False
     if snap.get('ccr', 0): return False
     if any(snap.get('ram', [])): return False
     return True
+
+
+# Exception rows: the test name encodes the architectural vector the 030
+# must take (e.g. "... vec 4 / $10", "-> vec 4 on 030"). The hardware
+# bench reports the vector it actually trapped to in a "vec" field next
+# to a "trap_state" (pre-trap) snapshot instead of a "final" one, so for
+# these rows the meaningful comparison is the vector, not register state
+# (the post-trap register state is handler/platform dependent).
+VEC_RE = re.compile(r'vec\s+(\d+)')
+
+
+def classify_trap(name, got_vec):
+    is_exc = name.startswith('EXC')
+    m = VEC_RE.search(name)
+    exp = int(m.group(1)) if m else None
+    if not is_exc:
+        # A test NOT designed to raise an exception trapped anyway. On real
+        # hardware this is usually a harness interaction (a test that mutates
+        # A7/SP, so the dump epilogue faults) rather than a CPU bug.
+        return ("exc_unexpected_trap",
+                f"trapped vec {got_vec} on a test not designed to trap")
+    if exp is None:
+        # Designed exception whose vector isn't spelled out in the name
+        # (e.g. TRAPEQ) -- it trapped as intended; nothing to cross-check.
+        return ("exc_match", f"trapped vec {got_vec} (no vec in name to verify)")
+    if got_vec == exp:
+        return ("exc_match", f"vec {got_vec}")
+    return ("exc_vec_diff", f"expected vec {exp}, got vec {got_vec}")
 
 
 def signext_w(v):     # sign-extend 16->32
@@ -182,7 +214,9 @@ def classify(name, baseline_final, cand_final, baseline_init, cand_init):
 
 CATEGORY_ORDER = ['match', 'skipped', 'ccr_only', 'flag_only',
                   'dreg_diff', 'areg_diff', 'ram_diff',
-                  'pc_diff', 'sign_extension', 'unknown']
+                  'pc_diff', 'sign_extension',
+                  'exc_match', 'exc_vec_diff', 'exc_unexpected_trap',
+                  'unknown']
 
 CATEGORY_HELP = {
     'match':           "candidate matches baseline byte-for-byte",
@@ -194,6 +228,9 @@ CATEGORY_HELP = {
     'ram_diff':        "scratch RAM bytes differ",
     'pc_diff':         "PC delta differs (test instruction length diverged)",
     'sign_extension':  "low 16/8 bits match; upper bits diverge",
+    'exc_match':       "exception row trapped to the vector its name specifies",
+    'exc_vec_diff':    "exception row trapped to a different vector than expected",
+    'exc_unexpected_trap': "candidate trapped on a test not designed to trap",
     'unknown':         "uncategorized divergence",
 }
 
@@ -210,8 +247,27 @@ def build_report(baseline_path, candidate_path):
     test_rows = []
     for name in common:
         b, c = base_by[name], cand_by[name]
-        cat, detail = classify(name, b['final'], c['final'],
-                               b['initial'], c['initial'])
+        # A candidate row carrying "trap_state" (and no "final") is an
+        # exception outcome from the hardware/supervisor bench: compare the
+        # vector it took, not register state. Everything else goes through
+        # the register/CCR/RAM classifier, with "initial" optional (the
+        # hardware bench omits it).
+        base_trap = 'trap_state' in b and 'final' not in b
+        cand_trap = 'trap_state' in c and 'final' not in c
+        if cand_trap:
+            cat, detail = classify_trap(name, c.get('vec', 0))
+        elif base_trap:
+            # The golden expects an exception here, but the candidate
+            # returned a normal "final" snapshot (it did not trap) -- e.g.
+            # a core that treats RTM as a no-op the way MAME does.
+            m = VEC_RE.search(name)
+            exp = int(m.group(1)) if m else b.get('vec')
+            cat, detail = ("exc_vec_diff",
+                           f"golden expects vec {exp}; candidate did not trap "
+                           f"(vec {c.get('vec', 0)})")
+        else:
+            cat, detail = classify(name, b['final'], c['final'],
+                                   b.get('initial', {}), c.get('initial', {}))
         cat_counts[cat] += 1
         op = name.split(' ')[0].split('.')[0].rstrip(':')
         if op == "DBG":
@@ -254,14 +310,17 @@ def render_terminal(rep, verbose=False):
             pct = 100.0 * n / rep['common_count']
             print(f"  {c:<16} {n:>4}  ({pct:5.1f}%)")
     print("\n=== per-op breakdown ===")
-    short = ['match','skip','ccr','flag','dreg','areg','ram','pc','sext','unk']
+    short = ['match','skip','ccr','flag','dreg','areg','ram','pc','sext',
+             'excOK','excV','excU','unk']
     print("{:<10}  ".format("op") +
           " ".join(f"{s:>5}" for s in short) + f"  {'total':>6}")
     for op in sorted(rep['per_op']):
         d = rep['per_op'][op]
         cells = [d['match'], d['skipped'], d['ccr_only'], d['flag_only'],
                  d['dreg_diff'], d['areg_diff'], d['ram_diff'],
-                 d['pc_diff'], d['sign_extension'], d['unknown']]
+                 d['pc_diff'], d['sign_extension'],
+                 d['exc_match'], d['exc_vec_diff'], d['exc_unexpected_trap'],
+                 d['unknown']]
         print("  {:<8}  ".format(op) +
               " ".join(f"{v:>5}" for v in cells) + f"  {d['total']:>6}")
     if verbose:
@@ -294,15 +353,16 @@ def render_markdown(rep):
             pct = 100.0 * n / rep['common_count']
             print(f"| `{c}` | {n} | {pct:.1f}% | {CATEGORY_HELP[c]} |")
     print("\n## Per-op breakdown\n")
-    print("| op | total | match | skip | ccr | flag | dreg | areg | ram | pc | sext | unk | pass% |")
-    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    print("| op | total | match | skip | ccr | flag | dreg | areg | ram | pc | sext | excOK | excV | excU | unk | pass% |")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for op in sorted(rep['per_op']):
         d = rep['per_op'][op]
         pct = 100.0 * d['pass_rate']
         print(f"| `{op}` | {d['total']} | {d['match']} | {d['skipped']} | "
               f"{d['ccr_only']} | {d['flag_only']} | {d['dreg_diff']} | "
               f"{d['areg_diff']} | {d['ram_diff']} | {d['pc_diff']} | "
-              f"{d['sign_extension']} | {d['unknown']} | {pct:.0f}% |")
+              f"{d['sign_extension']} | {d['exc_match']} | {d['exc_vec_diff']} | "
+              f"{d['exc_unexpected_trap']} | {d['unknown']} | {pct:.0f}% |")
 
 
 def main():

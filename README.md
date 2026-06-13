@@ -23,15 +23,37 @@ The physical validation machine is a **Macintosh LC II** — same
 | `68030_PMMU_TESTBENCH.md` | Master plan: machine facts (MAME-verified), RTL strategy, bench design, LC II campaign, milestones |
 | `SingleStepTests/` | The testbench tree — benches, corpora, capture pipelines, hardware test images ([README](SingleStepTests/README.md)) |
 | `SingleStepTests/prebuilt/` | **Ready-to-boot test images** (.hda/.dsk per fixture) + [MANIFEST.md](SingleStepTests/prebuilt/MANIFEST.md) with the LC II runbook |
-| `SingleStepTests/results/` | Committed MAME oracle baselines: CPU (721 rows), PMMU (40 rows) |
+| `SingleStepTests/results/` | Oracle baselines + runs: CPU MAME baseline (721) + real-silicon-corrected `golden` + IIcx hardware run; PMMU (40); Amiga runs |
 | `rtl/tg68k/` | TG68KdotC kernel (integer-CPU starting point; 68030-parity gaps tracked in [test-blockers.md](SingleStepTests/test-blockers.md)) |
 | `rtl/nubus/` | NuBus video adapters carried from the Mac II core (mdc824 is the active one) |
 | `verilator/sim/` | m68k disassembler used by the simulator benches |
 | `docs/` | Supporting notes (680x0 function codes) |
 
-## Current status (2026-06-12)
+## Current status (2026-06-13)
 
 **Done and verified:**
+- **First real-silicon CPU run (Macintosh IIcx, 68030):** the full
+  consolidated corpus (720/721 rows; the one omission is the `hw_unsafe`
+  Line-A trap) booted and ran. **No CPU-semantics divergence from the
+  MAME oracle** — every non-match is harness address-residue, a
+  PRM-undefined flag, or environmental privileged state. The two
+  68030-discriminator rows that carried known-bad MAME goldens are now
+  **adjudicated by real silicon**: CACR all-ones reads `$3313` (not
+  MAME's `$FF13`) and RTM traps vec 4 (MAME's no-op is a MAME bug) —
+  both matching the earlier Amiga/WinUAE oracle. Run +
+  analysis: `SingleStepTests/results/cpu_supervisor/maciicx_cpu_2026-06-13.jsonl`.
+  Corrected oracle for RTL gating:
+  `SingleStepTests/results/cpu/golden_2026-06-13.json`.
+- **First real-silicon PMMU run (Macintosh IIcx, 68030):** the full
+  PMMU bench ran end-to-end (`identity_probe` OK on the 32-bit-clean
+  ROM; all 40 rows incl. live translation + fault frames). **37/40 match
+  MAME**; the 3 misses are MAME PMMU-fidelity bugs that real silicon
+  adjudicates — PSR write-mask `$EE47` (not `$FFFF`; an IIcx-only
+  finding, WinUAE also wrong), root-limit PSR `$4400` (L bit set), and
+  PTEST-ignores-TT PSR `$0001`. The MMU-config-exception row confirms
+  vec 56 in MAME's favor (clearing a WinUAE divergence). Run:
+  `SingleStepTests/results/pmmu/maciicx_pmmu_full_2026-06-13.jsonl`;
+  corrected oracle: `…/pmmu/golden_2026-06-13.json` (40/40).
 - CPU corpus (721 rows) captured natively on a MAME 68030, including
   68030-discriminator rows (CACR write mask, CALLM/RTM illegal traps).
 - PMMU corpus (40 rows: PMOVE/PTEST/PLOAD/PFLUSH, live translation,

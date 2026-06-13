@@ -38,6 +38,94 @@ harness preamble (D0..D7=0, A0..A5=0, A6=scratch, CCR=0,
 SFC=DFC=5 — see [function codes
 doc](../../../docs/680x0_function_codes.md)).
 
+## 2026-06-13 — Macintosh IIcx, full corpus (real 68030 silicon)
+
+The first **real-silicon** run of the consolidated CPU corpus.
+
+- **Machine:** Macintosh IIcx — MC68030 @ 16 MHz, on-chip PMMU, NuBus.
+  The IIcx is *not* the LC II named as the project's validation machine
+  (`68030_PMMU_TESTBENCH.md` §1), but it is the **same MC68030 core**, so
+  every CPU instruction byte runs with identical semantics. For the
+  integer corpus it is a fully valid real-silicon oracle. (The 68882
+  socket is irrelevant — the corpus has no FPU ops.)
+- **How:** booted the prebuilt `maciivi-cpu-mdc824` SCSI image on the
+  IIcx; pulled `/Results.jsonl` with
+  `rb-cli get "<image>.hda@1" /Results.jsonl out.jsonl`, stripped the
+  trailing zero pad.
+- **Files:** [`maciicx_cpu_2026-06-13.jsonl`](maciicx_cpu_2026-06-13.jsonl)
+  (720 rows) + [`maciicx_cpu_2026-06-13.diff.md`](maciicx_cpu_2026-06-13.diff.md)
+  (auto-diff vs `../cpu/mame_baseline_2026-06-12.json`).
+
+**720 of 721 corpus rows ran** — the one omission is
+`EXC: Line A trap ($A000)`, which is `hw_unsafe` (vector 10 is the
+bench's `_Read`/`_Write` SCSI path) and the bench skips it by design.
+
+### Headline: no CPU-semantics divergences from the oracle
+
+```
+python3 ../../gen/cpu_diff_corpus.py \
+    ../cpu/mame_baseline_2026-06-12.json maciicx_cpu_2026-06-13.jsonl
+```
+
+| Bucket | Count | What it means |
+|---|---:|---|
+| `match` (byte-identical final state) | 661 | real 030 == MAME oracle |
+| `exc_match` (trapped to the named vector) | 20 | exception rows correct |
+| harness address-residue | ~30 | **not a CPU difference** (see below) |
+| PRM-undefined CCR flags | ~6 | expected residue |
+| environmental privileged reads | 3 | CACR/SFC/DFC/VBR platform state |
+| `exc_unexpected_trap` | 2 | A7-mutating tests fault the dump epilogue |
+
+Every non-`match` row was inspected. **None is a CPU-correctness
+divergence.** They fall into four buckets:
+
+1. **Hardcoded scratch-address residue (the bulk).** Many tests bake in
+   the assumption that the scratch buffer lives at absolute `$1800`
+   (true under the MAME capture harness). On a real Mac, `$1800–$1820`
+   is **system low-memory** and the bench's scratch buffer is at
+   `~$62a22`. So every divergence in which a D-register or a stored RAM
+   word holds a *scratch address* (`MOVE.L A6,D0`, `PEA`/`MOVE.L (A7)+`,
+   `EXG An,Dn`, `MOVEM` of address registers), or an *absolute* `$18xx`
+   read/write (`MOVE.L (xxx).L`, memory-indirect via planted pointers),
+   diverges — the CPU computed correctly, the address just held
+   different data. The lone `flag_only` `CMPA.L D0,A0` is the same thing
+   (D0 carries the baked-in `$1808`, so the equality flips). Fixing this
+   class is a harness change (relocate plants relative to the real
+   scratch base), not a core change.
+2. **PRM-undefined CCR flags.** `ABCD`/`NBCD` (N,V undefined) and
+   `DIVS`/`DIVU` overflow (N undefined) differ only in bits the
+   M68000PRM leaves undefined — the same residue seen on the Mac II
+   campaign.
+3. **Environmental privileged reads.** `MOVEC CACR,D0` reads `1` (the
+   ROM left the instruction cache enabled), `SFC`/`DFC` read `5` (the
+   harness preamble sets them), `VBR` reads the installed handler-table
+   address. All expected; none is a corpus golden.
+4. **A7-mutating tests (`exc_unexpected_trap`, 2 rows).** `BSR.W / RTD`
+   and `EXG A0,A7` swap a scratch address into the stack pointer, so the
+   register-dump epilogue that follows the test faults (vec 2). Harness
+   interaction, not a CPU bug; A7 is already excluded from the diff.
+
+Also notable: **`TRAP #0/#7/#15` reported their correct vectors
+(32/39/47)** in this consolidated run — the earlier per-batch run (below)
+saw `vec=2` because the ROM trap handlers bus-error pre-OS. `CALLM` and
+`ILLEGAL` trap vec 4; `CHK`/`CHK2` vec 6; `DIVx`-by-zero vec 5; `TRAPcc`
+vec 7; odd-address `JMP` vec 3 — all correct.
+
+### Corpus impact — two MAME-bug rows adjudicated by real silicon
+
+Both 68030-discriminator rows that carried *known-bad MAME goldens* are
+now resolved against real hardware (and agree with the Amiga/WinUAE
+prediction — a second independent oracle):
+
+| Row | MAME golden (in baseline) | **IIcx (real 030)** | Verdict |
+|---|---|---|---|
+| `MOVEC.L D0,CACR; CACR,D1 write all-ones` | `D1=$0000FF13` | **`D1=$00003313`** | MAME's `$FF13` is wrong; `$3313` confirmed |
+| `EXC: RTM D0` | no-op, `vec=0` (Musashi bug) | **traps `vec 4`** | RTM *does* trap; MAME no-op is a MAME bug |
+
+See [`../../test-blockers.md`](../../test-blockers.md) (§"68030 gap list"
+items 2–3, §"MAME oracle quirks" #3) for the adjudication and the
+golden-correction status.
+
 ## Notes
 
 | pc / a7 addresses | The `pc` field is the address inside our payload's `prog_buffer` static buffer where the FINAL state dump runs. That's at a known compile-time offset, not at the test instruction itself. To compare against the MAME oracle, we look at the *delta* (final.pc − initial.pc) which should equal `test_len` — not the absolute address. |

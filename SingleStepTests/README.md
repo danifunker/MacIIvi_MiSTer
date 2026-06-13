@@ -60,6 +60,13 @@ against the 68030 baseline (expect the same integer rows plus possible
 movement on the privileged CACR rows — the 030 has more writable CACR
 bits than the kernel implements).
 
+For **gating a 68030-correct core**, diff against
+`results/cpu/golden_2026-06-13.json` instead — it is the MAME baseline
+with two rows corrected from real silicon (CACR all-ones `$3313`, RTM
+traps vec 4). See [`results/cpu/README.md`](results/cpu/README.md). The
+first real-hardware run lives at
+`results/cpu_supervisor/maciicx_cpu_2026-06-13.jsonl` (Macintosh IIcx).
+
 ## PMMU corpus
 
 The PMMU baseline lives at `results/pmmu/mame_baseline_2026-06-12.json`

@@ -22,16 +22,26 @@ how much the Mac IIvi ROM / System 7 cares:
    68020-only pair. Corpus rows exist (2026-06-12): the CALLM golden
    shows the correct vec-4 frame; the **RTM golden is known-bad**
    (MAME quirk #3 below) — a core that correctly traps RTM will fail
-   that row, and that failure is the desired behavior until an LC II
-   golden replaces it.
+   that row, and that failure is the desired behavior until a
+   real-silicon golden replaces it.
+   **ADJUDICATED on real 68030 silicon (Macintosh IIcx, 2026-06-13):
+   RTM `D0` takes the vec-4 illegal trap** (matching the Amiga/WinUAE
+   oracle). MAME's no-op golden is confirmed wrong; the corrected golden
+   for `EXC: RTM D0` is `vec=4`. CALLM already matched (vec 4 on both).
+   Run: `results/cpu_supervisor/maciicx_cpu_2026-06-13.jsonl`.
 3. **CACR data-cache bits.** 030 adds IBE + WA/DBE/CD/CED/FD/ED to
    the 020's EI/FI/CEI/CI. The corpus's discriminator row
    `MOVEC.L D0,CACR; CACR,D1 write all-ones` has golden
    **D1 = $0000FF13** (MAME's 030 mask `$FF1F` minus the self-clearing
    CI/CEI). A 68020-behaving core fails it with `D1: got 0x00000003`;
-   a core ignoring CACR fails with `got 0x00000000`. Real silicon may
-   keep `$3313` (bits 14-15 don't exist; CD/CED should self-clear) —
-   adjudicate on the LC II.
+   a core ignoring CACR fails with `got 0x00000000`.
+   **ADJUDICATED on real 68030 silicon (Macintosh IIcx, 2026-06-13):
+   the readback is `D1 = $00003313`, not MAME's `$FF13`** (bits 14-15
+   don't exist; CD/CED self-clear, exactly as predicted, and matching the
+   Amiga/WinUAE oracle). MAME's `$FF13` is confirmed wrong; the corrected
+   golden is `$00003313`. The IIcx is a different machine than the
+   project's nominal LC II, but the same MC68030 core, so this verdict is
+   authoritative for the integer ISA.
 4. **Bus fault frame format $B** (92 bytes) replaces the 020's $A/$B
    sizes in MMU-fault paths; the PMMU corpus's FAULT rows carry real
    frames to compare against.
@@ -54,22 +64,49 @@ cross-check on the physical LC II:
    LC II (or a patched MAME — patch is a candidate upstream fix).
 2. **Root-limit violations report PSR=I|N, not L.** Real 030 sets the
    L (limit) bit; MAME folds it into INVALID. The corpus row
-   `PTESTR ... root limit violation (L)` records MAME's `0x0401` —
-   expect real hardware to differ (likely `0x4401`-ish).
+   `PTESTR ... root limit violation (L)` records MAME's `0x0401`.
+   **ADJUDICATED on real silicon (Macintosh IIcx, 2026-06-13): PSR =
+   `$4400`** (L | I, N=0). Corrected golden is `$4400`. All three oracles
+   disagreed here — MAME `$0401`, WinUAE A3000 `$0001`, real 030 `$4400`
+   — which is exactly why silicon was needed.
 3. **RTM is a silent no-op on MAME's 030/040.** Musashi wires opcode
    `$06C0` into the 030 decode table (handler `x06c0_rtm_l_234fc`) as a
    `logerror` no-op — no trap, no module pop. Real 68030 silicon takes
    the vec-4 illegal trap (CALLM, by contrast, is correctly 020-only in
    the decode table and traps). The corpus row is named
    "MAME golden known-bad"; expect correct cores to fail it. Upstream
-   fix candidate.
+   fix candidate. **CONFIRMED on real silicon (Macintosh IIcx,
+   2026-06-13): RTM `D0` traps vec 4** — second real-silicon oracle to
+   contradict MAME (after the FS-UAE/WinUAE A3000 run). See gap-list
+   item 2 above.
 4. **PMOVE-to-PSR is accepted** (`m68851_pmove` case 3 writes m_mmu_sr)
-   — fine — but the *put* path for some 68851-only registers logs
-   "unsupported"; stick to 030-real registers in tests.
-5. **maciici vs maciivi as capture host:** the MC68030 device is
+   — fine — but MAME treats PSR as **fully writable**: the corpus row
+   `PMOVE PSR w/r (write $FFFF)` reads back `$FFFF`. **ADJUDICATED on real
+   silicon (Macintosh IIcx, 2026-06-13): the implemented-bit mask is
+   `$EE47`** — writing all-ones reads back `$EE47`. The WinUAE A3000 also
+   read `$FFFF`, so this is an **IIcx-only finding**: neither emulator
+   models the PSR write mask. Corrected golden is `$EE47`.
+5. **PTEST ignores transparent translation (MAME sets the T bit).** The
+   030's `PTEST` always does a table search and does *not* consult TT0/TT1
+   (the T bit reports a transparent hit only via the bus, not via PTEST).
+   MAME sets PSR `T` (`$0040`) for `PTESTR ... through TT0`; **real
+   silicon (IIcx, 2026-06-13) walks the table and reports PSR = `$0001`
+   (N=1, no T)**. Corrected golden is `$0001`. (WinUAE returned `$0000`.)
+6. **MMU-configuration exception is vector 56 — confirmed.** The fault
+   row `PMOVE TC enable with bad geometry` takes **vec 56** on both MAME
+   and real silicon (IIcx, 2026-06-13). The FS-UAE/WinUAE A3000 took
+   vec 11 (F-line) here — a WinUAE bug, now cleared; MAME and hardware
+   agree, no corpus change.
+7. **maciici vs maciivi as capture host:** the MC68030 device is
    identical; no PMMU test in the corpus touches chipset space. When the
    `maciivx` ROM set lands, re-run both captures and diff — expect
    byte-identical corpora.
+
+Real-silicon PMMU run: `results/pmmu/maciicx_pmmu_full_2026-06-13.jsonl`
+(37/40 vs MAME baseline; 40/40 vs `results/pmmu/golden_2026-06-13.json`).
+The depth-limited PTEST landmine (#1) is still unadjudicated — the corpus
+carries no depth-limited rows to exercise it, so it awaits a patched MAME
+or hand-built hardware goldens.
 
 ## PMMU corpus / bench invariants (learned building it)
 
