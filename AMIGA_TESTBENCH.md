@@ -197,14 +197,22 @@ results archived with provenance.
      (identity/remap stores and loads, M/U descriptor bits, ATC
      staleness ± PFLUSHA) **and both bus-error fault rows**.
 4. **Cross-oracle divergences (FS-UAE/WinUAE vs MAME)** — the 7-8
-   failing rows are emulator-model disagreements, not bench bugs;
-   real silicon (A3000 / LC II) adjudicates:
-   | Row class | MAME | FS-UAE (WinUAE core) |
-   |---|---|---|
-   | PTEST multi-level walk (N=3, An writeback, WP, invalid) | full walk; PSR N/W/I as PRM | stops early: PSR `I\|N=2`, descriptor addr = level-B entry |
-   | PTEST root-limit violation | PSR `I\|N=1` (no L bit) | limit ignored: PSR `0x1` |
-   | PTEST through enabled TT0 | PSR `T` (0x40) | no T bit |
-   | PMOVE TC bad geometry (E=1) | MMU-config exception, vector 56 | **F-line, vector 11** |
+   failing rows are emulator-model disagreements, not bench bugs. The
+   **Macintosh IIcx (real 68030, 2026-06-13)** has now adjudicated most
+   of them. The corrected expected values are baked into
+   `results/pmmu/golden_2026-06-13.json` — the oracle `verify_amiga.sh`
+   diffs against, and which the IIcx run itself passes 40/40:
+   | Row class | MAME | FS-UAE (WinUAE core) | **IIcx silicon (2026-06-13)** |
+   |---|---|---|---|
+   | PTEST multi-level walk (N=3, An writeback, WP, invalid) | full walk; PSR N/W/I as PRM | stops early: PSR `I\|N=2`, descriptor addr = level-B entry | **full walk** — matches MAME; FS-UAE's early stop is the outlier |
+   | PTEST root-limit violation | PSR `I\|N=1` (`0x401`) | limit ignored: PSR `0x1` | **PSR `$4400` (`L\|I`)** — a third value; neither emulator |
+   | PTEST through enabled TT0 | PSR `T` (`0x40`) | no T bit | **PSR `$0001`** — T ignored (PTEST sees through TT0): confirms FS-UAE over MAME |
+   | PMOVE TC bad geometry (E=1) | MMU-config exception, vector 56 | **F-line, vector 11** | **vector 56** (MMU-config exception) — matches MAME |
+   | PMOVE PSR write/readback (write `$FFFF`) | reads back `$FFFF` | reads back `$FFFF` | **`$EE47`** — IIcx-only; *neither* emulator models the PSR write-mask |
+
+   Only depth-limited PTEST (`#1..#6` ending on a table descriptor —
+   MAME quirk #1) remains unadjudicated: the corpus carries no such row
+   because it fatalerrors this MAME build.
 
 ## 6. Risks / open items
 
