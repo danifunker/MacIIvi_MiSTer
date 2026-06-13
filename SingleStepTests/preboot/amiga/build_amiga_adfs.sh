@@ -20,6 +20,9 @@ LOAD_ADDR=$((0x80000))
 
 make payloads
 
+# Clean staging so stale (e.g. previously dated) tgz can't pollute the
+# packaging glob / SHA256SUMS.amiga below.
+rm -rf "$STAGE"
 mkdir -p "$STAGE"
 
 build_adf() {  # payload.bin payload.elf out.adf
@@ -69,14 +72,14 @@ build_adf build/payload_pmmu_full_amiga.bin build/payload_pmmu_full_amiga.elf "$
 
 if [[ "${1:-}" == "--package" ]]; then
     echo "== packaging =="
-    STAMP=$(date +%F)
+    # Stable, undated names: stale images are just overwritten in place.
     mkdir -p "$OUTDIR"
     ( cd "$STAGE"
       for fx in cpu pmmu-safe pmmu-full; do
-          tar czf "amiga-$fx-$STAMP.tgz" "amiga-$fx.adf"
+          tar czf "amiga-$fx.tgz" "amiga-$fx.adf"
       done
       sha256sum amiga-*.tgz amiga-*.adf > SHA256SUMS.amiga )
     # raw ADFs are committed too — directly mountable from a checkout
-    cp -f "$STAGE"/amiga-*.adf "$STAGE"/amiga-*-"$STAMP".tgz "$STAGE/SHA256SUMS.amiga" "$OUTDIR/"
+    cp -f "$STAGE"/amiga-*.adf "$STAGE"/amiga-*.tgz "$STAGE/SHA256SUMS.amiga" "$OUTDIR/"
     ls -la "$OUTDIR" | grep amiga
 fi

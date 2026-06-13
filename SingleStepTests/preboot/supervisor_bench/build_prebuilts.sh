@@ -110,13 +110,13 @@ done
 
 echo
 echo "== packaging =="
-STAMP=$(date +%F)
+# Stable, undated names: stale images are just overwritten in place.
 ( cd "$STAGE"
   for fx in $FIXTURES; do
-      tar czf "maciivi-$fx-$STAMP.tgz" "maciivi-$fx.hda" "maciivi-$fx.dsk"
+      tar czf "maciivi-$fx.tgz" "maciivi-$fx.hda" "maciivi-$fx.dsk"
   done
   sha256sum maciivi-*.tgz maciivi-*.hda maciivi-*.dsk > SHA256SUMS
 )
-cp -f "$STAGE"/maciivi-*-"$STAMP".tgz "$STAGE/SHA256SUMS" "$OUTDIR/"
+cp -f "$STAGE"/maciivi-*.tgz "$STAGE/SHA256SUMS" "$OUTDIR/"
 echo "tgz files + SHA256SUMS -> $OUTDIR/"
 ls -la "$OUTDIR"

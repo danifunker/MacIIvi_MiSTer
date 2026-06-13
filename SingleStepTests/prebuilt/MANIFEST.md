@@ -1,4 +1,4 @@
-# Prebuilt test images — Macintosh IIvi / LC II campaign (2026-06-12)
+# Prebuilt test images — Macintosh IIvi / LC II campaign (2026-06-13)
 
 One tgz per fixture; each contains a SCSI **`.hda`** (BlueSCSI / SCSI2SD
 / real drive) and an 800K floppy **`.dsk`**. Checksums in `SHA256SUMS`.
@@ -79,7 +79,7 @@ disk layout, no filesystem; design in `AMIGA_TESTBENCH.md`, usage in
 `preboot/amiga/DEBUGGING.md`. **The raw `.adf` files are committed
 right here** (`amiga-*.adf`) — copy straight to the MiSTer SD card;
 per-fixture tgz alongside, and
-`maciivi-testbench-all-<date>.tgz` bundles every image (12 Mac
+`maciivi-testbench-all.tgz` bundles every image (12 Mac
 .hda/.dsk + 3 ADFs) in one download.
 
 | Fixture | Suite |
@@ -88,11 +88,20 @@ per-fixture tgz alongside, and
 | `amiga-pmmu-safe` | PMMU hw-safe rows (32 of 40) — **run first** |
 | `amiga-pmmu-full` | all 40 PMMU rows incl. live translation + faults |
 
-Extract results from byte offset `0x78000` of the ADF (no tooling
-needed): `python3 -c "open('out.jsonl','wb').write(open('x.adf','rb').read()[0x78000:0xDC000].rstrip(b'\x00'))"`,
-then diff with `gen/pmmu_diff_corpus.py`. Diagnostic marker slots at
-`0xD8000+` identify exactly how far a failed boot got (see
-AMIGA_TESTBENCH.md §2).
+Verify a run against the oracle in one step (extract + auto-detect
+CPU/PMMU + diff vs `results/<area>/golden_2026-06-13.json`):
+
+```
+preboot/amiga/verify_amiga.sh ran.adf      # exit 0 = clean, 1 = divergences
+```
+
+On FS-UAE a few rows still diverge from silicon (the cross-oracle set in
+`AMIGA_TESTBENCH.md` §5b); on real LC II / IIcx silicon a clean run is
+zero mismatches. To do it by hand instead, pull the result stream from
+ADF byte `0x78000` (`python3 -c "open('out.jsonl','wb').write(open('x.adf','rb').read()[0x78000:0xDC000].rstrip(b'\x00'))"`)
+and diff with `gen/pmmu_diff_corpus.py` / `gen/cpu_diff_corpus.py`.
+Diagnostic marker slots at `0xD8000+` identify how far a failed boot got
+(see AMIGA_TESTBENCH.md §2).
 
 Verification status: all three boot-verified end-to-end on FS-UAE
 A3000 (68030+MMU, KS 3.2). PMMU-full: 32/40 vs the MAME baseline with
@@ -110,3 +119,20 @@ real-silicon predictions against MAME. Archived runs:
 cd SingleStepTests/preboot/supervisor_bench
 ./build_prebuilts.sh          # → SingleStepTests/prebuilt/*.tgz
 ```
+
+**Rebuilt 2026-06-13** from the current bench source (the commit
+containing this file), which now includes the shared-runtime refactor
+made for the Amiga port (commit `bd9e134`, after the 2026-06-12 images
+were first built in `49ac1b9`). The **CPU images are functionally
+identical** to the 2026-06-12 set: all 721 embedded test names are
+byte-identical, and the only payload delta is +398 B of dead code from
+the shared `recovery.s` VBR helpers (`use_os_vbr`/`use_recovery_vbr`/
+`restore_os_traps`/`install_recovery_traps`) — assembled in but never
+called on the Mac build. The **PMMU images** now derive their
+runner-owned identity blocks from the payload's actual placement, so the
+reloc header reports `"masked_levb_slots":[4]` (the payload occupies only
+64K block 4) instead of the previously hardcoded `[4,5,6]`. Corpus
+outcomes are expected to be unchanged (blocks 5–6 are unused), but were
+**not** re-run for this rebuild: MAME `maciici` can't host the PMMU disk
+boot (non-identity machine — see the identity probe above), so re-verify
+the PMMU set on an identity machine (LC II / IIcx) before relying on it.
