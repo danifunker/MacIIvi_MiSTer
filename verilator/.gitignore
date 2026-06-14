@@ -1,0 +1,21 @@
+# Build artifacts
+obj_dir/
+*.o
+*.d
+
+# ROM files (copyrighted)
+*.rom
+
+# Log files
+*.log
+
+# IDE files
+*.ini
+
+# Submodules
+Musashi/
+
+# Visual Studio files
+*.vcxproj
+*.vcxproj.*
+*.sln
