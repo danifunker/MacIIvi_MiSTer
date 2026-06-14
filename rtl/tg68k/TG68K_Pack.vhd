@@ -28,19 +28,20 @@ package TG68K_Pack is
 	type micro_states is (idle, nop, ld_nn, st_nn, ld_dAn1, ld_AnXn1, ld_AnXn2, st_dAn1, ld_AnXnbd1, ld_AnXnbd2, ld_AnXnbd3,
 						  ld_229_1, ld_229_2, ld_229_3, ld_229_4, st_229_1, st_229_2, st_229_3, st_229_4,   
 						  st_AnXn1, st_AnXn2, bra1, bsr1, bsr2, nopnop, dbcc1, movem1, movem2, movem3, 
-						  andi, pack1, pack2, pack3, op_AxAy, cmpm, link1, link2, unlink1, unlink2, int1, int2, int3, int4, rte1, rte2, rte3, 
-						  rte4, rte5, rtd1, rtd2, trap00, trap0, trap1, trap2, trap3, cas1, cas2, cas21, cas22, cas23, cas24,
+						  andi, pack1, pack2, pack3, op_AxAy, cmpm, link1, link2, unlink1, unlink2, int1, int2, int3, int4, int5, rte1, rte2, rte3,
+						  rte4, rte5, rte6, rtd1, rtd2, trap00, trap0, trap1, trap2, trap3, cas1, cas2, cas21, cas22, cas23, cas24,
 						  cas25, cas26, cas27, cas28, chk20, chk21, chk22, chk23, chk24,
-						  trap4, trap5, trap6, trap_berr20, rte_berr20, movec1, movep1, movep2, movep3, movep4, movep5, rota1, bf1,
-						  mul1, mul2, mul_end1,  mul_end2, div1, div2, div3, div4, div_end1, div_end2,
-						  cp_write_cmd, cp_write_opw, cp_read_resp, cp_idle_resp, cp_xfer_to, cp_xfer_from,
-					  cp_xfer_to_load, cp_xfer_to_hi, cp_xfer_to_lo,
-					  cp_xfer_from_hi, cp_xfer_from_lo, cp_xfer_from_store,
-					  cp_xfer_from_done,
-					  cp_save_rd_fmt, cp_save_decode, cp_save_wr_mem, cp_save_rd_cir, cp_save_idle,
-					  cp_restore_rd_mem, cp_restore_idle, cp_restore_wr_fmt, cp_restore_decode, cp_restore_wr_data,
-				  cp_cond_write, cp_cond_resp, cp_cond_eval, cp_cond_skip, cp_fscc_wr,
-				  cp_fscc_wr_mem, cp_fdbcc_disp, cp_fdbcc_dec, cp_branch_apply);
+                          trap4, trap5, trap6, movec1, moves0, moves1, movep1, movep2, movep3, movep4, movep5, rota1, bf1,
+                          pmove_decode, pmove_mem_to_mmu_hi, pmove_mmu_to_mem_hi, pmove_mem_to_mmu_lo, pmove_mmu_to_mem_lo, ptest1, ptest2, pflush1, pload1,
+	                          fpu_decode, fpu_ftst_reg, fpu_core_wait, fpu_fdbcc, fpu_fbcc_long, fpu_ftrapcc, fpu_ftrapcc_long,
+	                          fpu_cr_imm_hi, fpu_cr_imm_done, fpu_data_imm_done, fpu_data_imm_start,
+	                          fpu_cond_mem_write, fpu_cond_mem_write_done,
+                          fpu_cr_mem_read, fpu_cr_mem_read_done, fpu_cr_mem_write, fpu_cr_mem_write_done,
+                          fpu_save, fpu_save_done, fpu_restore, fpu_restore_done,
+                          pmove_dn_hi, pmove_dn_lo, pmmu_dn_read_wait,
+                          pmmu_ld_nn, pmmu_ld_dAn1, pmmu_ld_AnXn1, pmmu_ld_AnXn2, pmmu_ld_229_1, pmmu_ld_229_2, pmmu_ld_229_3, pmmu_ld_229_4,
+                          berr1, berr2, berr3, berr4, berr5, berr6, berr7, berr8, berr_fill, trace_stk_grp2,
+                          mul1, mul2, mul_end1,  mul_end2, div1, div2, div3, div4, div_end1, div_end2, rte_mmu_replay);
 	
 	constant opcMOVE				: integer := 0; --
 	constant opcMOVEQ				: integer := 1; --
@@ -131,10 +132,26 @@ package TG68K_Pack is
 	constant alu_setFlags		: integer := 86; --
 	constant opcCHK2				: integer := 87; --
 	constant opcEXTB				: integer := 88; --
-	constant opcCPcmd				: integer := 89; --
-	constant opcCPopw				: integer := 90; --
 
-	constant lastOpcBit			: integer := 90;
+    constant pmmu_rd				: integer := 89; -- PMOVE <MMU>,Dn
+    constant pmmu_wr				: integer := 90; -- PMOVE Dn,<MMU>
+    constant pmmu_ptest			: integer := 91; -- PTEST
+    constant pmmu_pflush			: integer := 92; -- PFLUSH
+    constant pmmu_pload			: integer := 93; -- PLOAD
+    constant to_SSP				: integer := 94; -- Save A7 to SSP (68000/68010)
+    constant from_SSP				: integer := 95; -- Load A7 from SSP (68000/68010)
+    constant to_MSP				: integer := 96; -- Save A7 to MSP (68020/68030)
+    constant from_MSP				: integer := 97; -- Load A7 from MSP (68020/68030)
+    constant to_ISP				: integer := 98; -- Save A7 to ISP (68020/68030)
+    constant from_ISP				: integer := 99; -- Load A7 from ISP (68020/68030)
+    constant use_sfc_dfc			: integer := 100; -- MOVES: Use SFC/DFC for FC
+    constant sfc_not_dfc			: integer := 101; -- MOVES: 1=SFC (read), 0=DFC (write)
+    constant pmmu_addr_inc        : integer := 102; -- PMMU: +4 address increment for 64-bit CRP/SRP second transfer (no reg write-back)
+    constant pmmu_dbl             : integer := 103; -- PMMU: CRP/SRP doubleword size for (An)+/-(An) (updates An by 8)
+    constant fpu_cr_rd            : integer := 104; -- FPU: FMOVE control register -> CPU register
+    constant fpu_cond_rd          : integer := 105; -- FPU: FScc condition byte -> CPU register
+
+    constant lastOpcBit			: integer := 105;
 
 	component TG68K_ALU
 	generic(
@@ -146,7 +163,7 @@ package TG68K_Pack is
 	port(
 		clk						: in std_logic;
 		Reset						: in std_logic;
-		CPU						: in std_logic_vector(1 downto 0):="00";  -- 00->68000  01->68010  11->68020(only some parts - yet)
+		CPU						: in std_logic_vector(1 downto 0):="10";  -- 00->68000  01->68010  10->68030
 		clkena_lw				: in std_logic:='1';
 		execOPC					: in bit;
 		decodeOPC				: in bit;
@@ -180,11 +197,155 @@ package TG68K_Pack is
 		bf_ffo_offset			: in std_logic_vector(31 downto 0);
 		bf_loffset				: in std_logic_vector(4 downto 0);
 
+		-- BUG #397: Restore CCR on RTE format error
+		restore_ccr				: in std_logic := '0';
+		restored_ccr_value		: in std_logic_vector(7 downto 0) := "00000000";
+
 		set_V_Flag				: buffer bit;
 		Flags						: buffer std_logic_vector(7 downto 0);
 		c_out						: buffer std_logic_vector(2 downto 0);
 		addsub_q					: buffer std_logic_vector(31 downto 0);
 		ALUout					: out std_logic_vector(31 downto 0)
+	);
+	end component;
+
+	component TG68K_FPU
+	generic(
+		Enable_Transcendental	: integer := 1;
+		Enable_Packed_Decimal	: integer := 1
+	);
+	port(
+		clk						: in std_logic;
+		nReset					: in std_logic;
+		clkena					: in std_logic;
+		opcode					: in std_logic_vector(15 downto 0);
+		extension_word			: in std_logic_vector(15 downto 0);
+		fpu_enable				: in std_logic;
+		supervisor_mode			: in std_logic;
+		cpu_data_in				: in std_logic_vector(31 downto 0);
+		cpu_address_in			: in std_logic_vector(31 downto 0);
+		fpu_data_out			: out std_logic_vector(31 downto 0);
+		fsave_data_request		: in std_logic;
+		fsave_data_index		: in integer range 0 to 54;
+		frestore_data_write		: in std_logic;
+		frestore_data_in		: in std_logic_vector(31 downto 0);
+		fmovem_data_request		: in std_logic;
+		fmovem_reg_index		: in integer range 0 to 7;
+		fmovem_data_write		: in std_logic;
+		fmovem_data_in			: in std_logic_vector(79 downto 0);
+		fmovem_data_out			: out std_logic_vector(79 downto 0);
+		fpu_busy				: out std_logic;
+		fpu_done				: buffer std_logic;
+		fpu_exception			: buffer std_logic;
+		exception_code			: out std_logic_vector(7 downto 0);
+		fpcr_out				: out std_logic_vector(31 downto 0);
+		fpsr_out				: out std_logic_vector(31 downto 0);
+		fpiar_out				: out std_logic_vector(31 downto 0);
+		fsave_frame_size		: out integer range 4 to 216;
+		fsave_size_valid		: out std_logic;
+		cir_address				: in std_logic_vector(4 downto 0);
+		cir_write				: in std_logic;
+		cir_read				: in std_logic;
+		cir_data_in				: in std_logic_vector(15 downto 0);
+		cir_data_out			: out std_logic_vector(15 downto 0);
+		cir_data_valid			: buffer std_logic
+	);
+	end component;
+
+	component TG68K_FPU_Decoder
+	port(
+		clk						: in std_logic;
+		nReset					: in std_logic;
+		opcode					: in std_logic_vector(15 downto 0);
+		extension_word			: in std_logic_vector(15 downto 0);
+		decode_enable			: in std_logic;
+		instruction_type		: out std_logic_vector(3 downto 0);
+		operation_code			: out std_logic_vector(6 downto 0);
+		source_format			: out std_logic_vector(2 downto 0);
+		dest_format				: out std_logic_vector(2 downto 0);
+		source_reg				: out std_logic_vector(2 downto 0);
+		dest_reg				: out std_logic_vector(2 downto 0);
+		ea_mode					: out std_logic_vector(2 downto 0);
+		ea_register				: out std_logic_vector(2 downto 0);
+		needs_extension_word	: out std_logic;
+		valid_instruction		: out std_logic;
+		privileged_instruction	: out std_logic;
+		illegal_instruction		: out std_logic;
+		unsupported_instruction	: out std_logic
+	);
+	end component;
+
+	component TG68K_FPU_ALU
+	port(
+		clk						: in std_logic;
+		nReset					: in std_logic;
+		clkena					: in std_logic;
+		start_operation			: in std_logic;
+		operation_code			: in std_logic_vector(6 downto 0);
+		rounding_mode			: in std_logic_vector(1 downto 0);
+		operand_a				: in std_logic_vector(79 downto 0);
+		operand_b				: in std_logic_vector(79 downto 0);
+		result					: out std_logic_vector(79 downto 0);
+		result_valid			: out std_logic;
+		overflow				: out std_logic;
+		underflow				: out std_logic;
+		inexact					: out std_logic;
+		invalid					: out std_logic;
+		divide_by_zero			: out std_logic;
+		operation_busy			: out std_logic;
+		operation_done			: out std_logic
+	);
+	end component;
+
+	component TG68K_FPU_Converter
+	generic(
+		Enable_Packed_Decimal	: integer := 1
+	);
+	port(
+		clk						: in std_logic;
+		nReset					: in std_logic;
+		clkena					: in std_logic;
+		start_conversion		: in std_logic;
+		conversion_done			: out std_logic;
+		conversion_valid		: out std_logic;
+		source_format			: in std_logic_vector(2 downto 0);
+		dest_format				: in std_logic_vector(2 downto 0);
+		data_in					: in std_logic_vector(95 downto 0);
+		data_out				: out std_logic_vector(79 downto 0);
+		overflow				: out std_logic;
+		underflow				: out std_logic;
+		inexact					: out std_logic;
+		invalid					: out std_logic
+	);
+	end component;
+
+	component TG68K_FPU_Transcendental
+	port(
+		clk						: in std_logic;
+		nReset					: in std_logic;
+		clkena					: in std_logic;
+		start_operation			: in std_logic;
+		operation_code			: in std_logic_vector(6 downto 0);
+		operand					: in std_logic_vector(79 downto 0);
+		result					: out std_logic_vector(79 downto 0);
+		result_valid			: out std_logic;
+		overflow				: out std_logic;
+		underflow				: out std_logic;
+		inexact					: out std_logic;
+		invalid					: out std_logic;
+		operation_busy			: out std_logic;
+		operation_done			: out std_logic
+	);
+	end component;
+
+	component TG68K_FPU_ConstantROM
+	port(
+		clk						: in std_logic;
+		nReset					: in std_logic;
+		rom_offset				: in std_logic_vector(6 downto 0);
+		read_enable				: in std_logic;
+		constant_out			: out std_logic_vector(79 downto 0);
+		constant_valid			: out std_logic
 	);
 	end component;
 

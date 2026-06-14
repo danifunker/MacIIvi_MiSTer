@@ -1,4 +1,11 @@
-set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K_ALU.vhd ]
+# MacIIvi MC68030 TG68K core (integer kernel + PMMU + I/D cache, no FPU) — VHDL sources.
+# Listed in ghdl dependency order. convert_to_verilog.sh turns these into TG68K.v.
+# Quartus can compile these VHDL files directly; the Verilator bench uses the
+# converted TG68K.v (Verilator cannot read VHDL).
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K_Pack.vhd ]
+set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K_ALU.vhd ]
+set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K_PMMU_030.vhd ]
+set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K_Cache_030.vhd ]
+set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K_CacheCtrl_030.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68KdotC_Kernel.vhd ]
-set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) tg68k.v ]
+set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K.vhd ]
