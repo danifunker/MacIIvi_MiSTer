@@ -23,6 +23,29 @@ Verilog, **no PMMU, no caches**) with a true **MC68030**:
 
 No FPU in the stock IIvi (the 68882 socket is empty). See §3 decision D2.
 
+## Progress (2026-06-14)
+
+- **Phase 0 ✓** (`4d9b794`) — MC68030 VHDL imported (kernel + PMMU + 256B I/D
+  caches, no FPU); ghdl→Verilog whole-design conversion clean; Verilator lints.
+- **Phase 1 ✓** (`00eb804`) — Verilator CPU corpus bench ported to the new
+  kernel: **713/720 tests architecturally correct** (CCR/D/A/PC/SR). The 520
+  "USP:" failures are a single USP-injection harness gap, not CPU bugs; 7 genuine
+  diffs (1 CACR 030-mask, 5 PRM-undefined exception CCR, 1 RTM known-bad oracle).
+  BERR/HALT validated by running the imported VHDL fault benches under ghdl
+  (`tb_berr_frame` 15/15, fetch-fault/recovery/whichamiga/walker-timeout pass).
+- **Phase 2 (in progress)** — `rtl/tg68k/cpu030_wrapper.v` written: Mac async bus
+  (AS/UDS/LDS/DTACK) + E-clock/VMA + auto-vectors + **`berr_hold`** (the one
+  BERR/HALT item Minimig lacked, ported from MacLC). MMU/cache bypassed for now
+  (TC.E=0 → logical=physical; bare kernel has no cache). Lints clean.
+  **Open blocker:** the MacIIvi chipset (VASP-equivalent addr/dataController)
+  doesn't exist yet, so the wrapper has no Mac bus to drive — next step is to
+  bring over the MacLC chipset and retarget V8→VASP (or validate the wrapper by
+  dropping it into the existing MacLC core per the LC-test strategy).
+- **BERR/HALT division:** BERR *generation* (NuBus empty-slot timeout, FC=7 probe)
+  stays in the chipset (`nubus_arbiter.sv`, already present); the CPU only
+  *handles* BERR (validated). BERR+HALT *retry* is unbuilt across all cores
+  (FX68K carries the scaffolding) and isn't needed for slot detection.
+
 ## 2. Source inventory
 
 ### From `../Minimig-AGA_MiSTer` (branch `030_mmu2_fpu2`) — the 68030 core (VHDL)
