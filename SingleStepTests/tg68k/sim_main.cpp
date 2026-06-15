@@ -124,18 +124,30 @@ int main(int argc, char** argv, char** env) {
     top->reset = 0;
 
     // ---- Helpers for register injection/readback --------------------
-    // The ghdl-synthesized regfile is split across two unpacked arrays:
-    //   regfile_n1[i] = bits [7:0]   (low byte)
-    //   regfile_n2[i] = bits [31:8]  (upper 24 bits)
-    // Indices 0..7 = D0..D7, 8..15 = A0..A7.
+    // The MC68030 kernel stores the 16 registers in one packed signal,
+    //   reg [511:0] regfile
+    // which Verilator exposes as a 16-word array. The VHDL array is ascending
+    // (0 to 15), so ghdl packs reg index 0 (D0) in the HIGH word: arch register
+    // i (0..7 = D0..D7, 8..15 = A0..A7) is Verilator word (15 - i).
+    // (Confirmed: debug_regfile_d0 = regfile[511:480], _a7 = regfile[31:0].)
     auto set_reg = [](int i, uint32_t v) {
-        VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__regfile_n1[i] = v & 0xFF;
-        VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__regfile_n2[i] = (v >> 8) & 0xFFFFFF;
+        VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__regfile[15 - i] = v;
     };
     auto get_reg = [](int i) -> uint32_t {
-        uint32_t n1 = VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__regfile_n1[i];
-        uint32_t n2 = VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__regfile_n2[i];
-        return (n2 << 8) | n1;
+        return VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__regfile[15 - i];
+    };
+    // USP storage. The kernel's `usp` is a wire fed by an internal register that
+    // ghdl names n19256 (`assign usp = n19256;` in TG68KdotC_Kernel.v). The
+    // bench runs in supervisor mode, so USP must be injected separately from the
+    // A-regs. If a reconvert renames it, re-derive from that assign and update.
+    //
+    // KNOWN GAP: this poke does NOT currently take effect (USP readback is
+    // unchanged), so the corpus's USP comparisons fail on every test whose
+    // init.usp != reset value — ~520 "USP:" failures where ALL other state
+    // (CCR/D/A/PC/SR) is correct. A proper fix needs a debug-load port on the
+    // kernel or a MOVEC-based USP preamble. The non-USP census is the real one.
+    auto set_usp = [](uint32_t v) {
+        VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__n19256 = v;
     };
 
     // ---- Register-path probe (--probe-regs) ---------------------------
@@ -159,12 +171,9 @@ int main(int argc, char** argv, char** env) {
         top->reset = 0;
 
         // Immediately inject D0 = 0xDEADBEEF before kernel decodes MOVE.L.
-        // Verilator splits the 32-bit regfile into two arrays:
-        //   regfile_n1[i] = bits [7:0]   (low byte)
-        //   regfile_n2[i] = bits [31:8]  (upper 24 bits)
+        // regfile is one packed [511:0] signal; D0 is the HIGH word (15).
         const uint32_t d0 = 0xDEADBEEFu;
-        VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__regfile_n1[0] = d0 & 0xFF;
-        VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__regfile_n2[0] = (d0 >> 8) & 0xFFFFFF;
+        VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__regfile[15] = d0;
         std::cerr << "Injected D0 = 0x" << std::hex << d0 << std::dec
                   << " before bus startup\n";
 
@@ -307,6 +316,7 @@ int main(int argc, char** argv, char** env) {
             set_reg(r,     init["d"][r].get<uint32_t>());
             set_reg(8 + r, init["a"][r].get<uint32_t>());
         }
+        if (init.contains("usp")) set_usp(init["usp"].get<uint32_t>());
 
         // Two-stage capture:
         //   (1) First fetch at move_ccr_addr -- the test instruction has

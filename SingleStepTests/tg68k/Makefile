@@ -16,10 +16,10 @@ V_DEFINE = +define+SIMULATION=1 \
            -Wno-INITIALDLY -Wno-SYNCASYNCNET -Wno-ALWNEVER
 
 # Per CLAUDE.md: verilator uses the ghdl-generated .v sources + the SV pkg.
+# The standalone TG68KdotC_Kernel.v (from convert_to_verilog.sh) bundles the
+# kernel + ALU + PMMU as self-contained modules, so it is the only RTL needed.
 V_SRC = \
   tg68k_tests.v \
-  $(RTL)/tg68k/TG68K_Pack.sv \
-  $(RTL)/tg68k/TG68K_ALU.v \
   $(RTL)/tg68k/TG68KdotC_Kernel.v
 
 C_SRC = sim_main.cpp \

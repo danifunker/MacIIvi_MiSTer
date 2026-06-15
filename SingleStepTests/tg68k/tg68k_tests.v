@@ -1,19 +1,13 @@
-// SingleStep bench wrapper for TG68KdotC_Kernel.
+// SingleStep bench wrapper for the MC68030 TG68KdotC_Kernel (Minimig 030 core).
 //
-// Target: Macintosh IIvi (MC68030 + on-chip PMMU). CPU=2'b11 below
-// selects the kernel's most capable mode (VBR + extended stack frames
-// + the extended integer ISA), which covers the 68030's user-mode
-// integer behavior. Remaining 68030-parity gaps are tracked in
-// test-blockers.md and 68030_PMMU_TESTBENCH.md:
-//   * CALLM/RTM must trap as illegal (the 68030 dropped that 020 pair)
-//   * CACR needs the 030 data-cache bits (WA/DBE/CD/CED/FD/ED)
-//   * no PMMU: PMOVE/PTEST/PLOAD/PFLUSH are F-line on the raw kernel;
-//     the PMMU lives in a wrapper module and gets its own bench
-//     (SingleStepTests/pmmu/) once the RTL exists.
+// Target: Macintosh IIvi 68030. CPU=2'b10 selects the 030 path (PMMU + caches
+// integrated in the kernel). The PMMU is present but inactive in this bench:
+// out of reset TC.E=0, so translation is logical=physical and the table walker
+// never runs — hence the walker bus is tied idle below.
 //
-// The kernel runs one bus access per `clkena_in` pulse. The C++ harness owns
-// RAM and inspects `busstate` each enabled cycle to drive `data_in` (reads)
-// or capture `data_write` (writes). Byte lanes via nUDS/nLDS.
+// The kernel runs one bus access per `clkena_in` pulse. The C++ harness owns RAM
+// and inspects `busstate` each enabled cycle to drive `data_in` (reads) or
+// capture `data_write` (writes). Byte lanes via nUDS/nLDS.
 //
 // busstate encoding (from TG68K source):
 //   00 -> fetch code     10 -> read data
@@ -34,24 +28,18 @@ module tg68k_tests
    output        longword,
    output [2:0]  fc,
    output [31:0] vbr_out,
-   // Verification taps -- read by the C++ harness at the post-test
-   // capture moment so we can compare architectural PC/SR/USP against
-   // the MAME-derived corpus. Not used for normal bus operation.
-   //   pc_out  : kernel's TG68_PC. Runs one prefetch (typically 4 bytes)
-   //             AHEAD of the architectural post-instruction PC.
-   //   sr_out  : full 16-bit SR = {FlagsSR, Flags}. Bits 8-10 (IPL) are
-   //             setup-dependent and should be masked off when comparing.
-   //   usp_out : User Stack Pointer. Stable unless test executes
-   //             MOVE An,USP / MOVE USP,An (privileged).
+   // Verification taps -- read by the C++ harness at the post-test capture
+   // moment so we can compare architectural PC/SR/USP against the corpus.
+   //   pc_out  : kernel's TG68_PC (runs one prefetch ahead of architectural PC)
+   //   sr_out  : full 16-bit SR = {FlagsSR, Flags}; bits 8-10 (IPL) masked out
+   //   usp_out : User Stack Pointer
    output [31:0] pc_out,
    output [15:0] sr_out,
    output [31:0] usp_out
    );
 
-   // Hierarchical taps into the ghdl-generated kernel. These wires are
-   // declared at the top of the TG68KdotC_Kernel module body; reading
-   // them from here forces verilator to preserve them through dead-code
-   // elimination.
+   // Hierarchical taps into the ghdl-generated kernel. Referencing these from
+   // here forces verilator to preserve them through dead-code elimination.
    assign pc_out  = cpu.tg68_pc;
    assign sr_out  = {cpu.flagssr, cpu.flags};
    assign usp_out = cpu.usp;
@@ -65,7 +53,7 @@ module tg68k_tests
       .IPL             (3'b111),
       .IPL_autovector  (1'b0),
       .berr            (1'b0),
-      .CPU             (2'b11),     // 68020 mode (VBR + stack frames)
+      .CPU             (2'b10),     // 68030
       .addr_out        (addr_out),
       .data_write      (data_write),
       .nWr             (nWr),
@@ -73,15 +61,11 @@ module tg68k_tests
       .nLDS            (nLDS),
       .busstate        (busstate),
       .longword        (longword),
-      .nResetOut       (),
       .FC              (fc),
-      .clr_berr        (),
-      .cpu_halted      (),
-      .berr_inhibit    (),
-      .berr_data       (),
-      .skipFetch       (),
-      .regin_out       (),
-      .CACR_out        (),
-      .VBR_out         (vbr_out)
+      .VBR_out         (vbr_out),
+      // PMMU table-walker bus: tied idle (no walks while TC.E=0).
+      .pmmu_walker_ack (1'b0),
+      .pmmu_walker_data(32'b0),
+      .pmmu_walker_berr(1'b0)
       );
 endmodule

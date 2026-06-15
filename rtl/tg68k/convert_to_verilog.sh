@@ -47,6 +47,15 @@ echo "=== Step 2: Synthesize $TOP -> $OUT (FPU off, CPU=68030) ==="
 ghdl synth $GHDL_FLAGS --latches $GENERICS --out=verilog "$TOP" > "$OUT"
 echo "  wrote $OUT ($(wc -l < "$OUT") lines)"
 
+# Standalone kernel for the Verilator CPU corpus bench (SingleStepTests/tg68k/).
+# The bench drives the bare kernel's clkena/busstate bus and pokes its regfile,
+# so it needs the kernel as its own module (not buried inside TG68K_030.v).
+# CPU is a kernel *port* (driven by the bench), so no -gCPU here.
+KERNEL_PARAMS="-gSR_Read=2 -gVBR_Stackframe=2 -gextAddr_Mode=2 -gMUL_Mode=2 -gDIV_Mode=2 -gBitField=2 -gBarrelShifter=2 -gMUL_Hardware=1 -gFPU_Enable=0"
+echo "=== Step 2b: Synthesize standalone TG68KdotC_Kernel.v (bench DUT) ==="
+ghdl synth $GHDL_FLAGS --latches $KERNEL_PARAMS --out=verilog TG68KdotC_Kernel > TG68KdotC_Kernel.v
+echo "  wrote TG68KdotC_Kernel.v ($(wc -l < TG68KdotC_Kernel.v) lines)"
+
 echo "=== Step 3: Generate TG68K_verilog.qip ==="
 {
   echo "# TG68K (MC68030 + PMMU + I/D cache, no FPU) Verilog QIP"
