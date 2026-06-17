@@ -28,10 +28,7 @@ use ieee.std_logic_unsigned.all;
 
 entity TG68K is
    generic(
-      CPU           : std_logic_vector(1 downto 0):="01"; -- 00->68000  01->68010  10->68030
-      FPU_Enable    : integer := 1;                       -- 0=>FPU shell only, 1=>68881/68882 core
-      FPU_Transcendental_Enable : integer := 0;           -- 0=>omit trig/log/exp core, 1=>include it
-      FPU_Packed_Decimal_Enable : integer := 0            -- 0=>omit packed decimal converter, 1=>include it
+      CPU           : std_logic_vector(1 downto 0):="01"  -- 00->68000  01->68010  10->68030
    );
    port(        
       CLK           : in std_logic;
@@ -85,10 +82,7 @@ COMPONENT TG68KdotC_Kernel
       BitField : integer := 2;          --0=>no,      1=>yes,           2=>switchable with CPU(1)
 
       BarrelShifter : integer := 1;     --0=>no,      1=>yes,           2=>switchable with CPU(1)
-      MUL_Hardware : integer := 1;      --0=>no,      1=>yes
-      FPU_Enable : integer := 0;        --0=>FPU shell only, 1=>68881/68882 core
-      FPU_Transcendental_Enable : integer := 0; --0=>omit trig/log/exp core, 1=>include it
-      FPU_Packed_Decimal_Enable : integer := 0  --0=>omit packed decimal converter, 1=>include it
+      MUL_Hardware : integer := 1       --0=>no,      1=>yes
    );
    port(
       clk                              : in std_logic;
@@ -238,12 +232,6 @@ COMPONENT TG68KdotC_Kernel
       debug_pmmu_reg_rdat              : out std_logic_vector(31 downto 0);
       debug_make_berr                  : out std_logic;
       debug_pmmu_fault                 : out std_logic;
-      debug_berr_exception_active      : out std_logic;
-      debug_pmmu_fault_dispatched      : out std_logic;
-      debug_pmmu_fault_was_cleared     : out std_logic;
-      debug_pmmu_fault_rw              : out std_logic;
-      debug_pmmu_fault_is_insn         : out std_logic;
-      debug_pmmu_fault_fc              : out std_logic_vector(2 downto 0);
       debug_trap_format_error          : out std_logic;
       debug_format_error_rte_word      : out std_logic_vector(15 downto 0);
       debug_format_error_pc            : out std_logic_vector(31 downto 0);
@@ -259,7 +247,6 @@ COMPONENT TG68KdotC_Kernel
       debug_pmmu_wstate                : out std_logic_vector(4 downto 0);
       debug_pmmu_atc_buserr            : out std_logic_vector(21 downto 0);
       debug_pmmu_atc_valid             : out std_logic_vector(21 downto 0);
-      debug_pmmu_pending_flags         : out std_logic_vector(15 downto 0);
       debug_pmmu_fault_status          : out std_logic_vector(15 downto 0);
       debug_pmmu_saved_addr            : out std_logic_vector(31 downto 0);
       debug_pmmu_walk_desc_addr        : out std_logic_vector(31 downto 0);
@@ -278,12 +265,8 @@ COMPONENT TG68KdotC_Kernel
       debug_set_trap_chk               : out std_logic;
       debug_data_write_tmp             : out std_logic_vector(31 downto 0);
       debug_FlagsSR                    : out std_logic_vector(7 downto 0);
-      debug_USP                        : out std_logic_vector(31 downto 0);
-      debug_MSP                        : out std_logic_vector(31 downto 0);
-      debug_ISP                        : out std_logic_vector(31 downto 0);
-      debug_a7_is_msp                  : out std_logic;
-      debug_interrupt_mode             : out std_logic;
-      debug_rte_saved_mbit             : out std_logic
+      debug_OP1out                     : out std_logic_vector(31 downto 0);
+      debug_OP2out                     : out std_logic_vector(31 downto 0)
    );
    END COMPONENT;
 
@@ -305,7 +288,6 @@ COMPONENT TG68K_Cache_030
       -- Instruction Cache Interface
       i_addr         : in  std_logic_vector(31 downto 0);
       i_addr_phys    : in  std_logic_vector(31 downto 0);
-      i_fc           : in  std_logic_vector(2 downto 0);
       i_req          : in  std_logic;
       i_cache_inhibit : in  std_logic;
       i_data         : out std_logic_vector(31 downto 0);
@@ -317,7 +299,6 @@ COMPONENT TG68K_Cache_030
       -- Data Cache Interface
       d_addr         : in  std_logic_vector(31 downto 0);
       d_addr_phys    : in  std_logic_vector(31 downto 0);
-      d_fc           : in  std_logic_vector(2 downto 0);
       d_req          : in  std_logic;
       d_we           : in  std_logic;
       d_cache_inhibit : in  std_logic;
@@ -359,7 +340,6 @@ COMPONENT TG68K_Cache_030
    SIGNAL nResetOut   : std_logic;
    SIGNAL autovector  : std_logic;
    SIGNAL cpu1reset   : std_logic;
-   SIGNAL FC_int      : std_logic_vector(2 downto 0);
 
    -- Cache control signals
    SIGNAL cache_enabled   : std_logic;
@@ -435,7 +415,6 @@ BEGIN
    
    RESET <= '0' WHEN nResetOut='0' ELSE 'Z';
    HALT <=  '0' WHEN nResetOut='0' ELSE 'Z';
-   FC <= FC_int;
    cpu1reset <= RESET OR HALT;
 
    -- Cache is only available when CPU(1)='1' (the 68030 slot in this tree) and either cache is enabled
@@ -454,13 +433,10 @@ cpu1: TG68KdotC_Kernel
       extAddr_Mode => 2,         --0=>no,       1=>yes,           2=>switchable with CPU(1)
       MUL_Mode => 2,             --0=>16Bit,    1=>32Bit,         2=>switchable with CPU(1),  3=>no MUL,  
       DIV_Mode => 2,             --0=>16Bit,    1=>32Bit,         2=>switchable with CPU(1),  3=>no DIV,  
-      BitField => 2,             --0=>no,       1=>yes,           2=>switchable with CPU(1)
+      BitField => 2,             --0=>no,       1=>yes,           2=>switchable with CPU(1) 
 
-      BarrelShifter => 2,        --0=>no,       1=>yes,           2=>switchable with CPU(1)
-      MUL_Hardware => 1,         --0=>no,       1=>yes,
-      FPU_Enable => FPU_Enable,
-      FPU_Transcendental_Enable => FPU_Transcendental_Enable,
-      FPU_Packed_Decimal_Enable => FPU_Packed_Decimal_Enable
+      BarrelShifter => 2,        --0=>no,       1=>yes,           2=>switchable with CPU(1)  
+      MUL_Hardware => 1          --0=>no,       1=>yes,  
    )
    PORT MAP(
       CPU => CPU,                -- : in std_logic_vector(1 downto 0):="01";  -- 00->68000  01->68010  10->68030
@@ -472,7 +448,7 @@ cpu1: TG68KdotC_Kernel
       IPL_autovector => autovector, -- : in std_logic:='0';
       addr_out => ADDR,          -- : buffer std_logic_vector(31 downto 0);
       berr => BERR,              -- : in std_logic:='0';     -- only 68000 Stackpointer dummy for Atari ST core
-      FC => FC_int,              -- : out std_logic_vector(2 downto 0);
+      FC => FC,                  -- : out std_logic_vector(2 downto 0);
       data_write => data_write,  -- : out std_logic_vector(15 downto 0);
       busstate => state,         -- : buffer std_logic_vector(1 downto 0);	
       nWr => wr,                 -- : out std_logic;
@@ -591,18 +567,13 @@ cpu1: TG68KdotC_Kernel
       debug_rf_source_addr => open,
       debug_pmove_ea_latched => open,
       debug_reg_QA => open,
-      debug_pmmu_pending_flags => open,
       debug_pmmu_busy => open,
       debug_micro_state => open,
       debug_next_micro_state => open,
       debug_memmask => open,
       debug_sndOPC => open,
-      debug_USP => open,
-      debug_MSP => open,
-      debug_ISP => open,
-      debug_a7_is_msp => open,
-      debug_interrupt_mode => open,
-      debug_rte_saved_mbit => open
+      debug_OP1out => open,
+      debug_OP2out => open
    );
  
    PROCESS (CLK)
@@ -748,7 +719,6 @@ PROCESS (CLK, RESET, state, as_s, as_e, rw_s, rw_e, uds_s, uds_e, lds_s, lds_e)
       -- Instruction Cache Interface
       i_addr         => i_cache_addr,
       i_addr_phys    => pmmu_addr_phys,   -- Physical address from PMMU
-      i_fc           => FC_int,
       i_req          => i_cache_req,
       i_cache_inhibit => pmmu_ch_inhibit,  -- Cache inhibit from PMMU
       i_data         => i_cache_data,
@@ -760,7 +730,6 @@ PROCESS (CLK, RESET, state, as_s, as_e, rw_s, rw_e, uds_s, uds_e, lds_s, lds_e)
       -- Data Cache Interface
       d_addr         => d_cache_addr,
       d_addr_phys    => pmmu_addr_phys,   -- Physical address from PMMU
-      d_fc           => FC_int,
       d_req          => d_cache_req,
       d_we           => d_cache_we,
       d_cache_inhibit => pmmu_ch_inhibit,  -- Cache inhibit from PMMU

@@ -1,11 +1,18 @@
-# MacIIvi MC68030 TG68K core (integer kernel + PMMU + I/D cache, no FPU) — VHDL sources.
-# Listed in ghdl dependency order. convert_to_verilog.sh turns these into TG68K.v.
-# Quartus can compile these VHDL files directly; the Verilator bench uses the
-# converted TG68K.v (Verilator cannot read VHDL).
+# TG68K.C 68030 core (030_mmu branch) — IDENTICAL to MacLC_MiSTer's 030_LCii core.
+# This is the SAME MC68030 (integer kernel + PMMU + cache control) that boots the
+# Mac LC II; MacIIvi tracks it byte-for-byte so a fix to one applies to both. Sync
+# with ../../../MacLC_MiSTer/rtl/tg68k after any CPU change (see convert_to_verilog.sh).
+#
+# Order matters: package, then ALU, PMMU and cache (instantiated by the kernel),
+# then the kernel, then the Mac bus wrapper.
+#
+# NOTE: TG68K.vhd (the upstream top-level) is intentionally NOT listed here. The Mac
+# core uses the cpu030_wrapper.v wrapper below, which provides the Mac-specific 68K
+# bus state machine, E-clock/VMA, BR/BG/BGACK arbitration, auto-vectoring and
+# berr-hold that the upstream skeleton lacks. TG68K.vhd is kept for reference only.
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K_Pack.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K_ALU.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K_PMMU_030.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K_Cache_030.vhd ]
-set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K_CacheCtrl_030.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68KdotC_Kernel.vhd ]
-set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K.vhd ]
+set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) cpu030_wrapper.v ]

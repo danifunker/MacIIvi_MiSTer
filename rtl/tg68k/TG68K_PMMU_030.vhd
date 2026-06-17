@@ -4,19 +4,6 @@
 --           transparent translation, fault detection, PMOVE/PTEST/PFLUSH/PLOAD instructions,
 --           real page table walking via memory arbiter in cpu_wrapper.v
 -- The walker now reads actual descriptors from memory for non-identity address translation.
---
--- RMC / atomic table-search deviation from MC68030 UM 9.5.2:
---   The spec requires RMC asserted for the entire duration of a table search so
---   that no other bus master can interleave. This implementation does not drive
---   a bus-wide RMC lock. The CPU side is handled: while 'walker_active' is high
---   in cpu_wrapper.v, CPU memory access is suppressed (ramsel gated by
---   ~walker_active, line 106). Other Amiga chip-bus masters (Agnus/Paula/
---   Blitter) can still use their normal DMA slots against chip RAM between
---   consecutive walker descriptor reads. In practice, AmigaOS places page
---   tables in fast RAM, which the chipset masters do not access, so the walker
---   has de-facto exclusive access to page-table memory across the walk. This
---   deviation is known and latent; fixing it would require stalling chipset
---   DMA during any table walk, which would corrupt display/audio output.
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
@@ -44,7 +31,6 @@ entity TG68K_PMMU_030 is
     req            : in  std_logic;
     is_insn        : in  std_logic;
     rw             : in  std_logic; -- '1' read, '0' write
-    rmw            : in  std_logic := '0'; -- read-modify-write bus sequence (TAS/CAS/CAS2)
     fc             : in  std_logic_vector(2 downto 0);
     addr_log       : in  std_logic_vector(31 downto 0);
     addr_phys      : out std_logic_vector(31 downto 0);
@@ -96,17 +82,10 @@ entity TG68K_PMMU_030 is
     debug_ptr3_desc_addr : out std_logic_vector(31 downto 0);
     debug_ptr3_desc_data : out std_logic_vector(31 downto 0);
     debug_saved_fc       : out std_logic_vector(2 downto 0);
-    debug_pending_flags  : out std_logic_vector(15 downto 0);
     -- BUG #446: sticky latch — set on any PMOVE with an undecoded reg_sel.
     -- Useful for SignalTap / post-run forensics: real MC68030 ignores such
     -- writes, and silent ignore hid software bugs in prior triage.
     debug_illegal_reg_sel : out std_logic;
-    -- MC68030 UM 9.2.3 MMUDIS: when asserted, the MMU is prevented from searching
-    -- the ATC and the execution unit from performing table searches. Logical
-    -- addresses pass through as physical addresses. TTRs continue to operate
-    -- (MMUDIS does not affect transparent translation). Defaulted to '0' because
-    -- the Amiga platform has no MMUDIS source.
-    mmudis              : in  std_logic := '0';
     cpu_reset           : in  std_logic := '0'
   );
 end TG68K_PMMU_030;
@@ -123,10 +102,10 @@ architecture rtl of TG68K_PMMU_030 is
     return result;
   end function;
   -- MC68030 PMMU Control Registers
-  -- All registers are PMOVE-only per the MC68030 User's Manual (sections 9.7
-  -- and 9.8). MOVEC access to these registers is NOT defined on MC68030; the
-  -- kernel MOVEC whitelist correctly excludes them, and MOVEC to TC/TT0/TT1/
-  -- MMUSR traps as privilege violation.
+  -- All registers are PMOVE-only in this tree (the kernel MOVEC whitelist does
+  -- not include PMMU registers; MOVEC to TC/TT0/TT1/MMUSR traps as privilege
+  -- violation). MC68030 spec lists TC/TT0/TT1/MMUSR as MOVEC-accessible, but
+  -- that path is deliberately not wired here.
   -- Implemented: TC, TT0, TT1, CRP (64-bit), SRP (64-bit), MMUSR
   -- Not implemented: CAL, VAL, SCC, AC (removed — unused by Amiga software)
   
@@ -137,30 +116,22 @@ architecture rtl of TG68K_PMMU_030 is
   signal SRP_L  : std_logic_vector(31 downto 0); -- Supervisor Root Pointer low 32 bits (64-bit total)
   signal TT0    : std_logic_vector(31 downto 0); -- Transparent Translation Register 0
   signal TT1    : std_logic_vector(31 downto 0); -- Transparent Translation Register 1
-  signal MMUSR  : std_logic_vector(15 downto 0); -- MMU Status Register (MC68030 UM 9.7.4: architecturally 16 bits)
+  signal MMUSR  : std_logic_vector(31 downto 0); -- MMU Status Register
   -- NOTE: CAL, VAL, SCC, AC registers are defined in MC68030 but not implemented
   -- They were removed as unused signals to avoid synthesis warnings
   -- Internal
   signal tc_en  : std_logic; -- translation enable bit (TC[31] in some docs; keep flexible here)
-  signal tc_table_config_valid : std_logic; -- Valid TC fields for PMMU table-search instructions, independent of TC.E
   -- Walker descriptor address register (must persist across clock cycles for W_*_LOW states)
   signal desc_addr_reg : std_logic_vector(31 downto 0) := (others => '0');
-  signal ptest_desc_addr_reg : std_logic_vector(31 downto 0) := (others => '0');
-  signal ptest_desc_return_pending : std_logic := '0';
   signal last_mem_rdat : std_logic_vector(31 downto 0) := (others => '0');
   -- MC68030 register write masks (ENABLED for spec compliance)
   -- TC register mask: preserve E(31), SRE(25), FCL(24), and all field bits (23-0), clear reserved bits 30-26
   -- Note: Bit 23 (PS MSB) is forced to 1 in write logic since all valid PS values (8-15) have MSB=1
   constant TC_WRITE_MASK : std_logic_vector(31 downto 0) := "10000011111111111111111111111111";
   -- TTR register mask (MC68030 User's Manual section 9.2.6):
-  -- Reserved bits 14-11, 7, 3 are "must be programmed as 0" by spec, but the
-  -- hardware preserves whatever software writes and reads it back unchanged.
-  -- WinUAE follows the same convention: cpummu30.cpp:436 stores the raw
-  -- longword; only mmu030_decode_tt() extracts the documented fields. Our
-  -- ttr_check() procedure also consults only the documented bits, so storing
-  -- the full 32-bit value is functionally equivalent and matches WinUAE /
-  -- real-hardware behavior.
-  constant TTR_WRITE_MASK : std_logic_vector(31 downto 0) := (others => '1');
+  -- Preserve: Address(31:16), E(15), CI(10), RW(9), RWM(8), FC_Base(6:4), FC_Mask(2:0)
+  -- Clear reserved: bits 14-11, 7, 3
+  constant TTR_WRITE_MASK : std_logic_vector(31 downto 0) := "11111111111111111000011101110111"; -- 0xFFFF8777
   -- CRP/SRP HIGH mask: preserve L/U (31), Limit (30-16), DT (1:0); clear reserved (15-2)
   -- HIGH word format: L/U[63] + Limit[62:48] + Reserved[47:34] + DT[33:32]
   constant CRP_HIGH_MASK : std_logic_vector(31 downto 0) := "11111111111111110000000000000011"; -- 0xFFFF0003
@@ -177,10 +148,6 @@ architecture rtl of TG68K_PMMU_030 is
   signal ttr0_wp_comb    : std_logic;
   signal ttr1_ci_comb    : std_logic;
   signal ttr1_wp_comb    : std_logic;
-  signal atc_success_comb : std_logic;
-  signal atc_phys_comb    : std_logic_vector(31 downto 0);
-  signal atc_ci_comb      : std_logic;
-  signal atc_wp_comb      : std_logic;
   -- BUG #416: Track which addr_log/fc produced the current addr_phys_reg.
   -- ATC translations update addr_phys_reg on rising_edge, but addr_log changes
   -- combinationally after the Kernel's assignment in the same edge. This creates
@@ -195,8 +162,6 @@ architecture rtl of TG68K_PMMU_030 is
   -- change address translation even when addr_log/fc/rw are unchanged.
   signal xlat_cfg_seq       : unsigned(7 downto 0) := (others => '0');
   signal translated_cfg_seq : unsigned(7 downto 0) := (others => '0');
-  signal xlat_cfg_seq_seen  : unsigned(7 downto 0) := (others => '0');
-  signal xlat_cfg_seq_walk_seen : unsigned(7 downto 0) := (others => '0');
   -- Translation result latches
   signal addr_phys_reg      : std_logic_vector(31 downto 0) := (others => '0');
   signal cache_inhibit_reg  : std_logic := '0';
@@ -207,7 +172,6 @@ architecture rtl of TG68K_PMMU_030 is
   signal fault_fc_reg       : std_logic_vector(2 downto 0) := (others => '0');   -- BUG #414: FC at fault time
   signal fault_rw_reg       : std_logic := '1';                                   -- BUG #414: RW at fault time
   signal fault_is_insn_reg  : std_logic := '0';                                   -- BUG #414: Instruction fetch flag
-  signal fault_current_req_match : std_logic := '0';
   
   -- Debug: sticky fault status latch (captures MMUSR at exact moment of fault)
   signal debug_fault_status_latch : std_logic_vector(15 downto 0) := (others => '0');
@@ -251,6 +215,7 @@ architecture rtl of TG68K_PMMU_030 is
   -- atc_is_insn removed: FC already encodes instruction vs data (FC=2/6 vs FC=1/5)
   signal atc_shift : atc_shift_t;
   signal atc_page_size : atc_page_size_t;
+  signal atc_global : atc_val_t;  -- G bit: global page (survives PFLUSHAN)
   signal atc_level : atc_level_t;  -- BUG #412: walk level count for MMUSR N field
   signal atc_mru   : atc_val_t;  -- Pseudo-LRU: MRU bit per entry (1=recently used)
   signal atc_buserr : atc_val_t;  -- Cached fault entry present in ATC; fault class comes from atc_fault_status
@@ -259,7 +224,6 @@ architecture rtl of TG68K_PMMU_030 is
   signal atc_mru_update_idx : integer range 0 to ATC_ENTRIES-1 := 0;  -- Index to update
   signal atc_mbit_inval_req : std_logic := '0';  -- Request ATC invalidation for M-bit miss (per WinUAE)
   signal atc_mbit_inval_idx : integer range 0 to ATC_ENTRIES-1 := 0;  -- Index to invalidate
-  signal translated_match_dbg : std_logic;
   signal walk_req  : std_logic;
   signal walker_completed : std_logic := '0';
   -- Translation control decoding (TC register fields)
@@ -278,9 +242,6 @@ architecture rtl of TG68K_PMMU_030 is
   signal mmusr_update_value : std_logic_vector(31 downto 0) := (others => '0');
   -- MMU Configuration Exception tracking
   signal mmu_config_error   : std_logic := '0';
-  signal tc_config_check_pending : std_logic := '0';
-  signal tc_config_check_value   : std_logic_vector(31 downto 0) := (others => '0');
-  signal tc_config_valid         : std_logic := '1';
   -- BUG #446: sticky latch for illegal-reg_sel observations (see port).
   signal pmmu_illegal_reg_sel_seen : std_logic := '0';
   -- MC68030 page table walker FSM
@@ -318,8 +279,7 @@ architecture rtl of TG68K_PMMU_030 is
   signal ptest_rw : std_logic := '1';  -- '1'=PTESTR (read), '0'=PTESTW (write), from brief(9)
   signal ptest_level : std_logic_vector(2 downto 0) := "000";  -- BUG #413: PTEST level from brief(12:10)
   -- BUG #396: PTEST/PLOAD walk must NOT update addr_phys_reg.
-  -- ptest_active clears after the command is accepted; pload_active is held until
-  -- the translation process can start or discard the preload request.
+  -- ptest_active/pload_active are cleared after 1 cycle (before walker_completed).
   -- This flag persists through the entire walk so walker_completed can skip addr_phys_reg.
   signal instr_walk_pending : std_logic := '0';
   signal ptest_walk_pending : std_logic := '0';  -- Table-search PTEST active: update MMUSR only, never alter the ATC
@@ -334,8 +294,8 @@ architecture rtl of TG68K_PMMU_030 is
   signal pflush_active : std_logic := '0';
   signal pflush_addr : std_logic_vector(31 downto 0) := (others => '0');
   signal pflush_fc : std_logic_vector(2 downto 0) := (others => '0');
-  signal pflush_mode : std_logic_vector(2 downto 0) := (others => '0');  -- MODE field from brief(12:10)
-  signal pflush_mask : std_logic_vector(2 downto 0) := (others => '0');  -- FC0-FC2 comparison mask from brief(7:5); FC3 is unsupported on MC68030
+  signal pflush_mode : std_logic_vector(12 downto 8) := (others => '0');  -- From brief word
+  signal pflush_mask : std_logic_vector(2 downto 0) := (others => '0');  -- FC comparison mask from brief(7:5)
   
   -- Page table walking state
   signal walk_level     : integer range 0 to 5 := 0; -- Current level being walked (0-4 for FCL=0, 0-5 for FCL=1)
@@ -350,7 +310,6 @@ architecture rtl of TG68K_PMMU_030 is
   signal ptr3_desc_addr_reg : std_logic_vector(31 downto 0) := (others => '0');
   signal ptr3_desc_data_reg : std_logic_vector(31 downto 0) := (others => '0');
   signal walk_desc_is_long : std_logic := '0'; -- 1=long format (DT=11), 0=short format (DT=10/01)
-  signal walk_page_from_indirect : std_logic := '0'; -- Page descriptor was reached through one indirect descriptor
   signal walk_parent_dt_long : std_logic := '0'; -- BUG #409: 1=parent DT=11, entries are 8 bytes (stride 8)
   -- BUG #387 FIX: Walker timeout counter to detect stuck memory requests
   signal walker_timeout_counter : integer range 0 to 1023 := 0;
@@ -359,6 +318,7 @@ architecture rtl of TG68K_PMMU_030 is
   signal walk_vpn       : std_logic_vector(31 downto 0) := (others => '0'); -- Virtual page being walked
   signal walk_fault     : std_logic := '0'; -- Page fault flag
   signal walk_attr      : std_logic_vector(7 downto 0) := (others => '0'); -- Page attributes
+  signal walk_global    : std_logic := '0'; -- G bit from long-format descriptor (bit 10)
   signal walk_supervisor : std_logic := '0'; -- BUG #157 FIX: Cumulative S bit from TABLE descriptors
   signal walk_write_protect : std_logic := '0'; -- Cumulative WP bit from TABLE descriptors (per MC68030 spec 9.5.2)
   signal walk_is_root_pointer : std_logic := '0'; -- Root pointer DT=01 early termination (no S/WP/U/M checks)
@@ -524,7 +484,6 @@ architecture rtl of TG68K_PMMU_030 is
       fc        : in  std_logic_vector(2 downto 0);
       is_insn   : in  std_logic;
       rw        : in  std_logic;  -- '1'=read, '0'=write
-      rmw       : in  std_logic;  -- read-modify-write sequence; requires TTR RWM=1
       matched   : out std_logic;
       ci        : out std_logic;
       wp        : out std_logic) is
@@ -599,21 +558,14 @@ architecture rtl of TG68K_PMMU_030 is
       -- Bit 8 (RWM): 0 = R/W field used, 1 = R/W field ignored
       -- Bit 9 (R/W): 0 = write accesses transparent, 1 = read accesses transparent
       -- When RWM=1, both read and write accesses are transparently translated
-      if rmw = '1' and tt(8) = '0' then
-        -- MC68030 UM 9.2.6: RMW cycles are transparent only when RWM=1.
-        matched := '0';
-        ci := '0';
-        wp := '0';
-      elsif tt(8) = '0' then  -- RWM=0: R/W field is USED (check access type)
+      if tt(8) = '0' then  -- RWM=0: R/W field is USED (check access type)
         if tt(9) = '1' and rw = '0' then
           -- R/W=1 (read-only transparent) but this is a write - no match
           matched := '0';
-          ci := '0';
           wp := '0';
         elsif tt(9) = '0' and rw = '1' then
           -- R/W=0 (write-only transparent) but this is a read - no match
           matched := '0';
-          ci := '0';
           wp := '0';
         else
           wp := '0';  -- Access type matches
@@ -647,7 +599,7 @@ architecture rtl of TG68K_PMMU_030 is
     variable dummy_ci : std_logic;
     variable dummy_wp : std_logic;
   begin
-    ttr_check(tt, addr, fc, is_insn, '1', '0', matched, dummy_ci, dummy_wp);  -- Default to read for simple match check
+    ttr_check(tt, addr, fc, is_insn, '1', matched, dummy_ci, dummy_wp);  -- Default to read for simple match check
   end procedure;
   
   -- Extract table index from virtual address (MC68030 compliant)
@@ -773,35 +725,6 @@ architecture rtl of TG68K_PMMU_030 is
       return idx_bits(check_idx) = 0;
     end if;
   end function;
-  -- Early-termination limit checking uses the NEXT logical-address index field.
-  -- Root-pointer DT=01 is special:
-  --   * WinUAE skips the root-pointer limit check when TC.FCL is set because
-  --     there is no memory-resident FC-table descriptor to apply the limit to.
-  function early_term_limit_applies(
-    is_root_pointer : std_logic;
-    fcl             : std_logic;
-    level           : integer;
-    idx_bits        : tc_bits_array_t
-  ) return boolean is
-  begin
-    if is_root_pointer = '1' then
-      if fcl = '1' then
-        return false;
-      end if;
-      return idx_bits(0) /= 0;
-    end if;
-    return not is_final_table_level(fcl, level, idx_bits);
-  end function;
-  function early_term_limit_level(
-    is_root_pointer : std_logic;
-    level           : integer
-  ) return integer is
-  begin
-    if is_root_pointer = '1' then
-      return 0;
-    end if;
-    return level + 1;
-  end function;
   -- Check if descriptor is a page descriptor (not table pointer)
   -- MC68030 descriptor format: bits 1:0 determine type
   -- 00 = Invalid, 01 = Page descriptor, 10/11 = Table pointer
@@ -856,21 +779,6 @@ architecture rtl of TG68K_PMMU_030 is
       end if;
     end if;
     return total_bits;
-  end function;
-  function tc_config_invalid(tc : std_logic_vector(31 downto 0)) return boolean is
-    variable ps_val : integer;
-  begin
-    if tc(31) = '0' then
-      return false;
-    end if;
-    ps_val := to_integer(unsigned(tc(23 downto 20)));
-    if ps_val < 8 then
-      return true;
-    end if;
-    if tc_total_bits(tc) /= 32 then
-      return true;
-    end if;
-    return false;
   end function;
   -- Check if descriptor is short format (DT=10, 32-bit)
   function desc_is_short(desc : std_logic_vector(31 downto 0)) return boolean is
@@ -989,63 +897,6 @@ architecture rtl of TG68K_PMMU_030 is
     result(2 downto 0) := level;  -- Bits 2-0: N (Number of Levels for page walk)
     return result;
   end function;
-  -- Leveled PTEST can stop on a table descriptor with S/W accumulated, but with
-  -- no B/L/I fault classification. This matches WinUAE's MMUSR stop-search state.
-  function encode_mmusr_ptest(
-    supervisor_violation : std_logic;
-    write_protect : std_logic;
-    modified : std_logic;
-    transparent : std_logic;
-    level : std_logic_vector(2 downto 0)
-  ) return std_logic_vector is
-    variable result : std_logic_vector(31 downto 0);
-  begin
-    result := (others => '0');
-    result(13) := supervisor_violation;   -- Bit 13: S
-    result(11) := write_protect;          -- Bit 11: W
-    result(9)  := modified;               -- Bit 9: M
-    result(6)  := transparent;            -- Bit 6: T
-    result(2 downto 0) := level;          -- Bits 2-0: N
-    return result;
-  end function;
-  function encode_ptest_table_status(
-    fc : std_logic_vector(2 downto 0);
-    accum_supervisor : std_logic;
-    current_supervisor : std_logic;
-    accum_write_protect : std_logic;
-    current_write_protect : std_logic;
-    level : std_logic_vector(2 downto 0)
-  ) return std_logic_vector is
-    variable supervisor_violation : std_logic := '0';
-  begin
-    if fc(2) = '0' and (accum_supervisor = '1' or current_supervisor = '1') then
-      supervisor_violation := '1';
-    end if;
-    return encode_mmusr_ptest(
-      supervisor_violation => supervisor_violation,
-      write_protect => accum_write_protect or current_write_protect,
-      modified => '0',
-      transparent => '0',
-      level => level
-    );
-  end function;
-  function page_descriptor_count(
-    level : integer;
-    from_indirect : std_logic;
-    root_pointer : std_logic
-  ) return std_logic_vector is
-    variable count : integer;
-  begin
-    if root_pointer = '1' then
-      count := 0;
-    else
-      count := level + 1;
-      if from_indirect = '1' then
-        count := count + 1;
-      end if;
-    end if;
-    return std_logic_vector(to_unsigned(count, 3));
-  end function;
   -- Calculate effective page shift for early termination
   -- MC68030 spec: When a page descriptor (DT=01) is found before the final table level,
   -- the remaining index bits become part of the page offset, creating a larger "super page".
@@ -1100,67 +951,26 @@ architecture rtl of TG68K_PMMU_030 is
   end function;
 begin
   -- Connect internal register to output port
-  ptest_desc_addr <= ptest_desc_addr_reg;
+  ptest_desc_addr <= desc_addr_reg;
   -- BUG #371 FIX: Combinational TTR match for zero-latency addr_phys bypass
   -- When MMU is first enabled, addr_phys_reg is stale (from previous cycle).
   -- TTR transparent translations always produce phys=log (identity mapping),
   -- so we can compute the match combinationally and bypass the registered result.
-  process(TT0, TT1, addr_log, fc, is_insn, rw, rmw)
+  process(TT0, TT1, addr_log, fc, is_insn, rw)
     variable m0, m1 : std_logic;
     variable ci0, wp0, ci1, wp1 : std_logic;
   begin
     m0 := '0'; m1 := '0';
     ci0 := '0'; wp0 := '0';
     ci1 := '0'; wp1 := '0';
-    ttr_check(TT0, addr_log, fc, is_insn, rw, rmw, m0, ci0, wp0);
-    ttr_check(TT1, addr_log, fc, is_insn, rw, rmw, m1, ci1, wp1);
+    ttr_check(TT0, addr_log, fc, is_insn, rw, m0, ci0, wp0);
+    ttr_check(TT1, addr_log, fc, is_insn, rw, m1, ci1, wp1);
     ttr0_match_comb <= m0;
     ttr1_match_comb <= m1;
     ttr0_ci_comb <= ci0;
     ttr0_wp_comb <= wp0;
     ttr1_ci_comb <= ci1;
     ttr1_wp_comb <= wp1;
-  end process;
-  -- Successful ATC hits can also bypass the registered translation result.
-  -- This keeps addr_phys/cache attributes aligned with the current request and
-  -- avoids stalling a clean cached access behind the previous cycle's output.
-  process(addr_log, fc, rw, tc_en, mmudis, atc_valid, atc_flush_req, atc_fc,
-          atc_shift, atc_log_base, atc_phys_base, atc_attr, atc_buserr)
-    variable aligned_addr : std_logic_vector(31 downto 0);
-    variable phys_base    : unsigned(31 downto 0);
-    variable offset       : unsigned(31 downto 0);
-    variable phys_result  : unsigned(31 downto 0);
-  begin
-    atc_success_comb <= '0';
-    atc_phys_comb    <= (others => '0');
-    atc_ci_comb      <= '0';
-    atc_wp_comb      <= '0';
-
-    if tc_en = '1' and mmudis = '0' then
-      for i in 0 to ATC_ENTRIES-1 loop
-        if atc_valid(i) = '1' and atc_flush_req = '0' then
-          aligned_addr := align_addr(addr_log, atc_shift(i));
-          if atc_fc(i) = fc and aligned_addr = atc_log_base(i) then
-            if rw = '1' or atc_attr(i)(1) = '1' or atc_attr(i)(0) = '1' or atc_buserr(i) = '1' then
-              -- Only bypass successful cached translations. Faulting ATC entries
-              -- still go through the registered path so the fault handshake can
-              -- latch MMUSR/fault state before the CPU is released.
-              if atc_buserr(i) = '0' and
-                 not (rw = '0' and atc_attr(i)(0) = '1') and
-                 not (fc(2) = '0' and atc_attr(i)(3) = '0') then
-                phys_base := unsigned(atc_phys_base(i));
-                offset    := unsigned(addr_log) - unsigned(atc_log_base(i));
-                phys_result := phys_base + offset;
-                atc_success_comb <= '1';
-                atc_phys_comb    <= std_logic_vector(phys_result);
-                atc_ci_comb      <= atc_attr(i)(2);
-                atc_wp_comb      <= atc_attr(i)(0);
-              end if;
-            end if;
-          end if;
-        end if;
-      end loop;
-    end if;
   end process;
   -- Reset and register writes
   process(clk, nreset)
@@ -1174,9 +984,9 @@ begin
     variable page_offset_bits : integer;
   begin
     if nreset = '0' then
-      -- MC68030 hard reset clears TC. Disabled TC images are not configuration
-      -- checked, so PS=0 is legal while E=0 and must read back as zero.
-      TC    <= (others => '0');
+      -- MC68030: Initialize TC with E=0 (disabled) but PS=8 (minimum valid)
+      -- Bit 23 must be 1 for valid PS values (8-15), so initialize to x"00800000"
+      TC    <= x"00800000";
       CRP_H <= (others => '0');
       CRP_L <= (others => '0');
       SRP_H <= (others => '0');
@@ -1190,9 +1000,6 @@ begin
       xlat_cfg_seq <= (others => '0');
       -- ptest_addr, ptest_fc, ptest_rw now driven by edge detection process (BUG #397)
       mmu_config_error <= '0';
-      tc_config_check_pending <= '0';
-      tc_config_check_value <= (others => '0');
-      tc_config_valid <= '1';
       pmmu_illegal_reg_sel_seen <= '0';
     elsif rising_edge(clk) then
       atc_flush_req <= '0';
@@ -1203,55 +1010,15 @@ begin
       if mmu_config_ack = '1' then
         mmu_config_error <= '0';
       end if;
-      -- Pipeline TC consistency validation so PMOVE data returning from RAM does
-      -- not feed the full TC field-sum check and exception latch in one cycle.
-      if tc_config_check_pending = '1' then
-        tc_config_check_pending <= '0';
-        tc_e := tc_config_check_value(31);
-        ps_val := to_integer(unsigned(tc_config_check_value(23 downto 20)));
-        if tc_e = '0' then
-          tc_config_valid <= '1';
-        elsif ps_val < 8 then
-          -- MC68030 UM 9.7.2: on MMU configuration exception the TC image is
-          -- loaded, but the E bit is cleared.
-          tc_config_valid <= '1';
-          mmu_config_error <= '1';
-          TC(31) <= '0';
-          -- synthesis translate_off
-          report "MMU_CONFIG: Invalid PS field=" & integer'image(ps_val) &
-                 " (must be 8-15), raising configuration exception" severity warning;
-          -- synthesis translate_on
-        else
-          total_bits := tc_total_bits(tc_config_check_value);
-          if total_bits /= 32 then
-            -- MC68030 UM 9.7.2: on MMU configuration exception the TC image is
-            -- loaded, but the E bit is cleared.
-            tc_config_valid <= '1';
-            mmu_config_error <= '1';
-            TC(31) <= '0';
-            -- synthesis translate_off
-            report "MMU_CONFIG: Field sum=" & integer'image(total_bits) &
-                   " (must be 32), raising configuration exception" severity warning;
-            -- synthesis translate_on
-          else
-            tc_config_valid <= '1';
-          end if;
-        end if;
-      end if;
       -- Handle MMUSR updates with MC68030-compliant priority (MMUSR register only)
       -- IMPORTANT: These only affect MMUSR, not other registers!
       if cpu_reset = '1' then
-        -- MC68030 RESET (soft reset / RESET instruction) clears the translation
-        -- enable bit in TC and the enable bits in both TTRs. Preserve the rest
-        -- of the register contents. Per MC68030 UM 9.2.2 (PDF 14324-14326)
-        -- and WinUAE cpummu30.cpp L2690-2700, soft reset does NOT invalidate
-        -- ATC entries; only a hard reset (nreset='0') flushes the ATC.
-        -- Software that re-enables translation after RESET is expected to
-        -- issue PFLUSHA explicitly if it cannot reuse the existing ATC entries.
+        -- MC68030 RESET clears the translation enable bit in TC and the enable
+        -- bits in both TTRs. Preserve the remaining register contents.
         TC(31) <= '0';
-        tc_config_valid <= '1';
         TT0(15) <= '0';
         TT1(15) <= '0';
+        atc_flush_req <= '1';
         ptest_active <= '0';
         xlat_cfg_seq <= xlat_cfg_seq + 1;
       elsif ptest_update_mmusr = '1' then
@@ -1264,7 +1031,7 @@ begin
         null;
       elsif mmusr_update_req = '1' then
         -- Medium priority: Translation engine update (automatic updates)
-        MMUSR <= mmusr_update_value(15 downto 0);
+        MMUSR <= mmusr_update_value;
         mmusr_update_ack <= '1';
       end if;
       -- BUG FIX: Clear ptest_active when translation process signals completion
@@ -1323,17 +1090,35 @@ begin
             -- 23-20: PS (Page Size), 19-16: IS (Initial Shift), 15-12: TIA, 11-8: TIB, 7-4: TIC, 3-0: TID
             -- Reserved bits: 30-26 only (all other bits are valid control fields)
             tc_write_val := reg_wdat and TC_WRITE_MASK;
+            tc_e := reg_wdat(31);
             -- BUG #445: mmu_config_error is a sticky latch.
             -- A valid TC write (or TC.E=0) does NOT clear it; only mmu_config_ack
-            -- (from the kernel taking vector 56) or reset clears the latch.
-            -- MC68030 UM 9.7.2 / 9.7.5.3: TC consistency checks are only
-            -- performed when the new value has E=1. With E=0, translation is
-            -- disabled and software is allowed to load TC images like $00000000
-            -- without taking vector 56. WinUAE follows the same rule by
-            -- returning early when translation is disabled.
-            tc_config_check_value <= tc_write_val;
-            tc_config_check_pending <= '1';
-            tc_config_valid <= not tc_write_val(31);
+            -- (from the kernel taking vector 56) or reset clears the latch. Without
+            -- stickiness, software that writes a bad TC followed by a good TC
+            -- before the kernel dispatches the trap would silently lose the
+            -- exception, because pmmu_config_err would drop to 0 combinationally
+            -- via the decode-process default before trap_mmu_config is latched.
+            if tc_e = '1' then
+              ps_val := to_integer(unsigned(reg_wdat(23 downto 20)));
+              -- Check 1: PS field must be 8-15 (values 0-7 are reserved)
+              if ps_val < 8 then
+                mmu_config_error <= '1';
+                -- synthesis translate_off
+                report "MMU_CONFIG: Invalid PS field=" & integer'image(ps_val) &
+                       " (must be 8-15), raising configuration exception" severity warning;
+                -- synthesis translate_on
+              else
+                -- Check 2: Field sum must equal 32 per MC68030 spec (stop adding TIx at first zero)
+                total_bits := tc_total_bits(reg_wdat);
+                if total_bits /= 32 then
+                  mmu_config_error <= '1';
+                  -- synthesis translate_off
+                  report "MMU_CONFIG: Field sum=" & integer'image(total_bits) &
+                         " (must be 32), raising configuration exception" severity warning;
+                  -- synthesis translate_on
+                end if;
+              end if;
+            end if;
             TC <= tc_write_val;
             report "BUG387_TC_WRITE: tc_val=0x" &
                    integer'image(to_integer(unsigned(tc_write_val(31 downto 16)))) & "_" &
@@ -1345,8 +1130,8 @@ begin
           when "10010" =>  -- SRP: P-reg 0x12
             -- SRP register write - MC68030 Long-Format Root Pointer (same format as CRP)
             if reg_part = '1' then
-              -- SRP HIGH WORD (bits 63-32): L/U[63] + Limit[62:48] + Reserved[47:34] + DT[33:32]
-              -- MC68030 UM 9.5.1.1: DT is a 2-bit field (codes $0..$3), reserved bits 47-34
+              -- SRP HIGH WORD (bits 63-32): L/U[63] + Limit[62:48] + Reserved[47:33] + DT[32]
+              -- MC68030 spec: L/U bit 63, Limit bits 62-48, reserved bits 47-33 (zero), DT bit 32
               report "PMMU_REG_WRITE: SRP_H reg_part=" & std_logic'image(reg_part) &
                      " reg_wdat=" & integer'image(to_integer(signed(reg_wdat))) severity note;
               SRP_H <= reg_wdat and CRP_HIGH_MASK;
@@ -1372,8 +1157,8 @@ begin
           when "10011" =>  -- CRP: P-reg 0x13
             -- CRP register write - MC68030 Long-Format Root Pointer per User's Manual section 9.2.2
             if reg_part = '1' then
-              -- CRP HIGH WORD (bits 63-32): L/U[63] + Limit[62:48] + Reserved[47:34] + DT[33:32]
-              -- MC68030 UM 9.5.1.1: DT is a 2-bit field (codes $0..$3), reserved bits 47-34
+              -- CRP HIGH WORD (bits 63-32): L/U[63] + Limit[62:48] + Reserved[47:33] + DT[32]
+              -- MC68030 spec: L/U bit 63, Limit bits 62-48, reserved bits 47-33 (zero), DT bit 32
               report "PMMU_REG_WRITE: CRP_H reg_part=" & std_logic'image(reg_part) &
                      " reg_wdat=" & integer'image(to_integer(signed(reg_wdat))) severity note;
               CRP_H <= reg_wdat and CRP_HIGH_MASK;
@@ -1400,18 +1185,21 @@ begin
           when "11000" =>
             -- MC68030 UM 9.6.3.4: PMOVE to MMUSR is a direct 16-bit store
             -- MMUSR is fully read-write via PMOVE (software clears before PTEST)
-            MMUSR <= reg_wdat(15 downto 0);
+            MMUSR(15 downto 0) <= reg_wdat(15 downto 0);
           when others =>
-            -- MC68030 UM 9.6 (PDF line 15301-15303): "PMOVE for unsupported
-            -- registers (CAL, VAL, SCC, BAD, BACx, DRP, and AC)" is on the list
-            -- of instructions that "must be avoided or emulated in the
-            -- exception routine for F-line unimplemented instructions."
-            -- The kernel's PMOVE decode already F-line traps any reg_sel
-            -- outside the MC68030 set at TG68KdotC_Kernel.vhd (before the PMMU
-            -- sees reg_we). The "when others" branch here should therefore be
-            -- unreachable in real use; keep the sticky debug latch for
-            -- SignalTap but do NOT raise mmu_config_error (vector 56) — that
-            -- would be the wrong exception vector per the spec.
+            -- BUG #446: Observable warning on illegal PMOVE reg_sel.
+            -- Real MC68030 treats undecoded P-register selectors as undefined;
+            -- this tree historically silently ignored them. That hid software
+            -- bugs (e.g. kernels walking the wrong extension-word bit field)
+            -- because register writes would simply fall into this null arm.
+            -- Make the event observable:
+            --  - a simulation-only assertion (catches unit tests)
+            --  - a sticky latch pmmu_illegal_reg_sel_seen (SignalTap / debug)
+            --  - a hardware trap via mmu_config_error (vector 56): an undecoded
+            --    P-register selector is semantically a PMMU configuration
+            --    error; reusing the existing sticky mmu_config_error path
+            --    (BUG #445) inherits the one-shot ack handshake and keeps
+            --    tc_en clamped until the kernel processes the trap.
             -- synthesis translate_off
             assert false
               report "PMMU: illegal PMOVE reg_sel = " &
@@ -1420,16 +1208,18 @@ begin
               severity error;
             -- synthesis translate_on
             pmmu_illegal_reg_sel_seen <= '1';
+            mmu_config_error <= '1';  -- BUG #446: raise vector 56
           end case;
       end if;
-      -- Sticky debug latch on illegal reg_sel during reads; no trap raised
-      -- here (kernel F-line trap already handles it).
+      -- BUG #446: also latch on illegal reg_sel during reads, and raise the
+      -- vector-56 hardware trap on the same criterion as writes.
       if reg_re = '1' then
         case reg_sel is
           when "00010" | "00011" | "10000" | "10010" | "10011" | "11000" =>
             null;
           when others =>
             pmmu_illegal_reg_sel_seen <= '1';
+            mmu_config_error <= '1';
         end case;
       end if;
     end if;
@@ -1448,9 +1238,9 @@ begin
               SRP_L                        when reg_sel = "10010" and reg_part = '0' else
               CRP_H                        when reg_sel = "10011" and reg_part = '1' else
               CRP_L                        when reg_sel = "10011" and reg_part = '0' else
-              X"0000" & MMUSR when reg_sel = "11000" else
+              X"0000" & MMUSR(15 downto 0) when reg_sel = "11000" else
               (others => '0');
-  debug_mmusr <= MMUSR;
+  debug_mmusr <= MMUSR(15 downto 0);
   -- BUG #446: Expose the sticky illegal-reg_sel latch.
   debug_illegal_reg_sel <= pmmu_illegal_reg_sel_seen;
 
@@ -1515,14 +1305,7 @@ begin
   -- Bits 11-8: TIB (Table B Index)
   -- Bits 7-4: TIC (Table C Index)  
   -- Bits 3-0: TID (Table D Index)
-  -- Keep translation disabled while the stored TC image itself is invalid.
-  -- The raw TC contents are still preserved for PMOVE readback and vector-56
-  -- forensics, but the handler must run under identity/TTR semantics instead
-  -- of briefly re-enabling an illegal translation context after ack.
-  tc_en <= '1' when TC(31) = '1' and mmu_config_error = '0' and tc_config_valid = '1' else '0';
-  -- PMMU instructions can perform table searches regardless of TC.E; keep only
-  -- the configuration-error/validation gate separate from normal translation enable.
-  tc_table_config_valid <= '1' when mmu_config_error = '0' and tc_config_valid = '1' else '0';
+  tc_en <= TC(31) and not mmu_config_error;
   tc_sre <= TC(25);
   tc_fcl <= TC(24);
   tc_enable <= tc_en;
@@ -1600,21 +1383,19 @@ begin
     -- No need to re-check here
   end process;
   
-  -- Output the current translation result.
-  -- BUG #129 FIX: Add combinational bypass for identity translation when table
-  -- translation is disabled so cache-facing outputs stay in sync with the logical
-  -- address in the same cycle.
-  -- BUG #371 FIX: Also bypass for TTR transparent translations (phys=log identity
-  -- mapping); TT0/TT1 operate independently of TC.E and MMUDIS on MC68030.
-  -- TTR/disabled translations can bypass the registered path because the result is
-  -- identity. ATC hits stay on the registered path: busy remains asserted until
-  -- addr_phys_reg is refreshed for the current request, avoiding stale physical
-  -- addresses without putting the full ATC compare tree on the bus address output.
-  -- MC68030 UM Figure 9-32: FC=7 (CPU space) is always unmapped (identity).
+  -- Output the latched results
+  -- BUG #129 FIX: Add combinational bypass for identity translation when MMU disabled
+  -- This eliminates the 1-cycle lag that caused cache to sample stale physical address
+  -- When MMU is disabled (tc_en='0'), use logical address directly (same cycle)
+  -- When MMU is enabled, use registered translation result (allows for page table walks)
+  -- BUG #371 FIX: Also bypass for TTR transparent translations (phys=log identity mapping)
+  -- Without this, the first fetch after MMU enable gets a stale addr_phys_reg
+  -- MC68030 UM Figure 9-32: FC=7 (CPU space) is always unmapped (identity)
+  -- Keep TT disabled for normal accesses when TC.E=0 so MMU disable returns to
+  -- plain identity+CI=0 behavior instead of preserving stale transparent policy.
   addr_phys     <= addr_log when fc = "111"
-                   else addr_log when (ttr0_match_comb = '1' or ttr1_match_comb = '1')
                    else addr_log when tc_en = '0'
-                   else addr_log when mmudis = '1'  -- MC68030 UM 9.2.3
+                   else addr_log when (ttr0_match_comb = '1' or ttr1_match_comb = '1')
                    else addr_phys_reg;
   -- BUG #126 V2 FIX: Combinational bypass for cache_inhibit when MMU disabled
   -- Without this, cache_inhibit_reg retains stale value (pmmu_req='0' when MMU off)
@@ -1622,50 +1403,22 @@ begin
   -- must be consistent with addr_phys in the same cycle, otherwise the cache sees
   -- the correct I/O address but stale CI=0 from the previous RAM access and
   -- incorrectly caches I/O data.
-  -- MC68030 UM 9.3 (PDF line 14399): "If both registers match, the CI bits are
-  -- ORed together to generate the CIOUT signal." OR the WP bits on dual match
-  -- for consistency (spec is silent on WP for TTRs but UM 9.5.1.1 line 14571
-  -- prescribes OR for WP bits encountered during a table search).
   cache_inhibit <= '1' when fc = "111"  -- CPU space always cache-inhibited
-                   else (ttr0_ci_comb or ttr1_ci_comb) when (ttr0_match_comb = '1' and ttr1_match_comb = '1')
+                   else '0' when tc_en = '0'
                    else ttr0_ci_comb when ttr0_match_comb = '1'
                    else ttr1_ci_comb when ttr1_match_comb = '1'
-                   else '0' when tc_en = '0'
-                   else '0' when mmudis = '1'  -- MC68030 UM 9.2.3
                    else cache_inhibit_reg;
   write_protect <= '0' when fc = "111"  -- CPU space never write-protected
-                   else (ttr0_wp_comb or ttr1_wp_comb) when (ttr0_match_comb = '1' and ttr1_match_comb = '1')
+                   else '0' when tc_en = '0'
                    else ttr0_wp_comb when ttr0_match_comb = '1'
                    else ttr1_wp_comb when ttr1_match_comb = '1'
-                   else '0' when tc_en = '0'
-                   else '0' when mmudis = '1'  -- MC68030 UM 9.2.3
                    else write_protect_reg;
-  -- A latched fault describes one bus transfer. Once the CPU starts exception
-  -- stacking, the logical address/FC/RW tuple changes and the old fault must
-  -- not keep the wrapper unstalled or look like a fresh double-bus-fault.
-  fault_current_req_match <= '1' when fault_fc_reg = fc and
-                                      fault_rw_reg = rw and
-                                      fault_is_insn_reg = is_insn and
-                                      (addr_log = fault_addr_reg or
-                                       addr_log = std_logic_vector(unsigned(fault_addr_reg) + 2)) else
-                             '0';
-  fault         <= '0' when fc = "111" else
-                   fault_reg when translated_cfg_seq = xlat_cfg_seq and
-                                  fault_current_req_match = '1' else
-                   '0';  -- CPU space never faults; stale-context faults are ignored
+  fault         <= '0' when fc = "111" else fault_reg;  -- CPU space never faults
   fault_status  <= fault_status_reg;
   fault_addr    <= fault_addr_reg;     -- BUG #415: Faulting logical address
   fault_fc      <= fault_fc_reg;       -- BUG #414: FC at fault time
   fault_rw      <= fault_rw_reg;       -- BUG #414: RW at fault time
   fault_is_insn <= fault_is_insn_reg;  -- BUG #414: Instruction fetch flag
-  translated_match_dbg <= '1' when translated_addr = addr_log and
-                                   translated_fc = fc and
-                                   translated_rw = rw and
-                                   translated_cfg_seq = xlat_cfg_seq else '0';
-  debug_pending_flags <= req & translation_pending & walk_req & walker_completed &
-                         walker_fault & walker_fault_ack_pending &
-                         walker_completed_ack & fault_reg & tc_en & mmudis &
-                         rw & is_insn & fc & translated_match_dbg;
   -- Simplified translation process - always provide immediate result
   process(clk, nreset)
     variable hit       : std_logic;
@@ -1705,15 +1458,12 @@ begin
       walker_fault_ack <= '0';
       walker_completed_ack <= '0';
       walker_fault_ack_pending <= '0';
-      xlat_cfg_seq_seen <= (others => '0');
       mmusr_update_req <= '0';
       mmusr_update_value <= (others => '0');
       ptest_done <= '0';
       instr_walk_pending <= '0';
       ptest_walk_pending <= '0';
       ptest_walk_no_update <= '0';
-      ptest_desc_addr_reg <= (others => '0');
-      ptest_desc_return_pending <= '0';
       atc_mru_update_req <= '0';
       atc_mru_update_idx <= 0;
       atc_mbit_inval_req <= '0';
@@ -1730,50 +1480,17 @@ begin
       if mmusr_update_ack = '1' then
         mmusr_update_req <= '0';
       end if;
-      if ptest_update_mmusr = '1' then
-        ptest_desc_addr_reg <= (others => '0');
-        ptest_desc_return_pending <= '0';
-      end if;
-      -- A PMOVE to TC/CRP/SRP/TTx changes the translation context. Drop any
-      -- fault/completion bookkeeping left from the old context so it cannot be
-      -- replayed against the first access after MMU enable or root-pointer change.
-      if xlat_cfg_seq_seen /= xlat_cfg_seq then
-        xlat_cfg_seq_seen <= xlat_cfg_seq;
-        fault_reg <= '0';
-        fault_status_reg <= (others => '0');
-        fault_addr_reg <= (others => '0');
-        fault_fc_reg <= (others => '0');
-        fault_rw_reg <= '1';
-        fault_is_insn_reg <= '0';
-        translation_pending <= '0';
-        walk_req <= '0';
-        instr_walk_pending <= '0';
-        ptest_walk_pending <= '0';
-        ptest_walk_no_update <= '0';
-        ptest_desc_return_pending <= '0';
-        pload_flush_pending <= '0';
-        -- The walker process aborts and clears its own fault/completion state
-        -- on the same context sequence change. Do not leave an acknowledge
-        -- asserted here: a stuck ack masks the next real walker fault, which
-        -- makes PTEST fault results disappear before MMUSR can be updated.
-        walker_fault_ack <= '0';
-        walker_fault_ack_pending <= '0';
-        walker_completed_ack <= '0';
       -- Clear faults at start of each new translation request (MC68030 behavior)
       -- Each translation request starts with clean fault state
       -- Faults are only set if the current translation fails
       -- Process translation requests first
-      elsif req = '1' then
-        -- Hold the first latched fault only while the CPU is still presenting
-        -- the same bus transfer. Longword accesses can advance addr_log to the
-        -- second word (+2) while req remains high, but exception-entry stack
-        -- writes reuse req with different FC/RW/is_insn and must retranslate.
-        if fault_reg = '1' and req_prev = '1' and
-           fault_fc_reg = fc and
-           fault_rw_reg = rw and
-           fault_is_insn_reg = is_insn and
-           (addr_log = fault_addr_reg or
-            addr_log = std_logic_vector(unsigned(fault_addr_reg) + 2)) then
+      if req = '1' then
+        -- Hold the first latched fault for the duration of an asserted request.
+        -- Longword accesses can advance addr_log to the second word (+2) while req
+        -- remains high. Without this guard, repeated fault processing overwrites
+        -- fault_addr_reg with the later sub-cycle address before the kernel turns it
+        -- into a 68030 bus error frame.
+        if fault_reg = '1' and req_prev = '1' then
           null;
         else
           -- Clear previous fault state for a NEW translation request ONLY if not from walker
@@ -1795,9 +1512,9 @@ begin
           -- Don't clear faults on new requests - faults persist until explicitly cleared
           -- This allows tests to sample fault status after translation completes
           
-          -- Translation logic with proper precedence (no conflicting assignments):
-          -- FC=7 is always unmapped, then TT0/TT1, then table-disabled/MMUDIS
-          -- identity handling, then ATC/walker translation.
+          -- Translation logic with proper precedence (no conflicting assignments)
+          -- FC=7 is always unmapped, TTRs operate independently of TC.E, then
+          -- fall back to table translation or plain identity when TC.E=0.
           if fc = "111" then
             -- MC68030 UM 9.5.5.1, Figure 9-32: FC=7 (CPU space) is UNMAPPED.
             -- CPU space accesses (interrupt acknowledge, breakpoint, etc.) are
@@ -1814,27 +1531,26 @@ begin
             fault_status_reg   <= (others => '0');
             translation_pending <= '0';
           else
-            ttr_check(TT0, addr_log, fc, is_insn, rw, rmw, tmatch0, tci0, twp0);
-            ttr_check(TT1, addr_log, fc, is_insn, rw, rmw, tmatch1, tci1, twp1);
-            if tmatch0 = '1' and tmatch1 = '1' then
-              -- Dual transparent-translation hit: combine the attributes so the
-              -- registered state and MMUSR agree with the combinational outputs.
-              addr_phys_reg      <= addr_log;  -- Identity mapping
-              translated_addr    <= addr_log;  -- BUG #416
-              translated_fc      <= fc;        -- BUG #416
+            ttr_check(TT0, addr_log, fc, is_insn, rw, tmatch0, tci0, twp0);
+            ttr_check(TT1, addr_log, fc, is_insn, rw, tmatch1, tci1, twp1);
+            if tc_en = '0' then
+              -- Disabling MMU must also disable transparent-translation effects
+              -- on normal accesses, otherwise TT policy survives after TC.E=0.
+              addr_phys_reg      <= addr_log;
+              translated_addr    <= addr_log;
+              translated_fc      <= fc;
               translated_rw      <= rw;
               translated_cfg_seq <= xlat_cfg_seq;
-              cache_inhibit_reg  <= (tci0 or tci1);
-              write_protect_reg  <= (twp0 or twp1);
+              cache_inhibit_reg  <= '0';
+              write_protect_reg  <= '0';
               fault_reg          <= '0';
-              fault_status_reg <= encode_mmusr_success(
-                write_protect => (twp0 or twp1),
+              fault_status_reg   <= encode_mmusr_success(
+                write_protect => '0',
                 modified => '0',
-                transparent => '1',
+                transparent => '0',
                 level => "000"
               );
               translation_pending <= '0';
-              -- No walker needed for TTR
             elsif tmatch0 = '1' then
               -- TTR0 match - use identity translation with TTR attributes (always successful, no faults)
               addr_phys_reg      <= addr_log;  -- Identity mapping
@@ -1857,9 +1573,9 @@ begin
               end if;
               translation_pending <= '0';
               -- No walker needed for TTR
-            elsif tmatch1 = '1' then
-              -- TTR1 match - use identity translation with TTR attributes (always successful, no faults)
-             --  -- assert false report "TTR1 HIT: Setting addr_phys to 0x" & slv_to_hstring(addr_log) severity note;
+	            elsif tmatch1 = '1' then
+	              -- TTR1 match - use identity translation with TTR attributes (always successful, no faults)
+	             --  -- assert false report "TTR1 HIT: Setting addr_phys to 0x" & slv_to_hstring(addr_log) severity note;
               addr_phys_reg      <= addr_log;  -- Identity mapping
               translated_addr    <= addr_log;  -- BUG #416
               translated_fc      <= fc;        -- BUG #416
@@ -1877,43 +1593,8 @@ begin
               );
               translation_pending <= '0';
               -- No walker needed for TTR
-            elsif tc_en = '0' then
-              -- Table translation disabled and no TTR matched: plain identity mapping.
-              addr_phys_reg      <= addr_log;
-              translated_addr    <= addr_log;
-              translated_fc      <= fc;
-              translated_rw      <= rw;
-              translated_cfg_seq <= xlat_cfg_seq;
-              cache_inhibit_reg  <= '0';
-              write_protect_reg  <= '0';
-              fault_reg          <= '0';
-              fault_status_reg   <= encode_mmusr_success(
-                write_protect => '0',
-                modified => '0',
-                transparent => '0',
-                level => "000"
-              );
-              translation_pending <= '0';
-            elsif mmudis = '1' then
-              -- MC68030 UM 9.2.3: MMUDIS asserted and no TTR match → identity
-              -- translation; ATC searches and table searches are suppressed.
-              addr_phys_reg      <= addr_log;
-              translated_addr    <= addr_log;
-              translated_fc      <= fc;
-              translated_rw      <= rw;
-              translated_cfg_seq <= xlat_cfg_seq;
-              cache_inhibit_reg  <= '0';
-              write_protect_reg  <= '0';
-              fault_reg          <= '0';
-              fault_status_reg   <= encode_mmusr_success(
-                write_protect => '0',
-                modified => '0',
-                transparent => '0',
-                level => "000"
-              );
-              translation_pending <= '0';
             else
-              -- No TTR match, tc_en='1', MMUDIS='0' - check ATC and potentially start walker
+              -- No TTR match, tc_en='1' - check ATC and potentially start walker
               hit := '0';
               for i in 0 to ATC_ENTRIES-1 loop
             -- BUG #415: Skip ATC lookup when flush is pending (1-cycle race window)
@@ -1954,14 +1635,6 @@ begin
             -- ATC hit - request pseudo-LRU history bit update (handled in walker process)
             atc_mru_update_idx <= hit_idx;
             atc_mru_update_req <= '1';
-            -- If a previous translation_pending bit survived after the walker had
-            -- already gone idle, a valid ATC hit is a complete translation for the
-            -- current request. Clear the stale pending bit so the next ATC miss can
-            -- start a new walk instead of deadlocking with busy asserted.
-            if translation_pending = '1' and wstate = W_IDLE and walk_req = '0' and
-               walker_completed = '0' and walker_fault = '0' then
-              translation_pending <= '0';
-            end if;
             -- Use cached translation but check access violations
             -- But don't overwrite walker faults that are still pending
             if walker_fault = '1' and walker_fault_ack_pending = '1' then
@@ -1981,19 +1654,18 @@ begin
               fault_fc_reg <= fc;
               fault_rw_reg <= rw;
               fault_is_insn_reg <= is_insn;
-              -- Normal CPU translations use this status for the exception
-              -- frame/debug path only.  Like WinUAE, the architectural MMUSR
-              -- register is only changed by PTEST or PMOVE MMUSR.
-              -- Fault ATC entries intentionally do not preserve a usable physical
-              -- address or final page attributes. Mirror the direct walker fault
-              -- path so replay cannot probe/fill the cache via stale zeroed data.
-              addr_phys_reg <= addr_log;
+              mmusr_update_value <= status_tmp;
+              mmusr_update_req <= '1';
+              phys_base := unsigned(atc_phys_base(hit_idx));
+              offset    := unsigned(addr_log) - unsigned(atc_log_base(hit_idx));
+              phys_result := phys_base + offset;
+              addr_phys_reg <= std_logic_vector(phys_result);
               translated_addr <= addr_log;
               translated_fc   <= fc;
               translated_rw   <= rw;
               translated_cfg_seq <= xlat_cfg_seq;
-              cache_inhibit_reg <= '1';
-              write_protect_reg <= '1';
+              cache_inhibit_reg <= atc_attr(hit_idx)(2);
+              write_protect_reg <= atc_attr(hit_idx)(0);
             elsif rw = '0' and atc_attr(hit_idx)(0) = '1' then
               -- Write to write-protected page - generate fault (rw='0' is WRITE)
               status_tmp := encode_mmusr_fault(
@@ -2004,7 +1676,7 @@ begin
                 invalid => '0',                         -- Descriptor was valid
                 modified => '0',
                 transparent => '0',
-                level => "000"                         -- N is only defined for PTEST table searches
+                level => atc_level(hit_idx)             -- BUG #412: actual walk level from ATC
               );
               fault_reg <= '1';
               fault_status_reg <= status_tmp;
@@ -2012,7 +1684,8 @@ begin
               fault_fc_reg <= fc;               -- BUG #414: Latch FC at fault time
               fault_rw_reg <= rw;               -- BUG #414: Latch RW at fault time
               fault_is_insn_reg <= is_insn;     -- BUG #414: Latch instruction fetch flag
-              -- Do not update architectural MMUSR for ordinary CPU faults.
+              mmusr_update_value <= status_tmp;
+              mmusr_update_req <= '1';
               -- Debug: capture fault status in sticky latch
               if debug_fault_status_valid = '0' then
                 debug_fault_status_latch <= status_tmp(15 downto 0);
@@ -2040,7 +1713,7 @@ begin
                 invalid => '0',                         -- Descriptor was valid
                 modified => '0',
                 transparent => '0',
-                level => "000"                         -- N is only defined for PTEST table searches
+                level => atc_level(hit_idx)             -- BUG #412: actual walk level from ATC
               );
               fault_reg <= '1';
               fault_status_reg <= status_tmp;
@@ -2048,7 +1721,8 @@ begin
               fault_fc_reg <= fc;               -- BUG #414: Latch FC at fault time
               fault_rw_reg <= rw;               -- BUG #414: Latch RW at fault time
               fault_is_insn_reg <= is_insn;     -- BUG #414: Latch instruction fetch flag
-              -- Do not update architectural MMUSR for ordinary CPU faults.
+              mmusr_update_value <= status_tmp;
+              mmusr_update_req <= '1';
               -- Debug: capture fault status in sticky latch
               if debug_fault_status_valid = '0' then
                 debug_fault_status_latch <= status_tmp(15 downto 0);
@@ -2099,7 +1773,7 @@ begin
                   write_protect => atc_attr(hit_idx)(0),   -- WP bit from page attributes
                   modified => atc_attr(hit_idx)(1),        -- M bit from page descriptor
                   transparent => '0',                      -- Not a transparent translation
-                  level => "000"                          -- N is only defined for PTEST table searches
+                  level => atc_level(hit_idx)              -- BUG #412: actual walk level from ATC
                 );
                --  -- report "ATC_HIT: successful translation, phys=0x" & slv_to_hstring(std_logic_vector(phys_result)) severity note;
               end if;
@@ -2147,8 +1821,8 @@ begin
         -- synthesis translate_on
         if translation_pending = '0' then
           -- Check Transparent Translation first
-          ttr_check(TT0, ptest_addr, ptest_fc, '0', ptest_rw, '0', tmatch0, tci0, twp0);  -- Use PTEST R/W from brief(9)
-          ttr_check(TT1, ptest_addr, ptest_fc, '0', ptest_rw, '0', tmatch1, tci1, twp1);  -- Use PTEST R/W from brief(9)
+          ttr_check(TT0, ptest_addr, ptest_fc, '0', ptest_rw, tmatch0, tci0, twp0);  -- Use PTEST R/W from brief(9)
+          ttr_check(TT1, ptest_addr, ptest_fc, '0', ptest_rw, tmatch1, tci1, twp1);  -- Use PTEST R/W from brief(9)
           -- synthesis translate_off
           -- report "PTEST_TTR: tmatch0=" & std_logic'image(tmatch0) &
           --        " tmatch1=" & std_logic'image(tmatch1) &
@@ -2165,18 +1839,7 @@ begin
           --        " TT0_fcm=" & std_logic'image(TT0(2)) & std_logic'image(TT0(1)) & std_logic'image(TT0(0))
           --        severity note;
           -- synthesis translate_on
-          if tmatch0 = '1' and tmatch1 = '1' then
-            -- Dual transparent-translation hit: combine attributes so PTEST
-            -- observes the same result as the live transparent path.
-            mmusr_update_value <= encode_mmusr_success(
-              write_protect => (twp0 or twp1),
-              modified => '0',
-              transparent => '1',
-              level => "000"
-            );
-            mmusr_update_req <= '1';
-            ptest_done <= '1';
-          elsif tmatch0 = '1' then
+          if tmatch0 = '1' then
             -- synthesis translate_off
             report "PTEST_TTR0_HIT: ptest_addr=" & slv_to_hex(ptest_addr) & " fc=" &
                    std_logic'image(ptest_fc(2)) & std_logic'image(ptest_fc(1)) & std_logic'image(ptest_fc(0)) severity note;
@@ -2200,6 +1863,16 @@ begin
             );
             mmusr_update_req <= '1';
             ptest_done <= '1';  -- BUG FIX: Signal PTEST completion after TTR1 match
+          elsif tc_en = '0' then
+            -- Table translation disabled and no TTR matched: identity success.
+            mmusr_update_value <= encode_mmusr_success(
+              write_protect => '0',
+              modified => '0',
+              transparent => '0',
+              level => "000"
+            );
+            mmusr_update_req <= '1';
+            ptest_done <= '1';
           elsif ptest_level = "000" then
             -- BUG #413: PTEST level=0 - ATC-only search (no table walk)
             -- Per MC68030 spec and WinUAE mmu030_ptest_atc_search():
@@ -2221,15 +1894,12 @@ begin
                 -- Cached fault entry: report the original MMUSR fault class.
                 mmusr_update_value <= x"0000" & atc_fault_status(hit_idx);
               else
-                -- Normal ATC hit - report WP and M from ATC attributes.
-                -- MC68030 UM 9.7.4 Table 9-3 (line 15636): for PTEST Level 0
-                -- the N field is always cleared to zero; it does NOT report the
-                -- level of the walk that originally populated this ATC entry.
+                -- Normal ATC hit - report WP and M from ATC attributes
                 mmusr_update_value <= encode_mmusr_success(
                   write_protect => atc_attr(hit_idx)(0),   -- WP
                   modified => atc_attr(hit_idx)(1),        -- M
                   transparent => '0',
-                  level => "000"                            -- N=0 for PTEST Level 0
+                  level => atc_level(hit_idx)              -- Level from ATC
                 );
               end if;
             else
@@ -2247,7 +1917,7 @@ begin
             end if;
             mmusr_update_req <= '1';
             ptest_done <= '1';
-          elsif tc_table_config_valid = '1' then
+          else
             -- No TTR match, level>0 - trigger walker to test translation
             -- synthesis translate_off
             report "PTEST_WALK: ptest_addr=" & slv_to_hex(ptest_addr) &
@@ -2262,29 +1932,10 @@ begin
             translation_pending <= '1';
             instr_walk_pending <= '1';  -- BUG #396: Mark walk as PTEST-initiated
             ptest_walk_pending <= '1';
-            ptest_desc_return_pending <= '1';
-            -- M68000 PRM p.603 (PTEST description): "No descriptor bits are
-            -- modified by this instruction." PTEST must leave U and M bits
-            -- untouched on both table and page descriptors.
-            ptest_walk_no_update <= '1';
+            ptest_walk_no_update <= '0';  -- MC68030 table searches update descriptor history bits regardless of A-bit
             ptest_done <= '1';  -- BUG FIX: Signal PTEST completion after triggering walker
             -- report "PTEST: Triggered walker for addr=0x" & slv_to_hstring(ptest_addr) &
                   --  -- " fc=" & slv_to_string(ptest_fc) severity note;
-          else
-            -- TC validation is still pending or a configuration exception is active.
-            -- Complete the PMMU instruction without starting a malformed walk.
-            mmusr_update_value <= encode_mmusr_fault(
-              bus_error => '0',
-              limit_violation => '0',
-              supervisor_violation => '0',
-              write_protect => '0',
-              invalid => '1',
-              modified => '0',
-              transparent => '0',
-              level => "000"
-            );
-            mmusr_update_req <= '1';
-            ptest_done <= '1';
           end if;
         end if;
       end if;
@@ -2292,7 +1943,7 @@ begin
       -- Per MC68030 spec and WinUAE: PLOAD always flushes the page from ATC first,
       -- then unconditionally performs a table walk to (re)fill the ATC entry.
       if pload_active = '1' then
-        if tc_table_config_valid = '1' and translation_pending = '0' then
+        if tc_en = '1' and translation_pending = '0' then
           -- Always trigger walker to load fresh translation
           -- The walker process handles flushing the old ATC entry via pload_flush_pending
           saved_addr_log <= pload_addr;
@@ -2310,11 +1961,6 @@ begin
       if walker_fault = '1' and walker_fault_ack = '0' then
         -- Walker faulted - process immediately regardless of req state
         status_tmp := walker_fault_status;
-        if ptest_walk_pending = '0' then
-          -- WinUAE only stamps MMUSR.N for PTEST/table-search requests.
-          -- Ordinary translation faults, including cached BADFEED entries, keep N=0.
-          status_tmp(2 downto 0) := "000";
-        end if;
         -- BUG #396b: PTEST/PLOAD walks must NOT set fault_reg or corrupt addr_phys_reg.
         -- Walker faults during PTEST/PLOAD should only update MMUSR, not trigger CPU bus error.
         -- Without this guard, PTEST W on a WP page causes walker_fault -> fault_reg=1 ->
@@ -2345,10 +1991,6 @@ begin
         mmusr_update_value <= status_tmp;
         -- MC68030 UM 9.7.3: PLOAD does not alter MMUSR; only PTEST updates it
         if ptest_walk_pending = '1' then
-          if ptest_desc_return_pending = '1' then
-            ptest_desc_addr_reg <= desc_addr_reg;
-            ptest_desc_return_pending <= '0';
-          end if;
           mmusr_update_req <= '1';
         end if;
         translation_pending <= '0';
@@ -2360,23 +2002,16 @@ begin
         walker_fault_ack <= '1';
         walker_fault_ack_pending <= '1';
       elsif walker_completed = '1' then
-        if ptest_desc_return_pending = '1' then
-          ptest_desc_addr_reg <= desc_addr_reg;
-          ptest_desc_return_pending <= '0';
-        end if;
         -- Walker completed - clear PLOAD flush flag if set
         pload_flush_pending <= '0';
         -- Walker completed successfully - clear any previous fault status
         -- A successful walker completion means this specific translation succeeded
         -- First check if the completed request would have been handled by TTR
-        ttr_check(TT0, saved_addr_log, saved_fc, saved_is_insn, saved_rw, '0', tmatch0, tci0, twp0);
-        ttr_check(TT1, saved_addr_log, saved_fc, saved_is_insn, saved_rw, '0', tmatch1, tci1, twp1);
+        ttr_check(TT0, saved_addr_log, saved_fc, saved_is_insn, saved_rw, tmatch0, tci0, twp0);
+        ttr_check(TT1, saved_addr_log, saved_fc, saved_is_insn, saved_rw, tmatch1, tci1, twp1);
         if tmatch0 = '1' or tmatch1 = '1' then
           -- This request hits TTR - don't override TTR results that are already set
-          -- TTR results already handled in main translation logic. The walker
-          -- completion still satisfies the pending request, so clear the pending
-          -- bit here as well.
-          translation_pending <= '0';
+          null; -- TTR results already handled in main translation logic
         else
           -- No TTR hit - check ATC for walker results
           hit := '0';
@@ -2419,7 +2054,7 @@ begin
                 invalid => '0',                         -- Descriptor was valid
                 modified => '0',
                 transparent => '0',
-                level => "000"                         -- N is only defined for PTEST table searches
+                level => atc_level(hit_idx)             -- BUG #412: actual walk level from ATC
               );
               -- BUG #396: PTEST/PLOAD walks must NOT update addr_phys_reg or fault_reg.
               -- These are instruction-initiated walks that only test/preload the ATC.
@@ -2461,7 +2096,7 @@ begin
                 invalid => '0',                         -- Descriptor was valid
                 modified => '0',
                 transparent => '0',
-                level => "000"                         -- N is only defined for PTEST table searches
+                level => atc_level(hit_idx)             -- BUG #412: actual walk level from ATC
               );
               -- BUG #396: Skip addr_phys_reg update for PTEST/PLOAD walks
               -- BUG #404: Skip when addr_log has moved past saved_addr_log
@@ -2510,7 +2145,7 @@ begin
                 write_protect => atc_attr(hit_idx)(0),   -- WP bit from page attributes
                 modified => atc_attr(hit_idx)(1),        -- M bit from page descriptor
                 transparent => '0',                      -- Not a transparent translation
-                level => "000"                          -- N is only defined for PTEST table searches
+                level => atc_level(hit_idx)              -- BUG #412: actual walk level from ATC
               );
               fault_status_reg <= status_tmp;
               -- BUG #374 FIX: Update MMUSR on successful walker completion
@@ -2559,22 +2194,6 @@ begin
          --  -- report "FAULT_ACK: Cleared walker fault acknowledgment" severity note;
         end if;
       end if; -- walker_completed
-
-      -- Stale-pending recovery: if the walker is idle and there is no completion
-      -- or fault left to consume, a pending bit by itself cannot make progress.
-      -- This can happen when the CPU address moves while a fault/completion
-      -- handshake is resolving; an ATC miss with translation_pending still set
-      -- will otherwise never assert walk_req, leaving busy high forever.
-      if translation_pending = '1' and wstate = W_IDLE and walk_req = '0' and
-         walker_completed = '0' and walker_fault = '0' and
-         walker_fault_ack_pending = '0' then
-        translation_pending <= '0';
-        instr_walk_pending <= '0';
-        ptest_walk_pending <= '0';
-        ptest_walk_no_update <= '0';
-        ptest_desc_return_pending <= '0';
-        pload_flush_pending <= '0';
-      end if;
       
       -- Clear walk request when walker starts (to avoid continuous requests)
       if wstate /= W_IDLE then
@@ -2599,19 +2218,11 @@ begin
     -- Pseudo-LRU ATC replacement
     variable replace_idx : integer range 0 to ATC_ENTRIES-1;
     variable found_invalid : boolean;
-    variable found_match : boolean;
     variable all_mru_set : boolean;
     -- Early termination offset calculation
     variable early_term_desc_addr : std_logic_vector(31 downto 0);
     variable early_term_page_addr : std_logic_vector(31 downto 0);
     variable early_term_offset    : std_logic_vector(31 downto 0);
-    -- Decode page attributes into variables before reusing them in this cycle.
-    -- Using the walk_attr signal directly in W_PAGE would read the previous page's
-    -- latched value because signal assignments don't take effect until the process suspends.
-    variable page_user_access     : std_logic;
-    variable page_cache_inhibit   : std_logic;
-    variable page_modified        : std_logic;
-    variable page_write_protect   : std_logic;
   begin
     if nreset = '0' then
       for i in 0 to ATC_ENTRIES-1 loop
@@ -2654,7 +2265,6 @@ begin
       walk_limit_value <= (others => '0');
       walk_is_root_pointer <= '0';  -- Root pointer DT=01 flag
       walker_timeout_counter <= 0;  -- BUG #387: Reset timeout counter
-      xlat_cfg_seq_walk_seen <= (others => '0');
       ptr1_desc_addr_reg <= (others => '0');
       ptr1_desc_data_reg <= (others => '0');
       ptr2_desc_addr_reg <= (others => '0');
@@ -2662,62 +2272,44 @@ begin
       ptr3_desc_addr_reg <= (others => '0');
       ptr3_desc_data_reg <= (others => '0');
       last_mem_rdat <= (others => '0');
-      walk_page_from_indirect <= '0';
     elsif rising_edge(clk) then
-      if xlat_cfg_seq_walk_seen /= xlat_cfg_seq then
-        xlat_cfg_seq_walk_seen <= xlat_cfg_seq;
-        -- A register write changed the translation context. Any in-flight walk
-        -- was based on the old TC/root/TTR state, so abort it before it can fill
-        -- a stale ATC entry after the flush.
-        wstate <= W_IDLE;
-        mem_req <= '0';
-        mem_we <= '0';
-        mem_addr <= (others => '0');
-        mem_wdat <= (others => '0');
-        walk_fault <= '0';
-        walker_fault <= '0';
-        walker_fault_status <= (others => '0');
-        walker_completed <= '0';
+      if mem_ack = '1' then
+        last_mem_rdat <= mem_rdat;
+      end if;
+      -- BUG #387 FIX: Timeout mechanism to prevent walker deadlocks
+      -- Monitor mem_req without mem_ack and force fault after timeout
+      if wstate = W_IDLE then
+        walker_timeout_counter <= 0;  -- Reset counter when idle
+      elsif mem_req = '1' and mem_ack = '0' and mem_berr = '0' then
+        -- Waiting for memory response - increment timeout counter
+        if walker_timeout_counter < 1023 then
+          walker_timeout_counter <= walker_timeout_counter + 1;
+        end if;
+      elsif mem_ack = '1' or mem_berr = '1' then
+        -- Got response - reset timeout counter
         walker_timeout_counter <= 0;
-        desc_update_needed <= '0';
+      end if;
+      -- Check for timeout condition BEFORE case statement to prevent override
+      if walker_timeout_counter >= WALKER_TIMEOUT_CYCLES and mem_req = '1' then
+        -- Timeout exceeded - force bus error fault and transition to W_FAULT
+        walk_fault <= '1';
+        walker_fault <= '1';
+        walker_fault_status <= encode_mmusr_fault(
+          bus_error => '1',                -- B bit: timeout is a bus error
+          limit_violation => '0',
+          supervisor_violation => '0',
+          write_protect => '0',
+          invalid => '1',                  -- No valid translation available
+          modified => '0',
+          transparent => '0',
+          level => std_logic_vector(to_unsigned(walk_level, 3))
+        );
+        mem_req <= '0';  -- Stop requesting memory
+        walker_timeout_counter <= 0;  -- Reset counter
+        wstate <= W_FAULT;  -- Transition to fault state (which will set walker_completed)
       else
-        if mem_ack = '1' then
-          last_mem_rdat <= mem_rdat;
-        end if;
-        -- BUG #387 FIX: Timeout mechanism to prevent walker deadlocks
-        -- Monitor mem_req without mem_ack and force fault after timeout
-        if wstate = W_IDLE then
-          walker_timeout_counter <= 0;  -- Reset counter when idle
-        elsif mem_req = '1' and mem_ack = '0' and mem_berr = '0' then
-          -- Waiting for memory response - increment timeout counter
-          if walker_timeout_counter < 1023 then
-            walker_timeout_counter <= walker_timeout_counter + 1;
-          end if;
-        elsif mem_ack = '1' or mem_berr = '1' then
-          -- Got response - reset timeout counter
-          walker_timeout_counter <= 0;
-        end if;
-        -- Check for timeout condition BEFORE case statement to prevent override
-        if walker_timeout_counter >= WALKER_TIMEOUT_CYCLES and mem_req = '1' then
-          -- Timeout exceeded - force bus error fault and transition to W_FAULT
-          walk_fault <= '1';
-          walker_fault <= '1';
-          walker_fault_status <= encode_mmusr_fault(
-            bus_error => '1',                -- B bit: timeout is a bus error
-            limit_violation => '0',
-            supervisor_violation => '0',
-            write_protect => '0',
-            invalid => '1',                  -- No valid translation available
-            modified => '0',
-            transparent => '0',
-            level => std_logic_vector(to_unsigned(walk_level, 3))
-          );
-          mem_req <= '0';  -- Stop requesting memory
-          walker_timeout_counter <= 0;  -- Reset counter
-          wstate <= W_FAULT;  -- Transition to fault state (which will set walker_completed)
-        else
-          -- Normal walker state machine (only runs if not in timeout)
-          case wstate is
+        -- Normal walker state machine (only runs if not in timeout)
+        case wstate is
         when W_IDLE =>
           -- Don't auto-clear walker_completed here - let translation handler clear it
           -- BUG #149 FIX: Clear walker_fault when acknowledged to prevent pmmu_busy deadlock
@@ -2728,21 +2320,6 @@ begin
           end if;
           -- Start page table walk on ATC miss using saved request parameters
           if walk_req = '1' then
-            -- WinUAE flushes the target page before the PLOAD table search.
-            -- Do this at walk start so cached fault entries are removed even
-            -- if the following table walk faults before reaching W_PAGE.
-            if pload_flush_pending = '1' then
-              for i in 0 to ATC_ENTRIES-1 loop
-                if atc_valid(i) = '1' then
-                  if align_addr(saved_addr_log, atc_shift(i)) = atc_log_base(i) then
-                    atc_valid(i) <= '0';
-                    atc_mru(i) <= '0';
-                    atc_buserr(i) <= '0';
-                    atc_fault_status(i) <= (others => '0');
-                  end if;
-                end if;
-              end loop;
-            end if;
             -- Debug: Log walker startup for failing test addresses
             if saved_addr_log = x"12343000" or saved_addr_log = x"12344000" or saved_addr_log = x"12345000" then
               -- report "DEBUG_WALKER_START: addr=0x" & slv_to_hstring(saved_addr_log) &
@@ -2760,7 +2337,6 @@ begin
             walk_desc_high <= (others => '0');
             walk_desc_low <= (others => '0');
             walk_desc_is_long <= '0';
-            walk_page_from_indirect <= '0';
             indirect_addr <= (others => '0');
             indirect_target_long <= '0';
             walk_limit_valid <= '0';  -- BUG #155: Clear limit tracking at walk start
@@ -2853,61 +2429,59 @@ begin
           -- Read root table descriptor - deadlock-proof design
           limit_fault := false;  -- BUG FIX: Reset limit fault tracker
           table_index := get_fcl_table_index(walk_vpn, saved_fc, tc_fcl, walk_level, tc_initial_shift, tc_page_size, tc_idx_bits);
-          -- MC68030 Root Pointer Limit Check
-          -- CRP_H/SRP_H HIGH-word layout: L/U[31], Limit[30:16], Reserved[15:2], DT[1:0]
-          -- MC68030 UM 9.5.2 line 14877-14879 and 9.5.1.2 line 14654-14656:
-          -- "The root pointer includes a limit field that applies when the
-          --  function code lookup is not used (the FCL bit of the TC register
-          --  is zero)." / "when the FCL field of the TC register is set, the
-          --  L/U and LIMIT fields of the root pointer registers are unused."
-          -- Skip the check entirely under FCL=1; the root table is indexed by
-          -- the 3-bit FC (0..7), which is always within bounds.
-          if tc_fcl = '0' then
-            -- Select appropriate root pointer HIGH word based on FC and SRE
-            if saved_fc(2) = '1' and tc_sre = '1' then
-              rp_high := SRP_H;  -- Supervisor Root Pointer
-            else
-              rp_high := CRP_H;  -- CPU Root Pointer
+          -- MC68030 Root Pointer Limit Check (only for root level)
+          -- CRP_H/SRP_H format: L/U[31], Limit[30:16], Reserved[15:1], DT[0]
+          -- Select appropriate root pointer HIGH word based on FC and SRE
+          if saved_fc(2) = '1' and tc_sre = '1' then
+            rp_high := SRP_H;  -- Supervisor Root Pointer
+          else
+            rp_high := CRP_H;  -- CPU Root Pointer
+          end if;
+          -- Extract L/U flag and limit value from HIGH word
+          lu_flag := rp_high(31);           -- L/U semantics: 1=lower limit, 0=upper limit
+          limit_value := unsigned(rp_high(30 downto 16));  -- Bits 62-48 (LIMIT)
+          -- Check if table_index is within bounds based on L/U flag
+          if lu_flag = '1' then
+            -- Lower limit: table_index must be >= limit
+            if to_unsigned(table_index, 15) < limit_value then
+              -- Limit violation - generate fault
+              walker_fault <= '1';
+              walker_fault_status <= encode_mmusr_fault(
+                bus_error => '0',
+                limit_violation => '1',  -- This is a limit violation
+                supervisor_violation => '0',
+                write_protect => '0',
+                invalid => '1',
+                modified => '0',
+                transparent => '0',
+                level => std_logic_vector(to_unsigned(walk_level, 3))
+              );
+              -- report "LIMIT_VIOLATION: table_index=" & integer'image(table_index) &
+                     -- " limit(lower)=" & integer'image(to_integer(limit_value)) &
+                     -- " (L/U=1, must be >= limit)" severity note;
+              wstate <= W_FAULT;
+              limit_fault := true;  -- BUG FIX: Prevent mem_req assertion
             end if;
-            lu_flag := rp_high(31);           -- L/U: 1=lower limit, 0=upper limit
-            limit_value := unsigned(rp_high(30 downto 16));  -- 15-bit LIMIT
-            if lu_flag = '1' then
-              -- Lower limit: table_index must be >= limit.
-              -- Edge case: L/U=1 and LIMIT=0 effectively disables the check
-              -- (to_unsigned(x,15) < 0 is always false).
-              if to_unsigned(table_index, 15) < limit_value then
-                walker_fault <= '1';
-                walker_fault_status <= encode_mmusr_fault(
-                  bus_error => '0',
-                  limit_violation => '1',
-                  supervisor_violation => '0',
-                  write_protect => '0',
-                  invalid => '1',
-                  modified => '0',
-                  transparent => '0',
-                  level => std_logic_vector(to_unsigned(walk_level, 3))
-                );
-                wstate <= W_FAULT;
-                limit_fault := true;
-              end if;
-            else
-              -- Upper limit: table_index must be <= limit.
-              -- Edge case: L/U=0 and LIMIT=$7FFF effectively disables the check.
-              if to_unsigned(table_index, 15) > limit_value then
-                walker_fault <= '1';
-                walker_fault_status <= encode_mmusr_fault(
-                  bus_error => '0',
-                  limit_violation => '1',
-                  supervisor_violation => '0',
-                  write_protect => '0',
-                  invalid => '1',
-                  modified => '0',
-                  transparent => '0',
-                  level => std_logic_vector(to_unsigned(walk_level, 3))
-                );
-                wstate <= W_FAULT;
-                limit_fault := true;
-              end if;
+          else
+            -- Upper limit: table_index must be <= limit
+            if to_unsigned(table_index, 15) > limit_value then
+              -- Limit violation - generate fault
+              walker_fault <= '1';
+              walker_fault_status <= encode_mmusr_fault(
+                bus_error => '0',
+                limit_violation => '1',  -- This is a limit violation
+                supervisor_violation => '0',
+                write_protect => '0',
+                invalid => '1',
+                modified => '0',
+                transparent => '0',
+                level => std_logic_vector(to_unsigned(walk_level, 3))
+              );
+              -- report "LIMIT_VIOLATION: table_index=" & integer'image(table_index) &
+                     -- " limit(upper)=" & integer'image(to_integer(limit_value)) &
+                     -- " (L/U=0, must be <= limit)" severity note;
+              wstate <= W_FAULT;
+              limit_fault := true;  -- BUG FIX: Prevent mem_req assertion
             end if;
           end if;
           desc_addr_v := walk_addr(31 downto 4) & "0000"; -- Align to table boundary
@@ -2977,7 +2551,7 @@ begin
                 invalid => '1',                  -- DT=00: Only I bit should be set per MC68030 spec
                 modified => '0',
                 transparent => '0',
-                level => std_logic_vector(to_unsigned(walk_level + 1, 3))
+                level => std_logic_vector(to_unsigned(walk_level, 3))
               );
               -- Debug: Track invalid descriptor
               -- report "INVALID_DESC_ROOT: Invalid descriptor at level=" & integer'image(walk_level) &
@@ -2996,31 +2570,10 @@ begin
               end if;
               walk_desc_is_long <= '0';  -- Short format
               wstate <= W_PAGE;
-            elsif is_final_table_level(tc_fcl, 0, tc_idx_bits) then
-              -- DT=10 at the final level is a short-format indirect descriptor.
-              if ptest_walk_pending = '1' and
-                 to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
-                walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => '0',
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => mem_rdat(2),
-                  level => std_logic_vector(to_unsigned(walk_level + 1, 3))
-                );
-                wstate <= W_FAULT;
-              else
-                walk_desc_is_long <= '0';
-                indirect_addr <= mem_rdat(31 downto 2) & "00";
-                indirect_target_long <= mem_rdat(1) and mem_rdat(0);
-                wstate <= W_INDIRECT;
-              end if;
             else
               -- Short-format table descriptor; DT selects the next table format.
               -- TABLE descriptor U-bit writeback: set U before continuing
-              if ptest_walk_no_update = '0' and mem_rdat(3) = '0'
-                 and not (saved_fc(2) = '0' and walk_supervisor = '1') then
+              if ptest_walk_no_update = '0' and mem_rdat(3) = '0' then
                 desc_update_data <= mem_rdat(31 downto 4) & '1' & mem_rdat(2 downto 0);
                 walk_next_state <= W_PTR1;
                 walk_desc_is_long <= '0';
@@ -3034,12 +2587,10 @@ begin
               elsif ptest_walk_pending = '1' and
                  to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
                 walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => '0',
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => mem_rdat(2),
+                walker_fault_status <= encode_mmusr_success(
+                  write_protect => mem_rdat(2),
+                  modified => '0',
+                  transparent => '0',
                   level => std_logic_vector(to_unsigned(walk_level + 1, 3))
                 );
                 wstate <= W_FAULT;
@@ -3086,30 +2637,11 @@ begin
               -- Page descriptor - go to W_PAGE for processing
              --  -- report "W_ROOT_LOW: Long-format page descriptor, continuing to W_PAGE" severity note;
               wstate <= W_PAGE;
-            elsif is_final_table_level(tc_fcl, 0, tc_idx_bits) then
-              -- DT=11 at the final level is a long-format indirect descriptor.
-              if ptest_walk_pending = '1' and
-                 to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
-                walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => walk_desc_high(8),
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => walk_desc_high(2),
-                  level => std_logic_vector(to_unsigned(walk_level + 1, 3))
-                );
-                wstate <= W_FAULT;
-              else
-                indirect_addr <= mem_rdat(31 downto 2) & "00";
-                indirect_target_long <= walk_desc_high(1) and walk_desc_high(0);
-                wstate <= W_INDIRECT;
-              end if;
             else
               -- Table descriptor - extract address from LOW word and continue
               -- TABLE descriptor U-bit writeback (U is bit 3 of HIGH word)
               if ptest_walk_no_update = '0' and walk_desc_high(3) = '0' and
-                 not (saved_fc(2) = '0' and (walk_supervisor = '1' or walk_desc_high(8) = '1')) then
+                 not (saved_fc(2) = '0' and walk_desc_high(8) = '1') then
                 desc_update_data <= walk_desc_high(31 downto 4) & '1' & walk_desc_high(2 downto 0);
                 walk_next_state <= W_PTR1;
                 walk_addr <= get_desc_address(walk_desc_high, mem_rdat, '1');
@@ -3125,12 +2657,10 @@ begin
               elsif ptest_walk_pending = '1' and
                  to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
                 walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => walk_desc_high(8),
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => walk_desc_high(2),
+                walker_fault_status <= encode_mmusr_success(
+                  write_protect => walk_desc_high(2),
+                  modified => '0',
+                  transparent => '0',
                   level => std_logic_vector(to_unsigned(walk_level + 1, 3))
                 );
                 wstate <= W_FAULT;
@@ -3239,7 +2769,7 @@ begin
                 invalid => '1',                  -- DT=00: Only I bit should be set per MC68030 spec
                 modified => '0',
                 transparent => '0',
-                level => std_logic_vector(to_unsigned(walk_level + 1, 3))
+                level => std_logic_vector(to_unsigned(walk_level, 3))
               );
               -- Debug: Track invalid descriptor
               -- report "INVALID_DESC_PTR1: Invalid descriptor at level=" & integer'image(walk_level) &
@@ -3265,30 +2795,15 @@ begin
             elsif is_final_table_level(tc_fcl, 1, tc_idx_bits) then
               -- No more TI levels after this (FCL-aware check)
               -- DT=10 at final level = short-format indirect descriptor
-              if ptest_walk_pending = '1' and
-                 to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
-                walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => '0',
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => mem_rdat(2),
-                  level => std_logic_vector(to_unsigned(walk_level + 1, 3))
-                );
-                wstate <= W_FAULT;
-              else
-                walk_desc_is_long <= '0';  -- Short format indirect
-                indirect_addr <= mem_rdat(31 downto 2) & "00";  -- Extract target address (4-byte aligned)
-                indirect_target_long <= mem_rdat(1) and mem_rdat(0);  -- DT=11 selects a long-format indirect target
-               --  -- report "W_PTR1: Short indirect descriptor detected (DT=10, final level), target addr=0x" & slv_to_hstring(mem_rdat(31 downto 2) & "00") severity note;
-                wstate <= W_INDIRECT;
-              end if;
+              walk_desc_is_long <= '0';  -- Short format indirect
+              indirect_addr <= mem_rdat(31 downto 2) & "00";  -- Extract target address (4-byte aligned)
+              indirect_target_long <= mem_rdat(1) and mem_rdat(0);  -- DT=11 selects a long-format indirect target
+             --  -- report "W_PTR1: Short indirect descriptor detected (DT=10, final level), target addr=0x" & slv_to_hstring(mem_rdat(31 downto 2) & "00") severity note;
+              wstate <= W_INDIRECT;
             else
               -- Continue to next level (short format table descriptor)
               -- TABLE descriptor U-bit writeback
-              if ptest_walk_no_update = '0' and mem_rdat(3) = '0'
-                 and not (saved_fc(2) = '0' and walk_supervisor = '1') then
+              if ptest_walk_no_update = '0' and mem_rdat(3) = '0' then
                 desc_update_data <= mem_rdat(31 downto 4) & '1' & mem_rdat(2 downto 0);
                 walk_next_state <= W_PTR2;
                 walk_desc_is_long <= '0';
@@ -3302,12 +2817,10 @@ begin
               elsif ptest_walk_pending = '1' and
                  to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
                 walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => '0',
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => mem_rdat(2),
+                walker_fault_status <= encode_mmusr_success(
+                  write_protect => mem_rdat(2),
+                  modified => '0',
+                  transparent => '0',
                   level => std_logic_vector(to_unsigned(walk_level + 1, 3))
                 );
                 wstate <= W_FAULT;
@@ -3354,29 +2867,15 @@ begin
               -- No more TI levels after this (FCL-aware check)
               -- DT=11 at final level = long-format indirect descriptor
               -- Target address is in LOW word bits 31:2 (longword aligned)
-              if ptest_walk_pending = '1' and
-                 to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
-                walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => walk_desc_high(8),
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => walk_desc_high(2),
-                  level => std_logic_vector(to_unsigned(walk_level + 1, 3))
-                );
-                wstate <= W_FAULT;
-              else
-                indirect_addr <= mem_rdat(31 downto 2) & "00";  -- Extract target address
-                indirect_target_long <= walk_desc_high(1) and walk_desc_high(0);  -- DT selects indirect target format
-               --  -- report "W_PTR1_LOW: Long indirect descriptor (DT=11, final level), target addr=0x" & slv_to_hstring(mem_rdat(31 downto 2) & "00") severity note;
-                wstate <= W_INDIRECT;
-              end if;
+              indirect_addr <= mem_rdat(31 downto 2) & "00";  -- Extract target address
+              indirect_target_long <= walk_desc_high(1) and walk_desc_high(0);  -- DT selects indirect target format
+             --  -- report "W_PTR1_LOW: Long indirect descriptor (DT=11, final level), target addr=0x" & slv_to_hstring(mem_rdat(31 downto 2) & "00") severity note;
+              wstate <= W_INDIRECT;
             else
               -- Table descriptor - extract address from LOW word and continue
               -- TABLE descriptor U-bit writeback (U is bit 3 of HIGH word)
               if ptest_walk_no_update = '0' and walk_desc_high(3) = '0' and
-                 not (saved_fc(2) = '0' and (walk_supervisor = '1' or walk_desc_high(8) = '1')) then
+                 not (saved_fc(2) = '0' and walk_desc_high(8) = '1') then
                 desc_update_data <= walk_desc_high(31 downto 4) & '1' & walk_desc_high(2 downto 0);
                 walk_next_state <= W_PTR2;
                 walk_addr <= get_desc_address(walk_desc_high, mem_rdat, '1');
@@ -3392,12 +2891,10 @@ begin
               elsif ptest_walk_pending = '1' and
                  to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
                 walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => walk_desc_high(8),
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => walk_desc_high(2),
+                walker_fault_status <= encode_mmusr_success(
+                  write_protect => walk_desc_high(2),
+                  modified => '0',
+                  transparent => '0',
                   level => std_logic_vector(to_unsigned(walk_level + 1, 3))
                 );
                 wstate <= W_FAULT;
@@ -3513,7 +3010,7 @@ begin
                 invalid => '1',                  -- DT=00: Only I bit should be set per MC68030 spec
                 modified => '0',
                 transparent => '0',
-                level => std_logic_vector(to_unsigned(walk_level + 1, 3))
+                level => std_logic_vector(to_unsigned(walk_level, 3))
               );
               -- Debug: Track invalid descriptor
               -- report "INVALID_DESC_PTR2: Invalid descriptor at level=" & integer'image(walk_level) &
@@ -3539,30 +3036,15 @@ begin
             elsif is_final_table_level(tc_fcl, 2, tc_idx_bits) then
               -- No more TI levels after this (FCL-aware check)
               -- DT=10 at final level = short-format indirect descriptor
-              if ptest_walk_pending = '1' and
-                 to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
-                walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => '0',
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => mem_rdat(2),
-                  level => std_logic_vector(to_unsigned(walk_level + 1, 3))
-                );
-                wstate <= W_FAULT;
-              else
-                walk_desc_is_long <= '0';  -- Short format indirect
-                indirect_addr <= mem_rdat(31 downto 2) & "00";  -- Extract target address (4-byte aligned)
-                indirect_target_long <= mem_rdat(1) and mem_rdat(0);  -- DT=11 selects a long-format indirect target
-               --  -- report "W_PTR2: Short indirect descriptor detected (DT=10, final level), target addr=0x" & slv_to_hstring(mem_rdat(31 downto 2) & "00") severity note;
-                wstate <= W_INDIRECT;
-              end if;
+              walk_desc_is_long <= '0';  -- Short format indirect
+              indirect_addr <= mem_rdat(31 downto 2) & "00";  -- Extract target address (4-byte aligned)
+              indirect_target_long <= mem_rdat(1) and mem_rdat(0);  -- DT=11 selects a long-format indirect target
+             --  -- report "W_PTR2: Short indirect descriptor detected (DT=10, final level), target addr=0x" & slv_to_hstring(mem_rdat(31 downto 2) & "00") severity note;
+              wstate <= W_INDIRECT;
             else
               -- Short format table descriptor
               -- TABLE descriptor U-bit writeback
-              if ptest_walk_no_update = '0' and mem_rdat(3) = '0'
-                 and not (saved_fc(2) = '0' and walk_supervisor = '1') then
+              if ptest_walk_no_update = '0' and mem_rdat(3) = '0' then
                 desc_update_data <= mem_rdat(31 downto 4) & '1' & mem_rdat(2 downto 0);
                 walk_next_state <= W_PTR3;
                 walk_desc_is_long <= '0';
@@ -3576,12 +3058,10 @@ begin
               elsif ptest_walk_pending = '1' and
                  to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
                 walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => '0',
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => mem_rdat(2),
+                walker_fault_status <= encode_mmusr_success(
+                  write_protect => mem_rdat(2),
+                  modified => '0',
+                  transparent => '0',
                   level => std_logic_vector(to_unsigned(walk_level + 1, 3))
                 );
                 wstate <= W_FAULT;
@@ -3628,29 +3108,15 @@ begin
               -- No more TI levels after this (FCL-aware check)
               -- DT=11 at final level = long-format indirect descriptor
               -- Target address is in LOW word bits 31:2 (longword aligned)
-              if ptest_walk_pending = '1' and
-                 to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
-                walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => walk_desc_high(8),
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => walk_desc_high(2),
-                  level => std_logic_vector(to_unsigned(walk_level + 1, 3))
-                );
-                wstate <= W_FAULT;
-              else
-                indirect_addr <= mem_rdat(31 downto 2) & "00";  -- Extract target address
-                indirect_target_long <= walk_desc_high(1) and walk_desc_high(0);  -- DT selects indirect target format
-               --  -- report "W_PTR2_LOW: Long indirect descriptor (DT=11, final level), target addr=0x" & slv_to_hstring(mem_rdat(31 downto 2) & "00") severity note;
-                wstate <= W_INDIRECT;
-              end if;
+              indirect_addr <= mem_rdat(31 downto 2) & "00";  -- Extract target address
+              indirect_target_long <= walk_desc_high(1) and walk_desc_high(0);  -- DT selects indirect target format
+             --  -- report "W_PTR2_LOW: Long indirect descriptor (DT=11, final level), target addr=0x" & slv_to_hstring(mem_rdat(31 downto 2) & "00") severity note;
+              wstate <= W_INDIRECT;
             else
               -- Table descriptor - extract address from LOW word and continue
               -- TABLE descriptor U-bit writeback (U is bit 3 of HIGH word)
               if ptest_walk_no_update = '0' and walk_desc_high(3) = '0' and
-                 not (saved_fc(2) = '0' and (walk_supervisor = '1' or walk_desc_high(8) = '1')) then
+                 not (saved_fc(2) = '0' and walk_desc_high(8) = '1') then
                 desc_update_data <= walk_desc_high(31 downto 4) & '1' & walk_desc_high(2 downto 0);
                 walk_next_state <= W_PTR3;
                 walk_addr <= get_desc_address(walk_desc_high, mem_rdat, '1');
@@ -3666,12 +3132,10 @@ begin
               elsif ptest_walk_pending = '1' and
                  to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
                 walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => walk_desc_high(8),
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => walk_desc_high(2),
+                walker_fault_status <= encode_mmusr_success(
+                  write_protect => walk_desc_high(2),
+                  modified => '0',
+                  transparent => '0',
                   level => std_logic_vector(to_unsigned(walk_level + 1, 3))
                 );
                 wstate <= W_FAULT;
@@ -3765,7 +3229,7 @@ begin
                 invalid => '1',                  -- DT=00: Only I bit should be set per MC68030 spec
                 modified => '0',
                 transparent => '0',
-                level => std_logic_vector(to_unsigned(walk_level + 1, 3))
+                level => std_logic_vector(to_unsigned(walk_level, 3))
               );
               -- Debug: Track invalid descriptor
               -- report "INVALID_DESC_PTR3: Invalid descriptor at level=" & integer'image(walk_level) &
@@ -3785,30 +3249,15 @@ begin
               -- DT=10 at final level = short-format indirect descriptor (MC68030 spec section 9.5.3.2)
               -- The descriptor points to another descriptor (the target) that will be used
               -- Target address is in bits 31:2 (must be 4-byte aligned)
-              if ptest_walk_pending = '1' and
-                 to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
-                walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => '0',
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => mem_rdat(2),
-                  level => std_logic_vector(to_unsigned(walk_level + 1, 3))
-                );
-                wstate <= W_FAULT;
-              else
-                walk_desc_is_long <= '0';  -- Short format indirect
-                indirect_addr <= mem_rdat(31 downto 2) & "00";  -- Extract target address (4-byte aligned)
-                indirect_target_long <= mem_rdat(1) and mem_rdat(0);  -- DT=11 selects a long-format indirect target
-               --  -- report "W_PTR3: Short indirect descriptor detected (DT=10, final level), target addr=0x" & slv_to_hstring(mem_rdat(31 downto 2) & "00") severity note;
-                wstate <= W_INDIRECT;
-              end if;
+              walk_desc_is_long <= '0';  -- Short format indirect
+              indirect_addr <= mem_rdat(31 downto 2) & "00";  -- Extract target address (4-byte aligned)
+              indirect_target_long <= mem_rdat(1) and mem_rdat(0);  -- DT=11 selects a long-format indirect target
+             --  -- report "W_PTR3: Short indirect descriptor detected (DT=10, final level), target addr=0x" & slv_to_hstring(mem_rdat(31 downto 2) & "00") severity note;
+              wstate <= W_INDIRECT;
             else
               -- FCL=1 and TID!=0: Continue to W_PTR4 (5th level)
               -- TABLE descriptor U-bit writeback
-              if ptest_walk_no_update = '0' and mem_rdat(3) = '0'
-                 and not (saved_fc(2) = '0' and walk_supervisor = '1') then
+              if ptest_walk_no_update = '0' and mem_rdat(3) = '0' then
                 desc_update_data <= mem_rdat(31 downto 4) & '1' & mem_rdat(2 downto 0);
                 walk_next_state <= W_PTR4;
                 walk_desc_is_long <= '0';
@@ -3822,12 +3271,10 @@ begin
               elsif ptest_walk_pending = '1' and
                  to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
                 walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => '0',
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => mem_rdat(2),
+                walker_fault_status <= encode_mmusr_success(
+                  write_protect => mem_rdat(2),
+                  modified => '0',
+                  transparent => '0',
                   level => std_logic_vector(to_unsigned(walk_level + 1, 3))
                 );
                 wstate <= W_FAULT;
@@ -3873,29 +3320,15 @@ begin
             elsif is_final_table_level(tc_fcl, 3, tc_idx_bits) then
               -- At final level with DT=11, this is a LONG INDIRECT descriptor
               -- Target address is in LOW word bits 31:2 (longword aligned)
-              if ptest_walk_pending = '1' and
-                 to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
-                walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => walk_desc_high(8),
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => walk_desc_high(2),
-                  level => std_logic_vector(to_unsigned(walk_level + 1, 3))
-                );
-                wstate <= W_FAULT;
-              else
-                indirect_addr <= mem_rdat(31 downto 2) & "00";  -- Extract target address
-                indirect_target_long <= walk_desc_high(1) and walk_desc_high(0);  -- DT selects indirect target format
-               --  -- report "W_PTR3_LOW: Long indirect descriptor (final level), target addr=0x" & slv_to_hstring(mem_rdat(31 downto 2) & "00") severity note;
-                wstate <= W_INDIRECT;
-              end if;
+              indirect_addr <= mem_rdat(31 downto 2) & "00";  -- Extract target address
+              indirect_target_long <= walk_desc_high(1) and walk_desc_high(0);  -- DT selects indirect target format
+             --  -- report "W_PTR3_LOW: Long indirect descriptor (final level), target addr=0x" & slv_to_hstring(mem_rdat(31 downto 2) & "00") severity note;
+              wstate <= W_INDIRECT;
             else
               -- FCL=1 and TID!=0: Continue to W_PTR4 (5th level)
               -- TABLE descriptor U-bit writeback (U is bit 3 of HIGH word)
               if ptest_walk_no_update = '0' and walk_desc_high(3) = '0' and
-                 not (saved_fc(2) = '0' and (walk_supervisor = '1' or walk_desc_high(8) = '1')) then
+                 not (saved_fc(2) = '0' and walk_desc_high(8) = '1') then
                 desc_update_data <= walk_desc_high(31 downto 4) & '1' & walk_desc_high(2 downto 0);
                 walk_next_state <= W_PTR4;
                 walk_addr <= get_desc_address(walk_desc_high, mem_rdat, '1');
@@ -3911,12 +3344,10 @@ begin
               elsif ptest_walk_pending = '1' and
                  to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
                 walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => walk_desc_high(8),
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => walk_desc_high(2),
+                walker_fault_status <= encode_mmusr_success(
+                  write_protect => walk_desc_high(2),
+                  modified => '0',
+                  transparent => '0',
                   level => std_logic_vector(to_unsigned(walk_level + 1, 3))
                 );
                 wstate <= W_FAULT;
@@ -4010,7 +3441,7 @@ begin
                 invalid => '1',
                 modified => '0',
                 transparent => '0',
-                level => std_logic_vector(to_unsigned(walk_level + 1, 3))
+                level => std_logic_vector(to_unsigned(walk_level, 3))
               );
               wstate <= W_FAULT;
             elsif walk_parent_dt_long = '1' then
@@ -4024,24 +3455,10 @@ begin
             else
               -- DT=10 at final level = short-format indirect descriptor
               -- W_PTR4 is always final level (TID is last TI field)
-              if ptest_walk_pending = '1' and
-                 to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
-                walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => '0',
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => mem_rdat(2),
-                  level => std_logic_vector(to_unsigned(walk_level + 1, 3))
-                );
-                wstate <= W_FAULT;
-              else
-                walk_desc_is_long <= '0';
-                indirect_addr <= mem_rdat(31 downto 2) & "00";
-                indirect_target_long <= mem_rdat(1) and mem_rdat(0);  -- DT=11 selects a long-format indirect target
-                wstate <= W_INDIRECT;
-              end if;
+              walk_desc_is_long <= '0';
+              indirect_addr <= mem_rdat(31 downto 2) & "00";
+              indirect_target_long <= mem_rdat(1) and mem_rdat(0);  -- DT=11 selects a long-format indirect target
+              wstate <= W_INDIRECT;
             end if;
           end if;
         when W_PTR4_LOW =>
@@ -4072,23 +3489,9 @@ begin
             else
               -- DT=11 at final level = long-format indirect descriptor
               -- Target address is in LOW word bits 31:2 (longword aligned)
-              if ptest_walk_pending = '1' and
-                 to_unsigned(walk_level + 1, 3) >= unsigned(ptest_level) then
-                walker_fault <= '1';
-                walker_fault_status <= encode_ptest_table_status(
-                  fc => saved_fc,
-                  accum_supervisor => walk_supervisor,
-                  current_supervisor => walk_desc_high(8),
-                  accum_write_protect => walk_write_protect,
-                  current_write_protect => walk_desc_high(2),
-                  level => std_logic_vector(to_unsigned(walk_level + 1, 3))
-                );
-                wstate <= W_FAULT;
-              else
-                indirect_addr <= mem_rdat(31 downto 2) & "00";
-                indirect_target_long <= walk_desc_high(1) and walk_desc_high(0);  -- DT selects indirect target format
-                wstate <= W_INDIRECT;
-              end if;
+              indirect_addr <= mem_rdat(31 downto 2) & "00";
+              indirect_target_long <= walk_desc_high(1) and walk_desc_high(0);  -- DT selects indirect target format
+              wstate <= W_INDIRECT;
             end if;
           end if;
         when W_INDIRECT =>
@@ -4106,7 +3509,7 @@ begin
             walker_fault_status <= encode_mmusr_fault(
               bus_error => '1', limit_violation => '0', supervisor_violation => '0',
               write_protect => '0', invalid => '1', modified => '0', transparent => '0',
-              level => page_descriptor_count(walk_level, walk_page_from_indirect, walk_is_root_pointer)
+              level => std_logic_vector(to_unsigned(walk_level, 3))
             );
             wstate <= W_FAULT;
           elsif mem_ack = '1' then
@@ -4118,7 +3521,6 @@ begin
             if mem_rdat(1 downto 0) = "01" then
               -- Valid page descriptor - check if short or long format target
               walk_desc_high <= mem_rdat;
-              walk_page_from_indirect <= '1';
               if indirect_target_long = '0' then
                 -- BUG #164: Short-format target - done, proceed to W_PAGE
                 walk_desc <= mem_rdat;
@@ -4140,7 +3542,7 @@ begin
                 invalid => '1',                  -- DT=00: Only I bit should be set
                 modified => '0',
                 transparent => '0',
-                level => std_logic_vector(to_unsigned(walk_level + 2, 3))
+                level => std_logic_vector(to_unsigned(walk_level, 3))
               );
              --  -- report "W_INDIRECT: Invalid target descriptor (DT=00)" severity note;
               wstate <= W_FAULT;
@@ -4155,7 +3557,7 @@ begin
                 invalid => '1',                  -- Nested indirect sets I bit per MC68030 spec
                 modified => '0',
                 transparent => '0',
-                level => std_logic_vector(to_unsigned(walk_level + 2, 3))
+                level => std_logic_vector(to_unsigned(walk_level, 3))
               );
              --  -- report "W_INDIRECT: Nested indirect descriptor - invalid" severity note;
               wstate <= W_FAULT;
@@ -4174,7 +3576,7 @@ begin
             walker_fault_status <= encode_mmusr_fault(
               bus_error => '1', limit_violation => '0', supervisor_violation => '0',
               write_protect => '0', invalid => '1', modified => '0', transparent => '0',
-              level => std_logic_vector(to_unsigned(walk_level + 1, 3))
+              level => std_logic_vector(to_unsigned(walk_level, 3))
             );
             wstate <= W_FAULT;
           elsif mem_ack = '1' then
@@ -4186,12 +3588,8 @@ begin
             wstate <= W_PAGE;
           end if;
         when W_PAGE =>
-          -- Process page descriptor and validate completely.
-          -- Long-format descriptors carry DT/S/WP/etc. in HIGH and the
-          -- physical page base in LOW. Validating LOW would misread aligned
-          -- page bases ending in ...00 as DT=00 invalid descriptors.
-          if (walk_desc_is_long = '1' and not desc_valid(walk_desc_high)) or
-             (walk_desc_is_long = '0' and not desc_valid(walk_desc)) then
+          -- Process page descriptor and validate completely
+          if not desc_valid(walk_desc) then
             -- Invalid page descriptor (DT=00)
             walker_fault <= '1';
             walker_fault_status <= encode_mmusr_fault(
@@ -4202,7 +3600,7 @@ begin
               invalid => '1',                  -- DT=00: Only I bit should be set per MC68030 spec
               modified => '0',
               transparent => '0',
-              level => page_descriptor_count(walk_level, walk_page_from_indirect, walk_is_root_pointer)
+              level => std_logic_vector(to_unsigned(walk_level, 3))
             );
             -- Debug: Track invalid descriptor
             -- report "INVALID_DESC_PAGE: Invalid page descriptor at level=" & integer'image(walk_level) &
@@ -4222,7 +3620,7 @@ begin
               invalid => '0',                  -- Descriptor is valid
               modified => '0',
               transparent => '0',
-              level => page_descriptor_count(walk_level, walk_page_from_indirect, walk_is_root_pointer)
+              level => std_logic_vector(to_unsigned(walk_level, 3))
             );
             wstate <= W_FAULT;
           -- BUG #437 FIX: Per WinUAE cpummu30.cpp line 1496-1497 + 1643-1647:
@@ -4260,31 +3658,18 @@ begin
               walk_phys_base <= std_logic_vector(
                 unsigned(early_term_desc_addr) + unsigned(early_term_offset));
             end if;
-            -- MC68030 early termination limit check (MC68030 UM 9.5.1 LIMIT / 9.5.3.1):
-            -- "If an early termination page descriptor is a long format, the limit
-            --  field is applied to the next index field of the logical address."
-            -- If there is no next index field (current level is the deepest, or the
-            -- next TI field is zero), the check is undefined and must be skipped.
-            -- is_final_table_level() encodes this for both FCL=0 and FCL=1.
-            limit_fault := false;
-            if walk_desc_is_long = '1'
-               and early_term_limit_applies(walk_is_root_pointer, tc_fcl, walk_level, tc_idx_bits) then
-              table_index := get_fcl_table_index(
-                walk_vpn,
-                saved_fc,
-                tc_fcl,
-                early_term_limit_level(walk_is_root_pointer, walk_level),
-                tc_initial_shift,
-                tc_page_size,
-                tc_idx_bits
-              );
+            -- MC68030 early termination limit check (per WinUAE lines 1530-1554)
+            -- Check next table level's index against this descriptor's limit field
+            limit_fault := false;  -- BUG FIX: Track early termination limit violation
+            if walk_desc_is_long = '1' and walk_level < 4 then
+              table_index := get_fcl_table_index(walk_vpn, saved_fc, tc_fcl, walk_level + 1, tc_initial_shift, tc_page_size, tc_idx_bits);
               if walk_desc_high(31) = '1' and to_unsigned(table_index, 15) < unsigned(walk_desc_high(30 downto 16)) then
                 -- Lower limit violation: index < limit
                 walker_fault <= '1';
                 walker_fault_status <= encode_mmusr_fault(
                   bus_error => '0', limit_violation => '1', supervisor_violation => '0',
                   write_protect => '0', invalid => '1', modified => '0',
-                  transparent => '0', level => page_descriptor_count(walk_level, walk_page_from_indirect, walk_is_root_pointer));
+                  transparent => '0', level => std_logic_vector(to_unsigned(walk_level, 3)));
                 wstate <= W_FAULT;
                 limit_fault := true;  -- BUG FIX: Prevent U/M logic from overwriting fault
               elsif walk_desc_high(31) = '0' and to_unsigned(table_index, 15) > unsigned(walk_desc_high(30 downto 16)) then
@@ -4293,27 +3678,24 @@ begin
                 walker_fault_status <= encode_mmusr_fault(
                   bus_error => '0', limit_violation => '1', supervisor_violation => '0',
                   write_protect => '0', invalid => '1', modified => '0',
-                  transparent => '0', level => page_descriptor_count(walk_level, walk_page_from_indirect, walk_is_root_pointer));
+                  transparent => '0', level => std_logic_vector(to_unsigned(walk_level, 3)));
                 wstate <= W_FAULT;
                 limit_fault := true;  -- BUG FIX: Prevent U/M logic from overwriting fault
               end if;
             end if;
-            -- Extract attributes - bit positions are same in both formats.
-            -- Decode them into variables first so same-cycle MMUSR/PTEST decisions
-            -- see the current page instead of the previous walk_attr latch contents.
+            -- Extract attributes - bit positions are same in both formats
             -- U_ACC must reflect supervisor-only protection from long table and long page descriptors.
-            page_user_access   := not (walk_supervisor or get_supervisor_bit(walk_desc_high, walk_desc_is_long));
-            page_cache_inhibit := walk_desc_high(6);
-            page_modified      := walk_desc_high(4);
-            page_write_protect := walk_desc_high(2) or walk_write_protect;
-            walk_attr(3) <= page_user_access;   -- U_ACC = NOT(S): 1=user accessible, 0=supervisor-only
-            walk_attr(2) <= page_cache_inhibit; -- Cache inhibit (CI)
-            walk_attr(1) <= page_modified;      -- Modified (M)
-            walk_attr(0) <= page_write_protect; -- WP from page + accumulated table WP
-            -- MC68030 UM 9.6 (PDF line 15292): shared/global ATC entries are a
-            -- MC68851 feature, not an MC68030 feature. The MC68030 therefore
-            -- has only PFLUSHA and PFLUSH forms; no per-entry global attribute
-            -- participates in attribute extraction or flush filtering.
+            walk_attr(3) <= not (walk_supervisor or get_supervisor_bit(walk_desc_high, walk_desc_is_long)); -- U_ACC = NOT(S): 1=user accessible, 0=supervisor-only
+            walk_attr(2) <= walk_desc_high(6); -- Cache inhibit (CI)
+            walk_attr(1) <= walk_desc_high(4); -- Modified (M)
+            walk_attr(0) <= walk_desc_high(2) or walk_write_protect; -- WP from page + accumulated table WP
+            -- G bit (Global) is at bit 10 in long-format descriptors only
+            -- Short-format has no G bit, so non-global by default
+            if walk_desc_is_long = '1' then
+              walk_global <= walk_desc_high(10);  -- G bit for PFLUSHAN semantics
+            else
+              walk_global <= '0';  -- Short format = non-global
+            end if;
             walk_fault <= '0';
             -- Debug: Log attribute extraction for long-format descriptors
             if walk_desc_is_long = '1' then
@@ -4336,26 +3718,12 @@ begin
               -- Skip history-bit writeback only for non-mutating walks or register-only root pointers.
               if ptest_walk_pending = '1' then
                 walker_fault <= '1';
-                -- MC68030 UM 9.7.4 line 15636-15638: MMUSR N = "actual number of
-                -- tables accessed during the search". A root-pointer DT=01 early
-                -- termination reads no memory-resident table (the descriptor is
-                -- the CRP/SRP register itself, UM 9.5.1.2 line 14649-14656), so
-                -- N must be 0 in that case rather than walk_level+1.
-                if walk_is_root_pointer = '1' then
-                  walker_fault_status <= encode_mmusr_success(
-                    write_protect => page_write_protect,
-                    modified => page_modified,
-                    transparent => '0',
-                    level => "000"
-                  );
-                else
-                  walker_fault_status <= encode_mmusr_success(
-                    write_protect => page_write_protect,
-                    modified => page_modified,
-                    transparent => '0',
-                    level => page_descriptor_count(walk_level, walk_page_from_indirect, walk_is_root_pointer)
-                  );
-                end if;
+                walker_fault_status <= encode_mmusr_success(
+                  write_protect => walk_attr(0),
+                  modified => walk_attr(1),
+                  transparent => '0',
+                  level => std_logic_vector(to_unsigned(walk_level + 1, 3))
+                );
                 wstate <= W_FAULT;
               elsif pload_flush_pending = '1' then
                 wstate <= W_PLOAD_FLUSH;
@@ -4369,15 +3737,8 @@ begin
               -- Need to update descriptor with U/M bits
               desc_update_needed <= '1';
               -- Prepare updated descriptor: set U bit, and M bit if write AND not WP
-              -- MC68030 UM 9.8 line 15744-15746: PLOADW "updates all history
-              -- information in the translation tables (used and modified bits)
-              -- as if a write operation to that address had occurred." Allow M
-              -- update for PLOADW; suppress only for PTEST (ptest_walk_pending).
-              -- PTEST never reaches this line because ptest_walk_no_update='1'
-              -- routes it through the earlier no-update branch, but guarding on
-              -- ptest_walk_pending here documents the intent for readers.
               desc_update_data <= walk_desc_high(31 downto 5) &
-                                  (walk_desc_high(4) or ((not saved_rw) and (not ptest_walk_pending) and (not walk_desc_high(2)) and (not walk_write_protect))) &  -- M bit: set if write, not WP, not PTEST
+                                  (walk_desc_high(4) or ((not saved_rw) and (not instr_walk_pending) and (not walk_desc_high(2)) and (not walk_write_protect))) &  -- M bit: set if write, not WP, not PTEST/PLOAD
                                   '1' &  -- U bit: always set
                                   walk_desc_high(2 downto 0);
               wstate <= W_UPDATE_DESC;
@@ -4386,10 +3747,10 @@ begin
               if ptest_walk_pending = '1' then
                 walker_fault <= '1';
                 walker_fault_status <= encode_mmusr_success(
-                  write_protect => page_write_protect,
-                  modified => page_modified,
+                  write_protect => walk_attr(0),
+                  modified => walk_attr(1),
                   transparent => '0',
-                  level => page_descriptor_count(walk_level, walk_page_from_indirect, walk_is_root_pointer)
+                  level => std_logic_vector(to_unsigned(walk_level + 1, 3))
                 );
                 wstate <= W_FAULT;
               elsif pload_flush_pending = '1' then
@@ -4428,12 +3789,10 @@ begin
             if ptest_walk_pending = '1' and
                to_unsigned(walk_level, 3) >= unsigned(ptest_level) then
               walker_fault <= '1';
-              walker_fault_status <= encode_ptest_table_status(
-                fc => saved_fc,
-                accum_supervisor => walk_supervisor,
-                current_supervisor => '0',
-                accum_write_protect => walk_write_protect,
-                current_write_protect => '0',
+              walker_fault_status <= encode_mmusr_success(
+                write_protect => desc_update_data(2),
+                modified => '0',
+                transparent => '0',
                 level => std_logic_vector(to_unsigned(walk_level, 3))
               );
               wstate <= W_FAULT;
@@ -4459,7 +3818,7 @@ begin
             walker_fault_status <= encode_mmusr_fault(
               bus_error => '1', limit_violation => '0', supervisor_violation => '0',
               write_protect => '0', invalid => '1', modified => '0', transparent => '0',
-              level => page_descriptor_count(walk_level, walk_page_from_indirect, walk_is_root_pointer)
+              level => std_logic_vector(to_unsigned(walk_level, 3))
             );
             wstate <= W_FAULT;
           elsif mem_ack = '1' then
@@ -4476,7 +3835,7 @@ begin
                 write_protect => desc_update_data(2) or walk_write_protect,
                 modified => desc_update_data(4),
                 transparent => '0',
-                level => page_descriptor_count(walk_level, walk_page_from_indirect, walk_is_root_pointer)
+                level => std_logic_vector(to_unsigned(walk_level + 1, 3))
               );
               wstate <= W_FAULT;
             elsif pload_flush_pending = '1' then
@@ -4500,32 +3859,18 @@ begin
           wstate <= W_FILL;  -- Next cycle: fill with updated atc_valid
         when W_FILL =>
           -- Fill ATC with translation result using pseudo-LRU replacement
-          -- Keep the ATC associative state canonical: if this page/FC is already
-          -- resident, replace that entry before using the normal invalid/MRU
-          -- replacement path. This prevents stale cached faults from coexisting
-          -- with a fresh successful walk after history-bit writeback.
-          found_match := false;
+          -- Per MC68030 spec: first try invalid entry, then first entry with MRU=0
           found_invalid := false;
           replace_idx := 0;
-          -- Step 1: Search for an existing entry covering this logical page/FC.
+          -- Step 1: Search for an invalid (empty) entry
           for i in 0 to ATC_ENTRIES-1 loop
-            if atc_valid(i) = '1' and not found_match and atc_fc(i) = saved_fc and
-               align_addr(saved_addr_log, atc_shift(i)) = atc_log_base(i) then
+            if atc_valid(i) = '0' and not found_invalid then
               replace_idx := i;
-              found_match := true;
+              found_invalid := true;
             end if;
           end loop;
-          -- Step 2: Search for an invalid (empty) entry
-          if not found_match then
-            for i in 0 to ATC_ENTRIES-1 loop
-              if atc_valid(i) = '0' and not found_invalid then
-                replace_idx := i;
-                found_invalid := true;
-              end if;
-            end loop;
-          end if;
-          -- Step 3: If no invalid entry, find first entry with MRU=0
-          if not found_match and not found_invalid then
+          -- Step 2: If no invalid entry, find first entry with MRU=0
+          if not found_invalid then
             for i in 0 to ATC_ENTRIES-1 loop
               if atc_mru(i) = '0' then
                 replace_idx := i;
@@ -4533,24 +3878,15 @@ begin
               end if;
             end loop;
           end if;
-          -- Invalidate any duplicate entries for the same page/FC.
-          for i in 0 to ATC_ENTRIES-1 loop
-            if i /= replace_idx and atc_valid(i) = '1' and atc_fc(i) = saved_fc and
-               align_addr(saved_addr_log, atc_shift(i)) = atc_log_base(i) then
-              atc_valid(i) <= '0';
-              atc_mru(i) <= '0';
-              atc_buserr(i) <= '0';
-              atc_fault_status(i) <= (others => '0');
-            end if;
-          end loop;
           -- Fill the selected entry
           atc_log_base(replace_idx)  <= walk_log_base;
-          atc_phys_base(replace_idx) <= align_addr(walk_phys_base, walk_page_shift);
+          atc_phys_base(replace_idx) <= walk_phys_base;
           atc_shift(replace_idx)     <= walk_page_shift;
           atc_page_size(replace_idx) <= walk_page_size;
           atc_attr(replace_idx)      <= walk_attr(3 downto 0);
           atc_fc(replace_idx)        <= saved_fc;
-          atc_level(replace_idx)     <= page_descriptor_count(walk_level, walk_page_from_indirect, walk_is_root_pointer);
+          atc_global(replace_idx)    <= walk_global;
+          atc_level(replace_idx)     <= std_logic_vector(to_unsigned(walk_level + 1, 3));
           atc_valid(replace_idx)     <= '1';
           atc_buserr(replace_idx)    <= '0';  -- BUG #436: Clear bus error flag for successful walk
           atc_fault_status(replace_idx) <= (others => '0');
@@ -4601,25 +3937,15 @@ begin
           else
             -- Cache the original MMUSR fault class in the ATC so repeated hits
             -- replay the same B/L/S/W/I combination without re-walking.
-            found_match := false;
             found_invalid := false;
             replace_idx := 0;
             for i in 0 to ATC_ENTRIES-1 loop
-              if atc_valid(i) = '1' and not found_match and atc_fc(i) = saved_fc and
-                 align_addr(saved_addr_log, atc_shift(i)) = atc_log_base(i) then
+              if atc_valid(i) = '0' and not found_invalid then
                 replace_idx := i;
-                found_match := true;
+                found_invalid := true;
               end if;
             end loop;
-            if not found_match then
-              for i in 0 to ATC_ENTRIES-1 loop
-                if atc_valid(i) = '0' and not found_invalid then
-                  replace_idx := i;
-                  found_invalid := true;
-                end if;
-              end loop;
-            end if;
-            if not found_match and not found_invalid then
+            if not found_invalid then
               for i in 0 to ATC_ENTRIES-1 loop
                 if atc_mru(i) = '0' then
                   replace_idx := i;
@@ -4627,25 +3953,17 @@ begin
                 end if;
               end loop;
             end if;
-            for i in 0 to ATC_ENTRIES-1 loop
-              if i /= replace_idx and atc_valid(i) = '1' and atc_fc(i) = saved_fc and
-                 align_addr(saved_addr_log, atc_shift(i)) = atc_log_base(i) then
-                atc_valid(i) <= '0';
-                atc_mru(i) <= '0';
-                atc_buserr(i) <= '0';
-                atc_fault_status(i) <= (others => '0');
-              end if;
-            end loop;
             atc_log_base(replace_idx)  <= walk_log_base;
             atc_phys_base(replace_idx) <= (others => '0');  -- No valid physical address
             atc_shift(replace_idx)     <= walk_page_shift;
             atc_page_size(replace_idx) <= walk_page_size;
             atc_attr(replace_idx)      <= (others => '0');  -- No valid attributes
             atc_fc(replace_idx)        <= saved_fc;
-            atc_level(replace_idx)     <= (others => '0');
+            atc_global(replace_idx)    <= '0';
+            atc_level(replace_idx)     <= walker_fault_status(2 downto 0);
             atc_valid(replace_idx)     <= '1';
             atc_buserr(replace_idx)    <= '1';  -- Mark as cached fault entry
-            atc_fault_status(replace_idx) <= walker_fault_status(15 downto 3) & "000";
+            atc_fault_status(replace_idx) <= walker_fault_status(15 downto 0);
             atc_mru(replace_idx) <= '1';
             walker_completed <= '1';  -- Signal that walker completed (with fault)
             wstate <= W_IDLE;
@@ -4654,8 +3972,7 @@ begin
         when others =>
           wstate <= W_IDLE;
         end case;
-        end if;  -- End timeout vs normal state machine conditional
-      end if;  -- End context-change abort vs normal walker state machine
+      end if;  -- End timeout vs normal state machine conditional
       -- Handle ATC MRU update requests from translation process (ATC hits)
       if atc_mru_update_req = '1' then
         atc_mru(atc_mru_update_idx) <= '1';
@@ -4693,43 +4010,65 @@ begin
         end loop;
       end if;
       if pflush_clear_atc = '1' and wstate = W_IDLE then
-        -- MC68030 PFLUSH variants (brief word bits 12:10):
-        --   001 = PFLUSHA
-        --   100 = PFLUSH  <fc>,#mask
-        --   110 = PFLUSH  <fc>,#mask,<ea>
-        -- MC68030 UM 9.6: the 68851 shared-entry derivatives are not supported.
-        if pflush_mode = "001" then
-          -- PFLUSHA: flush all ATC entries
+        -- MC68030 PFLUSH variants:
+        -- pflush_mode(12:8) = pmmu_brief(12:8) determines flush type:
+        -- Bits 12-10 = MODE:
+        --   001 = PFLUSHA/PFLUSHAN (flush all, A bit in bit 9)
+        --   100 = PFLUSH FC,MASK (flush by FC, no EA)
+        --   110 = PFLUSH FC,MASK,<ea> (flush by FC with EA)
+        -- Bit 9 = A/N: 0=flush all, 1=flush all except global (for MODE=001)
+        -- Bit 8 = reserved (0)
+        if pflush_mode(12 downto 10) = "001" and pflush_mode(9) = '0' then
+          -- PFLUSHA - flush all ATC entries (MODE=001, A=0)
           for i in 0 to ATC_ENTRIES-1 loop
             atc_valid(i) <= '0';
             atc_mru(i) <= '0';
             atc_buserr(i) <= '0';
             atc_fault_status(i) <= (others => '0');
           end loop;
-        elsif pflush_mode = "100" then
-          -- PFLUSH FC,MASK: flush entries matching FC under mask, regardless of address.
-          -- mask=0 matches any FC. FC3 is not implemented on MC68030; decode rejects
-          -- brief(8)='1', so only the real 3-bit FC participates here.
+        elsif pflush_mode(12 downto 10) = "001" and pflush_mode(9) = '1' then
+          -- PFLUSHAN - flush all non-global entries per MC68030 spec (MODE=001, A=1)
+          -- Global pages (G bit = 1) survive PFLUSHAN
+          for i in 0 to ATC_ENTRIES-1 loop
+            if atc_global(i) = '0' then
+              atc_valid(i) <= '0';  -- Only flush non-global entries
+              atc_mru(i) <= '0';
+              atc_buserr(i) <= '0';
+              atc_fault_status(i) <= (others => '0');
+            end if;
+          end loop;
+        elsif pflush_mode(12 downto 10) = "100" then
+          -- BUG F FIX: PFLUSH FC,MASK (mode=100, no EA) - flush ALL entries matching FC/mask
+          -- MC68030 spec: No address comparison when no EA is provided
+          -- pflush_mode(9) = N bit: 0=flush all matching, 1=flush only non-global matching
           for i in 0 to ATC_ENTRIES-1 loop
             if atc_valid(i) = '1' then
+              -- BUG E FIX: Apply FC mask - XOR finds differences, AND with mask selects
+              -- relevant bits, "000" means all masked bits match (mask=0 matches any FC)
               if ((atc_fc(i) xor pflush_fc) and pflush_mask) = "000" then
-                atc_valid(i) <= '0';
-                atc_mru(i) <= '0';
-                atc_buserr(i) <= '0';
-                atc_fault_status(i) <= (others => '0');
+                if pflush_mode(9) = '0' or atc_global(i) = '0' then
+                  atc_valid(i) <= '0';
+                  atc_mru(i) <= '0';
+                  atc_buserr(i) <= '0';
+                  atc_fault_status(i) <= (others => '0');
+                end if;
               end if;
             end if;
           end loop;
         else
-          -- PFLUSH FC,MASK,<ea> (mode=110): FC match AND address match.
+          -- PFLUSH FC,MASK,<ea> (mode=110) - flush entries matching FC/mask AND address
+          -- pflush_mode(9) = N bit: 0=flush all matching, 1=flush only non-global matching
           for i in 0 to ATC_ENTRIES-1 loop
             if atc_valid(i) = '1' then
+              -- BUG E FIX: Apply FC mask (same as mode=100 above)
               if ((atc_fc(i) xor pflush_fc) and pflush_mask) = "000" and
                  align_addr(pflush_addr, atc_shift(i)) = atc_log_base(i) then
-                atc_valid(i) <= '0';
-                atc_mru(i) <= '0';
-                atc_buserr(i) <= '0';
-                atc_fault_status(i) <= (others => '0');
+                if pflush_mode(9) = '0' or atc_global(i) = '0' then
+                  atc_valid(i) <= '0';
+                  atc_mru(i) <= '0';
+                  atc_buserr(i) <= '0';
+                  atc_fault_status(i) <= (others => '0');
+                end if;
               end if;
             end if;
           end loop;
@@ -4749,20 +4088,12 @@ begin
     end if;
   end process;
   -- Walker busy indication - not busy if MMU disabled or TTR hit
-  process(wstate, addr_log, fc, rw, rmw, is_insn, TT0, TT1, tc_en, translation_pending, walker_fault, walker_completed, walker_fault_ack_pending, translated_addr, translated_fc, translated_rw, translated_cfg_seq, xlat_cfg_seq, req, fault_reg, fault_current_req_match, pload_active, ptest_update_mmusr, ptest_active, ptest_walk_pending, ptest_desc_return_pending, mmusr_update_req)
+  process(wstate, addr_log, fc, rw, is_insn, TT0, TT1, tc_en, translation_pending, walker_fault, walker_completed, walker_fault_ack_pending, translated_addr, translated_fc, translated_rw, translated_cfg_seq, xlat_cfg_seq, req, fault_reg)
     variable tmatch0, tmatch1 : std_logic;
     variable dummy_ci, dummy_wp : std_logic;
   begin
-    -- Normal CPU translation is idle when TC.E is clear, but PTEST/PLOAD can
-    -- still perform manual table searches with TC.E=0.
-    if ptest_update_mmusr = '1' or ptest_active = '1' or ptest_desc_return_pending = '1' or mmusr_update_req = '1' then
-      -- Hold the CPU while a PTEST command is being accepted/processed. Without
-      -- this, the A-bit writeback can sample stale desc_addr_reg before the
-      -- table search starts. Also hold until the resulting MMUSR update has
-      -- been committed so a following PMOVE MMUSR cannot read the old value.
-      busy <= '1';
-    elsif tc_en = '0' and pload_active = '0' and ptest_walk_pending = '0'
-       and translation_pending = '0' and wstate = W_IDLE then
+    -- Not busy if MMU is disabled
+    if tc_en = '0' then
       busy <= '0';
     else
       -- BUG #421 FIX: Use ttr_check with actual rw signal instead of ttr_match which
@@ -4770,9 +4101,9 @@ begin
       -- when the TTR only matches reads. This caused busy='0' (TTR handles it) while
       -- the translation process started a walker (TTR doesn't match writes), allowing
       -- the CPU to proceed with a stale physical address.
-      ttr_check(TT0, addr_log, fc, is_insn, rw, rmw, tmatch0, dummy_ci, dummy_wp);
-      ttr_check(TT1, addr_log, fc, is_insn, rw, rmw, tmatch1, dummy_ci, dummy_wp);
-      -- Not busy if TTR hit, fault is ready to report, or (walker idle with no pending walker work AND
+      ttr_check(TT0, addr_log, fc, is_insn, rw, tmatch0, dummy_ci, dummy_wp);
+      ttr_check(TT1, addr_log, fc, is_insn, rw, tmatch1, dummy_ci, dummy_wp);
+      -- Not busy if TTR hit or (walker idle with no pending walker work AND
       -- either no translation is active, or addr_phys_reg is fresh).
       -- BUG #416: Without the translated_addr/fc check, ATC hits leave busy='0'
       -- for one cycle while addr_phys_reg still holds the OLD translation. The bus
@@ -4783,8 +4114,7 @@ begin
       -- checking it when req='0' would deadlock because the translation process only
       -- updates translated_addr when req='1'.
       --
-      -- BUG #428 FIX: When fault_reg='1' for the current request, the translation
-      -- is "done" (it faulted).
+      -- BUG #428 FIX: When fault_reg='1', the translation is "done" (it faulted).
       -- Report busy='0' so clkena_lw can fire and make_berr captures the fault.
       -- Without this, the walker_fault handshake (3-4 cycles) holds busy='1'.
       -- During that window, clkena_in fires (cpu_wrapper releases for faults) but
@@ -4792,11 +4122,7 @@ begin
       -- addr_log combinationally, breaking translated_addr match. When the handshake
       -- completes, busy='1' persists (addr mismatch) and fault_reg clears (new
       -- translation for new addr) -> permanent deadlock, berr never dispatched.
-      if (pload_active = '0' and
-          (tmatch0 = '1' or tmatch1 = '1' or
-          (fault_reg = '1' and translated_cfg_seq = xlat_cfg_seq and fault_current_req_match = '1') or
-          (translation_pending = '0' and wstate = W_IDLE and walker_fault = '0' and walker_fault_ack_pending = '0' and
-           (req = '0' or (translated_addr = addr_log and translated_fc = fc and translated_rw = rw and translated_cfg_seq = xlat_cfg_seq))))) then
+      if (tmatch0 = '1' or tmatch1 = '1' or fault_reg = '1' or (translation_pending = '0' and wstate = W_IDLE and walker_fault = '0' and walker_fault_ack_pending = '0' and (req = '0' or (translated_addr = addr_log and translated_fc = fc and translated_rw = rw and translated_cfg_seq = xlat_cfg_seq)))) then
         busy <= '0';
       else
         busy <= '1';
@@ -4820,10 +4146,6 @@ begin
       ptest_fc <= (others => '0');    -- BUG #397: driven from this process
       ptest_rw <= '1';               -- BUG #397: driven from this process
       ptest_level <= "000";          -- BUG #413: driven from this process
-      pload_active <= '0';
-      pload_addr <= (others => '0');
-      pload_fc <= (others => '0');
-      pload_rw <= '1';
     elsif rising_edge(clk) then
       -- Update previous values for edge detection
       ptest_req_prev <= ptest_req;
@@ -4851,8 +4173,8 @@ begin
         pflush_active <= '1';
         pflush_addr <= pmmu_addr;
         pflush_fc <= pmmu_fc;
-        pflush_mode <= pmmu_brief(12 downto 10);  -- Capture PFLUSH MODE field from brief word
-        pflush_mask <= pmmu_brief(7 downto 5);  -- Capture FC0-FC2 comparison mask; FC3/bit8 is unsupported on MC68030
+        pflush_mode <= pmmu_brief(12 downto 8);  -- Capture PFLUSH mode from brief word
+        pflush_mask <= pmmu_brief(7 downto 5);  -- BUG E FIX: Capture FC comparison mask
         pflush_clear_atc <= '1';
       elsif pflush_active = '1' then
         -- Keep the clear request live until the flush logic can service it.
@@ -4878,12 +4200,8 @@ begin
         pload_rw <= pmmu_brief(9);
         -- PLOADR vs PLOADW affects access permissions tested during load
       elsif pload_active = '1' then
-        -- Keep the request live while a previous translation is still draining.
-        -- WinUAE flushes the ATC page and immediately performs the table search;
-        -- losing this edge leaves a cached fault entry live across RTE.
-        if translation_pending = '0' then
-          pload_active <= '0';
-        end if;
+        -- PLOAD operation active - clear after one cycle
+        pload_active <= '0';
       end if;
     end if;
   end process;

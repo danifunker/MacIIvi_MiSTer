@@ -23,10 +23,44 @@ Verilog, **no PMMU, no caches**) with a true **MC68030**:
 
 No FPU in the stock IIvi (the 68882 socket is empty). See §3 decision D2.
 
+## Update (2026-06-16) — core RE-UNIFIED with MacLC II (the canonical Mac core)
+
+Phase 0 had imported a **different, newer** Minimig snapshot (`030_mmu2_fpu2`:
+kernel +1500 lines, PMMU +680 lines, a `CacheCtrl_030` split + two-level
+`TG68K.vhd` top build) than the MC68030 that actually boots the Mac in
+`../MacLC_MiSTer` (branch `030_LCii`). That was an accidental **divergence** —
+MacIIvi is meant to host the *same* CPU as the LC II so a fix to one applies to
+both (and so the LC-II boot is the silicon oracle for this core). Re-synced:
+
+- Copied MacLC II's 6 core VHDL sources + `convert_to_verilog.sh` + `tg68k.v`
+  reference wrapper into `rtl/tg68k/`; removed the newer-Minimig-only files
+  (`TG68K_CacheCtrl_030.vhd`, the 6.5 MB whole-design `TG68K_030.v`,
+  `TG68K_verilog.qip`). `TG68K.qip` now lists the MacLC core + `cpu030_wrapper.v`.
+- Regenerated `TG68KdotC_Kernel.v` via the copied ghdl script: **byte-identical**
+  to MacLC's committed kernel (`sha 0a6d793d`). All 8 core files now diff-clean
+  vs `../MacLC_MiSTer/rtl/tg68k/`. **Sync rule:** any CPU change is made in MacLC,
+  then re-copied here (the two `rtl/tg68k/` trees must stay byte-for-byte equal).
+- `cpu030_wrapper.v` kept (the Mac-bus glue uses only ports MacLC's kernel
+  exposes — `pmmu_walker_*`, `debug_make_berr/trap_berr` — lints clean against it).
+- Verilator CPU bench re-validated on the unified kernel: **714/719** non-skipped
+  architecturally correct (CCR/D/A/PC/SR), 5 genuine diffs (all PRM-undefined
+  exception CCR: DIVU÷0 / CHK), RTM known-bad oracle now correctly skipped. This
+  is *better* than the old import's 713/720 — the CACR-030-mask row now passes.
+  (Bench fixes: USP net `n19256`→`n15135` after reconvert; skip empty-`final`
+  known-bad records instead of crashing on a null oracle field.)
+
+> **bug #3 (LC II PMMU translated-fetch fault) is NOT auto-fixed by this.** It
+> lives in the shared `TG68K_PMMU_030.vhd` / kernel / `tg68k.v` — the handoff's
+> "the MC68030 import probably resolves it" note is moot now that the import is
+> the *same* core. Fix it once in MacLC (bus-FSM/walker, per the handoff's
+> CPU-side steps); re-copy here.
+
 ## Progress (2026-06-14)
 
 - **Phase 0 ✓** (`4d9b794`) — MC68030 VHDL imported (kernel + PMMU + 256B I/D
   caches, no FPU); ghdl→Verilog whole-design conversion clean; Verilator lints.
+  *(Superseded 2026-06-16: that import was a newer/divergent Minimig snapshot;
+  the core is now re-synced to MacLC II's `030_LCii` — see the update above.)*
 - **Phase 1 ✓** (`00eb804`) — Verilator CPU corpus bench ported to the new
   kernel: **713/720 tests architecturally correct** (CCR/D/A/PC/SR). The 520
   "USP:" failures are a single USP-injection harness gap, not CPU bugs; 7 genuine
