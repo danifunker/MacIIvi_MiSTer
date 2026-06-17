@@ -49,11 +49,15 @@ both (and so the LC-II boot is the silicon oracle for this core). Re-synced:
   (Bench fixes: USP net `n19256`→`n15135` after reconvert; skip empty-`final`
   known-bad records instead of crashing on a null oracle field.)
 
-> **bug #3 (LC II PMMU translated-fetch fault) is NOT auto-fixed by this.** It
-> lives in the shared `TG68K_PMMU_030.vhd` / kernel / `tg68k.v` — the handoff's
-> "the MC68030 import probably resolves it" note is moot now that the import is
-> the *same* core. Fix it once in MacLC (bus-FSM/walker, per the handoff's
-> CPU-side steps); re-copy here.
+> **bug #3 (LC II PMMU translated-fetch fault) — FIXED** (MacLC `0590605`, synced
+> here `e345d01`, kernel still byte-identical). Root cause was NOT a bus-FSM/walker
+> bug: after `pmove TC; jmp`, the kernel re-translated the residual prefetch of the
+> `jmp` at physical ROM `$00a416b6`, which the page tables intentionally leave
+> unmapped (limit=9, TT0/TT1=0) — real HW serves it from the logical 68030 I-cache /
+> prefetch queue. Fix models that prefetch: instruction fetches from the page the CPU
+> was executing in when the MMU went live bypass translation until execution branches
+> away. CPU corpus unchanged (714/719). Full writeup:
+> `../MacLC_MiSTer/docs/findings_pmmu_translated_fetch_2026-06-16.md`.
 
 ## Progress (2026-06-14)
 
