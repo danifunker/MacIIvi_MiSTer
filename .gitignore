@@ -1,5 +1,6 @@
 # verilator build outputs
 SingleStepTests/*/obj_dir/
+SingleStepTests/*/obj_dir_*/
 # preboot / macos_bench build dirs (each also has a local .gitignore)
 SingleStepTests/preboot/*/build/
 SingleStepTests/macos_bench/build/

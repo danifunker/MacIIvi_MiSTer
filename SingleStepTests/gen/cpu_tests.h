@@ -2913,6 +2913,18 @@ static CpuTestSpec g_cpu_tests[] = {
       {0}, 0,
       {0x4E,0x71}, 2,
       {0}, 0, 0, 0, 0, 0xFF},
+    /* LC II boot repro: indexed (An,Xn) source cmp.b flag-commit race.
+     * cmp.b (A2,D2.l),D1 with D1.b=$FE, mem=$00 -> not-equal -> Z=0,N=1 (CCR=0x08).
+     * Buggy kernel commits Z=1 (CCR=0x04). bytes: B2 32 28 00. */
+    {"REPRO cmpb (A2,D2.l),D1 indexed Z",
+      {0}, 0,
+      {0xB2,0x32,0x28,0x00}, 4,
+      {0}, 0, 0, 0, 0, 0xFF},
+    /* Same, with the boot's preceding neg.b D1 (44 01) to match pipeline state. */
+    {"REPRO negb;cmpb (A2,D2.l),D1 indexed Z",
+      {0}, 0,
+      {0x44,0x01,0xB2,0x32,0x28,0x00}, 6,
+      {0}, 0, 0, 0, 0, 0xFF},
 };
 
 #define CPU_N_TESTS ((unsigned short)(sizeof(g_cpu_tests)/sizeof(g_cpu_tests[0])))
