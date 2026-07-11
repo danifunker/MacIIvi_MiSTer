@@ -1039,15 +1039,16 @@ module emu
 	// Monitor ID Selection — OSD-selectable between 640x480 VGA (default,
 	// MAME-faithful) and 512x384 12" RGB. Portrait is not supported. This is
 	// the sense ID the ROM reads to pick V8 timing.
-`ifdef ONBOARD_DISPLAY
+	// Built-in video monitor sense. Stays a VALID sense (6/2) in BOTH display
+	// shapes: forcing 7 ("no display") WEDGES the ROM in early POST — proven
+	// against MAME with :vasp:MONTYPE forced to 7 (F2400 loop at $4084xxxx,
+	// zero slot traffic; the real no-monitor flow needs the extended sense
+	// dialogue static montype cannot model). The mdc824-primary path is the
+	// real-hardware one instead: healthy POST on sense 6, the F400 slot probe
+	// runs the card's declaration-ROM PrimaryInit, and the PRAM main-display
+	// setting (persisted in MacIIvi.nvr) routes the boot screen to the card.
 	wire [3:0] v8_monitor_id = status[10] ? 4'h2 :  // 512x384 12" RGB
 	                                         4'h6;   // 640x480 VGA (default)
-`else
-	// mdc824-only: the built-in video reports "no display attached" (sense 7)
-	// so the ROM adopts the NuBus card; the OSD Monitor option instead drives
-	// the card's monitor select (.monitor_512 on the nubus_card instance).
-	wire [3:0] v8_monitor_id = 4'h7;
-`endif
 
 	// VASP-internal CLUT/DAC — same register interface as the LC's discrete
 	// Ariel RAMDAC (MAME vasp.cpp dac_r/dac_w), so the module carries over.
@@ -1132,7 +1133,12 @@ module emu
 	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(MDC_VRAM_WORDS)) nubus_card (
 		.clk(clk_sys),
 		.reset(!_cpuReset),
-		.addr(cpuAddr),
+		// Real A0 required: the declaration ROM lives on byte lane 3
+		// (local_addr[1:0]==2'b11) and cpuAddr[0] is forced 0 on this
+		// 16-bit bus — without tg68_a[0] every decl-ROM read returned
+		// $FFFF and the Slot Manager saw an empty slot (2026-07-11 bench
+		// finding; lbmactwo feeds the card its full HMMU address).
+		.addr({cpuAddr[31:1], tg68_a[0]}),
 		.data_in(cpuDataOut),
 		.uds_lds({~_cpuUDS, ~_cpuLDS}),
 		.cpu_longword(tg68_longword),

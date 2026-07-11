@@ -41,16 +41,28 @@ end
 local function force_montype()
 	if not MONTYPE then return end
 	local ioport = manager.machine.ioport
+	-- Target the VASP's MONTYPE port EXPLICITLY. A generic "monitor" field
+	-- scan matched the mdc824 card's own CONFIG field first (":nbe:mdc824:
+	-- CONFIG" has a monochrome-monitor bit) and left the built-in sense
+	-- untouched — the Run B trap of 2026-07-11.
+	local p = ioport.ports[":vasp:MONTYPE"]
+	if p then
+		for name, fld in pairs(p.fields) do
+			fld:set_value(MONTYPE)
+			f:write(string.format("# MONTYPE forced to %d via :vasp:MONTYPE\n", MONTYPE)); f:flush()
+			return
+		end
+	end
 	for tag, port in pairs(ioport.ports) do
-		for name, fld in pairs(port.fields) do
-			if tostring(name):find("monitor") or tostring(name):find("Monitor") then
+		if tostring(tag):find("MONTYPE") then
+			for name, fld in pairs(port.fields) do
 				fld:set_value(MONTYPE)
 				f:write(string.format("# MONTYPE forced to %d via %s\n", MONTYPE, tag)); f:flush()
 				return
 			end
 		end
 	end
-	f:write("# MONTYPE field NOT FOUND\n"); f:flush()
+	f:write("# MONTYPE port NOT FOUND\n"); f:flush()
 end
 
 emu.register_frame_done(function()

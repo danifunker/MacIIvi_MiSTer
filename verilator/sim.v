@@ -164,10 +164,12 @@ module emu
 
 	wire v8_ce_pix;
 
-	// Display source select: run with +mdc824 to (a) strap the built-in
-	// video's monitor sense to "no display" (montype 7) so the ROM must
-	// adopt the NuBus 8*24 as its boot display, and (b) route the card's
-	// scanout to the sim display. Default = built-in video, montype 6.
+	// Display source select: run with +mdc824 to route the CARD's scanout to
+	// the sim display (built-in video stays the default). NOTE: this no
+	// longer touches the monitor sense — montype 7 ("no display") WEDGES the
+	// ROM in early POST (MAME-proven with :vasp:MONTYPE forced: F2400 loop
+	// at $4084xxxx, zero slot traffic). Sense stays 6; the card becomes the
+	// boot display the real-hardware way, via the PRAM main-display setting.
 	reg disp_mdc824 = 1'b0;
 	initial disp_mdc824 = ($test$plusargs("mdc824") != 0);
 
@@ -614,10 +616,10 @@ module emu
 	// Use actual video mode from pseudovia (ROM configures this via register 0x10)
 	wire [2:0] v8_video_mode = pvia_video_config[2:0];
 
-	// Monitor ID Selection - 640x480 VGA (default, matches MacIIvi.sv default
-	// and MAME's VASP screen). With +mdc824 the built-in video reports "no
-	// display attached" (sense 7) so the ROM hunts NuBus for its boot screen.
-	wire [3:0] v8_monitor_id = disp_mdc824 ? 4'h7 : 4'h6;
+	// Monitor ID Selection - 640x480 VGA (default, matches MacIIvi.sv and
+	// MAME's VASP screen). Always a VALID sense — see the +mdc824 note above
+	// (sense 7 wedges the ROM; MAME-proven).
+	wire [3:0] v8_monitor_id = 4'h6;
 
 	ariel_ramdac ariel(
 		.clk_sys(clk_sys),
@@ -683,7 +685,8 @@ module emu
 	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(196608)) nubus_card (
 		.clk(clk_sys),
 		.reset(!_cpuReset),
-		.addr(cpuAddr),
+		// Real A0 required (decl ROM = byte lane 3); see MacIIvi.sv note.
+		.addr({cpuAddr[31:1], tg68_a[0]}),
 		.data_in(cpuDataOut),
 		.uds_lds({~_cpuUDS, ~_cpuLDS}),
 		.cpu_longword(tg68_longword),
