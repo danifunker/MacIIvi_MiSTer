@@ -8,20 +8,26 @@
 //   * Declaration ROM is on byte lane 3 (addr%4==3), not inverted.
 //   * Flat register map at slot-local 0x20_xxxx (control / base / stride /
 //     CRTC / RAMDAC), not the TFB quadrant decode.
-//   * Resolution is chosen by the ROM reading MONITOR SENSE lines; we
-//     advertise the Macintosh 14" hi-res monitor (640x480), sense [6,2,4,6].
+//   * Resolution is chosen by the ROM reading MONITOR SENSE lines; the
+//     monitor_512 input (OSD "Monitor" option) selects which monitor we
+//     advertise: 0 = Macintosh 14" hi-res 640x480, sense [6,2,4,6];
+//     1 = Macintosh 12" RGB 512x384, sense [2,2,0,2] (Snow MacMonitor codes).
+//     A change takes effect on the next Mac reboot (Slot Manager re-probe).
 //   * bpp comes from the RAMDAC control register mode field.
 //
 // The data-plane backend (dual-port VRAM-in-BRAM, port-B scanout, pixel
 // extraction, NuBus halfword/ACK handling) is carried over from
 // nubus_video_highres.sv.
 //
-// Same-bpp milestone: boot is 1 bpp; 8/24 bpp need a larger VRAM than the
-// current 128 KB on-chip BRAM, so they are deferred.
+// 1/2/4/8 bpp are supported (VRAM_WORDS BRAM words; 8 bpp @ 640x480 needs
+// 300 KB).  24 bpp (RAMDAC mode 0xD) stays deferred: 640x480 direct colour
+// is a 1.2 MB framebuffer, beyond on-chip BRAM — it would need the SDRAM
+// path back.
 
 module nubus_video_mdc824 #(
     parameter SLOT_ID = 4'hE,
-    parameter DEFAULT_MONOCHROME = 1'b0
+    parameter DEFAULT_MONOCHROME = 1'b0,
+    parameter integer VRAM_WORDS = 196608   // 16-bit words of card VRAM (384 KB)
 ) (
     input clk,
     input reset,
@@ -70,6 +76,7 @@ module nubus_video_mdc824 #(
     // Overlay control (MiSTer OSD)
     input        overlay_en,
     input        monochrome,
+    input        monitor_512,   // OSD monitor select: 0=640x480 13", 1=512x384 12"
 
     // Pixel clock enable output
     output       ce_pixel,
@@ -97,9 +104,11 @@ module nubus_video_mdc824 #(
 
     // VRAM lives in dedicated on-chip BRAM (vram_ram).  VRAM_BASE high bits are
     // ignored by the BRAM (only the low word-index bits index it); kept for
-    // parity with the hi-res card.
+    // parity with the hi-res card.  Size comes from the VRAM_WORDS parameter
+    // (set in LBMacTwo.sv, same value as the vram_ram instance) — accesses
+    // beyond it are acked-and-dropped / read $FFFF so the declaration ROM's
+    // VRAM probe sees the real size.
     localparam VRAM_BASE = 25'h300000;
-    localparam VRAM_SIZE = 65536;   // 2^16 words = 128 KB (1 bpp boot fits)
 
     // ========================================================================
     // Slot-local address decode (Snow mdc12 map):
@@ -139,7 +148,15 @@ module nubus_video_mdc824 #(
     //   big-endian file -> even byte index (addr[2]==0) = high byte [15:8].
     // ========================================================================
     (* ramstyle = "M10K" *) reg [15:0] rom [0:16383];
-    initial $readmemh("boot2.hex", rom);
+    // MacIIvi repo path: the 341-0868 declaration ROM lives at
+    // rtl/nubus/mdc824_rom.hex (byte-verified against ../mdc824.rom).
+    // The sim runs with CWD = a direct child of the repo root (verilator/
+    // or a sim*run/ dir); Quartus resolves relative to the project root.
+`ifdef SIMULATION
+    initial $readmemh("../rtl/nubus/mdc824_rom.hex", rom);
+`else
+    initial $readmemh("rtl/nubus/mdc824_rom.hex", rom);
+`endif
 
     reg [15:0] rom_word;
     always @(posedge clk)
@@ -170,16 +187,18 @@ module nubus_video_mdc824 #(
     reg        vblank_enable;
     reg        beam_toggle;   // CRTC beam-position read toggles 0<->4
 
-    // ---- Monitor sense: advertise Macintosh 14" hi-res (640x480) = [6,2,4,6]
-    localparam [2:0] MSENSE0 = 3'd6;
-    localparam [2:0] MSENSE1 = 3'd2;
-    localparam [2:0] MSENSE2 = 3'd4;
-    localparam [2:0] MSENSE3 = 3'd6;
+    // ---- Monitor sense (Snow MacMonitor::sense codes):
+    //   Macintosh 14" hi-res (640x480) = [6,2,4,6]
+    //   Macintosh 12" RGB   (512x384) = [2,2,0,2]
+    wire [2:0] msense0 = monitor_512 ? 3'd2 : 3'd6;
+    wire [2:0] msense1 = monitor_512 ? 3'd2 : 3'd2;
+    wire [2:0] msense2 = monitor_512 ? 3'd0 : 3'd4;
+    wire [2:0] msense3 = monitor_512 ? 3'd2 : 3'd6;
     // ctrl sense_in0=bit11, sense_in1=bit10, sense_in2=bit9 gate the AND.
     wire [2:0] sense_val =
-        MSENSE0 & (ctrl[11] ? MSENSE1 : 3'b111)
-                & (ctrl[10] ? MSENSE2 : 3'b111)
-                & (ctrl[9]  ? MSENSE3 : 3'b111);
+        msense0 & (ctrl[11] ? msense1 : 3'b111)
+                & (ctrl[10] ? msense2 : 3'b111)
+                & (ctrl[9]  ? msense3 : 3'b111);
     // Control read-back: sense_out occupies bits [11:9].
     wire [7:0] ctrl_high_sense = {ctrl[15:12], sense_val, ctrl[8]};
 
@@ -191,8 +210,12 @@ module nubus_video_mdc824 #(
                       (rmode == 4'h8) ? 2'd2 : 2'd3;  // 0xC/0xD -> 8bpp (24bpp later)
 
     // ========================================================================
-    // Pixel clock: 30.24 MHz from clk_sys = 31.3344 MHz (same divider as hi-res)
+    // Pixel clock from clk_sys = 31.3344 MHz (fractional accumulator):
+    //   640x480 13": 30.24 MHz   (same divider as hi-res)
+    //   512x384 12": 15.6672 MHz (increment is exactly half the modulus, so
+    //                this degenerates to a clean divide-by-2)
     // ========================================================================
+    wire [15:0] clk_video_inc = monitor_512 ? 16'd15667 : 16'd30240;
     reg [15:0] clk_video_acc;
     reg clk_video_en;
     always @(posedge clk) begin
@@ -200,11 +223,11 @@ module nubus_video_mdc824 #(
             clk_video_acc <= 16'd0;
             clk_video_en <= 1'b0;
         end else begin
-            if (clk_video_acc + 16'd30240 >= 16'd31334) begin
-                clk_video_acc <= clk_video_acc + 16'd30240 - 16'd31334;
+            if (clk_video_acc + clk_video_inc >= 16'd31334) begin
+                clk_video_acc <= clk_video_acc + clk_video_inc - 16'd31334;
                 clk_video_en <= 1'b1;
             end else begin
-                clk_video_acc <= clk_video_acc + 16'd30240;
+                clk_video_acc <= clk_video_acc + clk_video_inc;
                 clk_video_en <= 1'b0;
             end
         end
@@ -213,16 +236,19 @@ module nubus_video_mdc824 #(
     assign ce_pixel = clk_video_en;
 
     // ========================================================================
-    // Video timing — 640x480 (Macintosh 14" hi-res), 896x525 total @ 30.24 MHz
+    // Video timing, selected by monitor_512:
+    //   640x480 (Macintosh 14" hi-res): 896x525 total @ 30.24 MHz
+    //   512x384 (Macintosh 12" RGB):    640x407 total @ 15.6672 MHz
+    //     (24.48 kHz / 60.15 Hz — the Apple 12" RGB scan rates)
     // ========================================================================
-    localparam H_TOTAL = 896;
-    localparam H_RES   = 640;
-    localparam V_TOTAL = 525;
-    localparam V_RES   = 480;
-    localparam H_SYNC_START = 640 + 32;
-    localparam H_SYNC_END   = 640 + 32 + 64;
-    localparam V_SYNC_START = 480 + 3;
-    localparam V_SYNC_END   = 480 + 3 + 3;
+    wire [10:0] h_total      = monitor_512 ? 11'd640 : 11'd896;
+    wire [10:0] h_res        = monitor_512 ? 11'd512 : 11'd640;
+    wire [10:0] v_total      = monitor_512 ? 11'd407 : 11'd525;
+    wire [10:0] v_res        = monitor_512 ? 11'd384 : 11'd480;
+    wire [10:0] h_sync_start = monitor_512 ? 11'd528 : 11'd672;   // res + front porch
+    wire [10:0] h_sync_end   = monitor_512 ? 11'd560 : 11'd736;   // + sync width
+    wire [10:0] v_sync_start = monitor_512 ? 11'd385 : 11'd483;
+    wire [10:0] v_sync_end   = monitor_512 ? 11'd388 : 11'd486;
 
     reg [10:0] h_cnt;
     reg [10:0] v_cnt;
@@ -237,18 +263,18 @@ module nubus_video_mdc824 #(
             vga_vs_reg <= 1'b1;
             blanking <= 1'b1;
         end else if (clk_video_en) begin
-            if (h_cnt == H_TOTAL - 1) begin
+            if (h_cnt >= h_total - 11'd1) begin
                 h_cnt <= 11'd0;
-                if (v_cnt == V_TOTAL - 1)
+                if (v_cnt >= v_total - 11'd1)
                     v_cnt <= 11'd0;
                 else
                     v_cnt <= v_cnt + 11'd1;
             end else begin
                 h_cnt <= h_cnt + 11'd1;
             end
-            vga_hs_reg <= ~(h_cnt >= H_SYNC_START && h_cnt < H_SYNC_END);
-            vga_vs_reg <= ~(v_cnt >= V_SYNC_START && v_cnt < V_SYNC_END);
-            blanking <= (h_cnt >= H_RES) || (v_cnt >= V_RES);
+            vga_hs_reg <= ~(h_cnt >= h_sync_start && h_cnt < h_sync_end);
+            vga_vs_reg <= ~(v_cnt >= v_sync_start && v_cnt < v_sync_end);
+            blanking <= (h_cnt >= h_res) || (v_cnt >= v_res);
         end
     end
 
@@ -262,7 +288,7 @@ module nubus_video_mdc824 #(
     // ========================================================================
     reg irq_active;
     reg irq_clear;
-    wire vbl_pulse = clk_video_en && (h_cnt == 0) && (v_cnt == V_RES - 1);
+    wire vbl_pulse = clk_video_en && (h_cnt == 0) && (v_cnt == v_res - 11'd1);
     always @(posedge clk) begin
         if (reset) begin
             irq_active <= 1'b0;
@@ -452,7 +478,7 @@ module nubus_video_mdc824 #(
 
                         // ---- VRAM write (raw, no inversion) ----
                         if (!rw_n && addr_is_vram) begin
-                            if (cpu_vram_word < VRAM_SIZE) begin
+                            if (cpu_vram_word < VRAM_WORDS) begin
                                 vram_addr <= VRAM_BASE + {5'd0, cpu_vram_word};
                                 cpu_write_data <= data_in;
                                 cpu_write_strobes <= uds_lds;
@@ -471,7 +497,7 @@ module nubus_video_mdc824 #(
                         end
                         // ---- VRAM read (raw) ----
                         else if (rw_n && addr_is_vram) begin
-                            if (cpu_vram_word < VRAM_SIZE) begin
+                            if (cpu_vram_word < VRAM_WORDS) begin
                                 vram_addr <= VRAM_BASE + {5'd0, cpu_vram_word};
                                 state <= S_CPU_READ;
                             end else begin

@@ -214,6 +214,10 @@ module emu
 	wire selectSuperSlot;  // NuBus $C/$D/$E super-slot space
 	wire selectSlot;       // NuBus $FC/$FD/$FE slot space
 	wire [1:0] slotNum;    // 0=$C 1=$D 2=$E
+	// NuBus slot $E (mdc824) — keep in sync with MacIIvi.sv
+	wire [15:0] nubusDataOut;
+	wire        nubusAck_n;
+	wire        nubus_nmrq_n;
 	wire [7:0] pseudovia_dout;
 	wire pseudovia_irq;
 	wire capslock;
@@ -319,7 +323,7 @@ module emu
 	wire        slot_space = selectSuperSlot || selectSlot;
 	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space) ? 1'b1 : ~(!_cpuAS && io_space && !selectSCSIDMA));
 	assign      _cpuDTACK = fc7_berr ? 1'b1 :
-	                        (slot_space && !_cpuAS) ? 1'b0 :
+	                        (slot_space && !_cpuAS) ? nubusAck_n :
 	                        selectSCSIDMA ? ~scsiDREQ :
 	                        (~(!_cpuAS && !io_space) | !dtack_en);
 
@@ -333,7 +337,7 @@ module emu
 	                       io_space && !selectSCSIDMA;
 	reg [15:0] periph_din_reg;
 	always @(posedge clk_sys) periph_din_reg <= dataControllerDataOut;
-	wire [15:0] cpu_din_muxed = slot_space      ? 16'hFFFF :
+	wire [15:0] cpu_din_muxed = slot_space      ? nubusDataOut :
 	                            vpa_periph_read ? periph_din_reg :
 	                                              dataControllerDataOut;
 
@@ -638,10 +642,10 @@ module emu
 		.we(selectPseudoVIA && !_cpuRW && cpuBusControl),
 		.req(selectPseudoVIA && cpuBusControl),
 		.vblank_irq(v8_vblank),
-		// NuBus slot IRQs $C/$D/$E — wired by the NuBus/mdc824 integration
+		// NuBus slot IRQs: only slot $E is populated (mdc824 VBL, active low)
 		.slot_irq_c(1'b0),
 		.slot_irq_d(1'b0),
-		.slot_irq_e(1'b0),
+		.slot_irq_e(~nubus_nmrq_n),
 		.asc_irq(asc_irq),
 		// SCSI flags tied off (LC II lineage decision) — matches MacIIvi.sv;
 		// revisit against MAME maciivx during disk bring-up.
@@ -651,6 +655,103 @@ module emu
 		.monitor_id(v8_monitor_id),
 		.video_config(pvia_video_config)
 	);
+
+	// ------------------------------------------------------------------------
+	// NuBus slot $E — Apple Display Card 8*24 (mdc824), bus-side integration.
+	// Keep in sync with MacIIvi.sv (rationale there). Card VGA outputs are not
+	// yet the sim display; onboard video remains on VGA_* for now.
+	// ------------------------------------------------------------------------
+	wire [15:0] nubusDataOut_card;
+	wire        nubusAck_card;   // active low; 1 = card not responding
+	wire [7:0]  mdc_r, mdc_g, mdc_b;
+	wire        mdc_hs, mdc_vs, mdc_blank, mdc_ce_pixel;
+	wire [24:0] mdc_vram_addr, mdc_vram_scan_addr;
+	wire [15:0] mdc_vram_dout, mdc_vram_din, mdc_vram_scan_data;
+	wire        mdc_vram_rd, mdc_vram_wr, mdc_vram_ready, mdc_vram_scan_rd;
+
+	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(196608)) nubus_card (
+		.clk(clk_sys),
+		.reset(!_cpuReset),
+		.addr(cpuAddr),
+		.data_in(cpuDataOut),
+		.uds_lds({~_cpuUDS, ~_cpuLDS}),
+		.cpu_longword(tg68_longword),
+		.rw_n(_cpuRW),
+		.cpu_as_n(_cpuAS),
+		.select(selectSlot || selectSuperSlot),
+		.data_out(nubusDataOut_card),
+		.ack_n(nubusAck_card),
+		.nmrq_n(nubus_nmrq_n),
+		.vga_r(mdc_r), .vga_g(mdc_g), .vga_b(mdc_b),
+		.vga_hs(mdc_hs), .vga_vs(mdc_vs), .vga_blank(mdc_blank),
+		.vga_clk(),
+		.vram_addr(mdc_vram_addr),
+		.vram_dout(mdc_vram_dout),
+		.vram_din(mdc_vram_din),
+		.vram_rd(mdc_vram_rd),
+		.vram_wr(mdc_vram_wr),
+		.vram_ready(mdc_vram_ready),
+		.vram_scan_addr(mdc_vram_scan_addr),
+		.vram_scan_rd(mdc_vram_scan_rd),
+		.vram_scan_data(mdc_vram_scan_data),
+		.ioctl_wr(1'b0), .ioctl_addr(25'd0), .ioctl_data(16'd0),
+		.ioctl_download(1'b0), .ioctl_index(8'd0),
+		.overlay_en(1'b0),
+		.monochrome(1'b0),
+		.monitor_512(1'b0),   // sim: 640x480 13" profile
+		.ce_pixel(mdc_ce_pixel),
+		.dbg_video_en(), .dbg_vram_wr_cnt(), .dbg_vram_fetch_cnt(),
+		.dbg_irq_cnt(), .dbg_ack_cnt(), .dbg_vblank_enable()
+	);
+
+	vram_ram #(.WORDS(196608)) mdc_vram (
+		.clk(clk_sys),
+		.addr(mdc_vram_addr),
+		.din(mdc_vram_dout),
+		.dout(mdc_vram_din),
+		.rd(mdc_vram_rd),
+		.wr(mdc_vram_wr),
+		.ready(mdc_vram_ready),
+		.addr_b(mdc_vram_scan_addr),
+		.rd_b(mdc_vram_scan_rd),
+		.dout_b(mdc_vram_scan_data)
+	);
+
+	// Empty-slot open bus (slots $C/$D): 4 clk with no card ack -> $FFFF+DTACK
+	reg [2:0] nubus_timeout;
+	always @(posedge clk_sys) begin
+		if (_cpuAS) nubus_timeout <= 3'd0;
+		else if (slot_space && nubusAck_card && !nubus_timeout[2])
+			nubus_timeout <= nubus_timeout + 3'd1;
+	end
+	wire nubus_no_card = slot_space && nubusAck_card && nubus_timeout[2];
+	assign nubusDataOut = nubus_no_card ? 16'hFFFF : nubusDataOut_card;
+	assign nubusAck_n   = nubus_no_card ? 1'b0    : nubusAck_card;
+
+`ifdef SIMULATION
+	// [NUBUS] access logger: one line per completed slot-space cycle (first
+	// 60 card ACKs + first 20 open-bus), so a run shows the Slot Manager
+	// finding the declaration ROM at $FExxxxxx vs empty $FC/$FD.
+	reg nb_as_d;
+	integer nb_ack_cnt = 0, nb_open_cnt = 0;
+	always @(posedge clk_sys) begin
+		nb_as_d <= _cpuAS;
+		if (!nb_as_d && _cpuAS && slot_space) begin  // AS rising = cycle end
+			if (nubus_no_card) begin
+				if (nb_open_cnt < 20) begin
+					$display("[NUBUS] OPEN  addr=%h rw=%b -> FFFF", cpuAddr, _cpuRW);
+					nb_open_cnt <= nb_open_cnt + 1;
+				end
+			end else begin
+				if (nb_ack_cnt < 60) begin
+					$display("[NUBUS] CARD  addr=%h rw=%b data=%h", cpuAddr, _cpuRW,
+					         _cpuRW ? nubusDataOut_card : cpuDataOut);
+					nb_ack_cnt <= nb_ack_cnt + 1;
+				end
+			end
+		end
+	end
+`endif
 
 	// ASC sample outputs (Commit C will route to AUDIO_L/R)
 	wire signed [15:0] asc_sample_l;

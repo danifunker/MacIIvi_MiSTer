@@ -14,15 +14,17 @@
 //     of CPU writes).  This retires the old 2-word cache that fell back to a
 //     stale word on a miss -> garbled text/edges.
 //
-// Sizing: 128 KB (2^16 16-bit words).  A 256 KB dual-port instance was getting
-// duplicated by the M10K mapper (2 reads + 1 write -> two arrays) and overflowed
-// the 553 M10K blocks.  128 KB fits even if duplicated (~256 blocks) and covers
-// 1/2 bpp at 640x480 -- the Mac's boot screens (gray desktop, dialogs, happy
-// Mac, Welcome) are 1 bpp.  Revisit for deeper colour once a non-duplicating
-// 256 KB mapping is confirmed.
+// Sizing: WORDS 16-bit words, set from LBMacTwo.sv (384 KB default — covers
+// 8 bpp at 640x480 = 300 KB with headroom).  History: an early 256 KB
+// dual-port attempt was duplicated by the M10K mapper (2 reads + 1 write ->
+// two arrays) and overflowed the 553 M10K blocks; the current template (port
+// A = read/write with new-data write-through in ONE always block, port B =
+// read-only) maps to a single true-dual-port array — the 2026-06-11 fit shows
+// the 128 KB instance at exactly 128 M10K, no duplication.  After any resize,
+// CHECK the fit report: vram_inst must use WORDS/512 M10K blocks, not double.
 //
 module vram_ram #(
-    parameter integer AW = 16                 // 2^16 words = 128 KB
+    parameter integer WORDS = 196608          // 16-bit words (384 KB)
 ) (
     input             clk,
 
@@ -39,7 +41,7 @@ module vram_ram #(
     input             rd_b,
     output reg [15:0] dout_b
 );
-    localparam integer WORDS = (1 << AW);
+    localparam integer AW = $clog2(WORDS);
 
     (* ramstyle = "M10K" *) reg [15:0] mem [0:WORDS-1];
 
