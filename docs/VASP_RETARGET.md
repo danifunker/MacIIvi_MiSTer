@@ -122,6 +122,26 @@ modules (MT48LC32M16: 10-bit column) `addr[24]` drives column A9. The LC II
    bring-up decision — the LC II core ties them off for a documented System 7
    crash; re-evaluate against MAME maciivi behavior during bring-up.
 
+## Machine variants (one board, one ROM, three personalities)
+
+The IIvi/IIvx/Performa 600 share the motherboard, VASP, and this exact 1MB
+ROM. The ROM picks the personality from the box-ID longword at $5FFFFFFC:
+its reader at $4084AB2A does `and.l #$7` and indexes the 8-byte BoxFlag
+table at $4084AB4A (disassembly-verified):
+
+| boxID & 7 | BoxFlag | Machine |
+|---|---|---|
+| 5 ($A55A2015) | $2A | Macintosh IIvx (32MHz, 68882, 32KB L2 — NOT this core yet) |
+| 6 ($A55A2016) | $26 | **Macintosh IIvi** (also the fallback for unknown IDs) |
+| 7 ($A55A2017) | $31 | **Performa 600** |
+
+The OSD "Machine" option (status[4], reset-applied) switches the box-ID
+between IIvi and P600. Both run the IIvi 16MHz CPU clock for now — the
+P600's 32MHz CPU mode is tracked as follow-up work (the 16-bit 16MHz bus
+is identical on real hardware; only internal CPU cycles differ). An IIvx
+mode would additionally need the FPU (deliberately omitted, decision D2)
+and the L2 model, so it stays out of scope.
+
 ## What carries over UNCHANGED
 
 - **ASC**: `vasp.cpp:95` = `ASC_V8(config, m_asc, C15M)` — the exact type the

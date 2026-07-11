@@ -100,7 +100,9 @@ rows, MAME-captured + IIcx-silicon-adjudicated). The tg68k Verilator bench:
 
 - ROM: 1MB `4957eb49` (CRC32 61be06e5) = `rom/MacIIvx-IIvi-Performa600.rom`;
   loads at CPU $40000000; overlay mirrors it at $0 until first ROM-region read.
-- Box ID: $5FFFFFFC reads $A55A2016 (IIvi).
+- Box ID: $5FFFFFFC reads $A55A2016 (Mac IIvi) or $A55A2017 (Performa 600,
+  OSD "Machine" select; ROM masks #$7 → BoxFlag table $4084AB4A). Both
+  machines run 16MHz for now; P600 32MHz CPU mode is a tracked follow-up.
 - RAM: contiguous at $0 — OSD options 4/8/20/36MB (68MB = hardware max,
   deferred; 36MB needs a 64MB SDRAM module).
 - I/O at $50000000 (+ $00F00000 mirrors): VIA1 +$0, SCC +$4000, SCSI pDMA
