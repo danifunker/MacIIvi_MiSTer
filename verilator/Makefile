@@ -9,12 +9,18 @@ V_DEFINE = +define+debug=1 +define+SIMULATION=1 +define+USE_EGRET_CPU=1 +define+
 	-I$(RTL) \
 	-I$(RTL)/tg68k \
 	-I$(RTL)/uart \
-	-I$(RTL)/egret \
-        --timing
+	-I$(RTL)/egret
 # Suppress common warnings that don't affect simulation correctness
 V_DEFINE += -Wno-WIDTH -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-IMPLICIT -Wno-PINMISSING -Wno-UNUSEDSIGNAL -Wno-UNOPTFLAT -Wno-CASEINCOMPLETE -Wno-UNSIGNED -Wno-CMPCONST -Wno-LATCH -Wno-UNDRIVEN -Wno-MISINDENT -Wno-COMBDLY -Wno-INITIALDLY -Wno-SYNCASYNCNET -Wno-BLKLOOPINIT -Wno-MULTIDRIVEN -Wno-GENUNNAMED
 #V_DEFINE += --threads 8  # this slows it way down
-V_DEFINE += --trace-fst
+# --trace-fst/--trace REMOVED (MacLCII 83ccf91 cherry-pick, ~1.5x faster sim):
+# nothing in sim_main.cpp/sim.v ever instantiated an FST tracer (no --trace CLI
+# flag, no $dumpvars), so trace support only slowed eval by keeping every net
+# observable. Re-add BOTH --trace-fst here and --trace in the $(VOUT) rule if
+# you wire real wave dumps. Consequence: every signal sim_main.cpp reads via
+# rootp-> MUST be pinned public_flat_rd in tg68k_debug.vlt or it gets
+# optimized away and the C++ build breaks.
+#V_DEFINE += --trace-fst
 # Uncomment to enable verbose per-instruction/per-cycle debug traces (HC05, TG68, VIA, PVIA, etc.)
 # V_DEFINE += +define+VERBOSE_TRACE=1
 # Uncomment for a FOCUSED HC05 stuck-loop trace (no flood) - prints the Egret PC +
@@ -60,6 +66,10 @@ EXE = ./obj_dir/Vemu
 #V_OPT = -O3 --x-assign fast --x-initial fast --noassert
 V_OPT =  --x-assign fast --x-initial fast --noassert
 #CC_OPT = -O
+# NOTE: CC_OPT lands in $(CFLAGS) which is passed UNQUOTED to verilator's
+# -CFLAGS, so only the first word survives as compiler flags — do not put
+# optimization flags here. Model opt level is set via OPT_FAST in the $(EXE)
+# rule below (verilated.mk default is -Os; we override to -O3).
 CC_OPT =
 
 # MacIIvi RTL source files
@@ -111,11 +121,11 @@ VOUT = obj_dir/Vemu.cpp
 all: $(EXE)
 
 $(VOUT): $(V_SRC)  Makefile
-	$V -cc $(V_OPT) -LDFLAGS "$(LDFLAGS) " -exe --trace --Mdir ./obj_dir $(V_DEFINE) $(V_INC) $(TOP) -CFLAGS $(CFLAGS) $(V_SRC) $(C_SRC)
+	$V -cc $(V_OPT) -LDFLAGS "$(LDFLAGS) " -exe --Mdir ./obj_dir $(V_DEFINE) $(V_INC) $(TOP) -CFLAGS $(CFLAGS) $(V_SRC) $(C_SRC)
 
 $(EXE): $(VOUT) $(C_SRC)
 #	(cd obj_dir; make OPT="-fauto-inc-dec -fdce -fdefer-pop -fdse -ftree-ccp -ftree-ch -ftree-fre -ftree-dce -ftree-dse" -f Vemu.mk)
-	(cd obj_dir; make -f Vemu.mk)
+	(cd obj_dir; $(MAKE) OPT_FAST="-O3" -f Vemu.mk)
 
 fast:
 	(cd obj_dir; rm -f *.o ; make OPT="-fcompare-elim -fcprop-registers -fguess-branch-probability -fauto-inc-dec -fif-conversion2 -fif-conversion -fipa-pure-const -fdce -fipa-profile -fipa-reference -fmerge-constants -fsplit-wide-types -fdefer-pop -fdse -ftree-ccp -ftree-ch -ftree-fre -ftree-dce -ftree-dse -ftree-builtin-call-dce -ftree-copyrename -ftree-dominator-opts -ftree-forwprop -ftree-phiprop -ftree-sra -ftree-pta -ftree-ter -funit-at-a-time -ftree-bit-ccp -falign-functions  -falign-jumps -falign-loops  -falign-labels -fcaller-saves -fcrossjumping -fcse-follow-jumps -fcse-skip-blocks -fdelete-null-pointer-checks -fdevirtualize -fexpensive-optimizations -fgcse  -fgcse-lm -finline-small-functions -findirect-inlining -fipa-sra -foptimize-sibling-calls -fpartial-inlining -fpeephole2 -fregmove -freorder-blocks  -freorder-functions -frerun-cse-after-loop -fsched-interblock  -fsched-spec -fschedule-insns -fschedule-insns2 -fstrict-aliasing -fstrict-overflow -ftree-switch-conversion -ftree-pre -ftree-vrp" -f Vemu.mk)

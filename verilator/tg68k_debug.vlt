@@ -1,4 +1,39 @@
 `verilator_config
+// ---------------------------------------------------------------------------
+// KEEP-ALIVE for every signal sim_main.cpp reads via rootp-> (2026-07-05).
+// The build no longer passes --trace (nothing ever instantiated a tracer, and
+// trace support slowed eval), so Verilator is free to optimize away any net
+// that isn't marked public. Every emu__DOT__* signal referenced in
+// sim_main.cpp MUST be listed here or the C++ compile breaks on the next
+// verilation (first casualty was emu.cpuFC).
+public_flat_rd -module "emu" -var "cpuFC"
+public_flat_rd -module "emu" -var "_cpuReset"
+public_flat_rd -module "emu" -var "via_pb_i"
+public_flat_rd -module "addrController_top" -var "overlay_disable_pending"
+public_flat_rd -module "addrController_top" -var "rom_overlay"
+public_flat_rd -module "egret_wrapper" -var "last_pc"
+public_flat_rd -module "egret_wrapper" -var "pb_ddr"
+public_flat_rd -module "egret_wrapper" -var "pb_out"
+public_flat_rd -module "m68hc05_core" -var "regA"
+public_flat_rd -module "m68hc05_core" -var "regX"
+public_flat_rd -module "scc" -var "wr3_a"
+public_flat_rd -module "scc" -var "wr4_a"
+public_flat_rd -module "scc" -var "wr5_a"
+public_flat_rd -module "scc" -var "wr9"
+public_flat_rd -module "scc" -var "wr14_a"
+public_flat_rd -module "scc" -var "baud_divid_speed_a"
+public_flat_rd -module "via6522" -var "acr"
+public_flat_rd -module "via6522" -var "bit_cnt"
+public_flat_rd -module "via6522" -var "shift_active"
+public_flat_rd -module "via6522" -var "shift_clock"
+public_flat_rd -module "via6522" -var "shift_reg"
+public_flat_rd -module "sim_ram" -var "mem"
+public_flat_rd -module "tg68k" -var "tg68_din_r"
+public_flat_rd -module "tg68k" -var "s_state"
+public_flat_rd -module "tg68k" -var "eff_busstate"
+public_flat_rd -module "TG68KdotC_Kernel" -var "regfile"
+public_flat_rd -module "TG68KdotC_Kernel" -var "srin"
+// ---------------------------------------------------------------------------
 // Expose the cmp's memory-operand latch (ea_data) + the stale last-read source so
 // the sim can verify whether cmp.b of an indexed I/O read uses a stale operand.
 public_flat_rd -module "TG68KdotC_Kernel" -var "ea_data"
