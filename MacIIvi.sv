@@ -1083,7 +1083,13 @@ module emu
 	wire [15:0] mdc_vram_dout, mdc_vram_din, mdc_vram_scan_data;
 	wire        mdc_vram_rd, mdc_vram_wr, mdc_vram_ready, mdc_vram_scan_rd;
 
-	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(196608)) nubus_card (
+	// FPGA BRAM budget: the onboard framebuffer (384KB vram_bram) + a 384KB
+	// card VRAM would need ~614 M10K of the Cyclone V's 553 — cannot fit.
+	// Hardware bring-up runs the card at its 128KB boot configuration
+	// (1/2 bpp; the declaration ROM reports the real size to the Slot
+	// Manager). The Verilator sim keeps 384KB/8bpp. Revisit when the
+	// display mux lands (dropping the onboard BRAM frees the budget).
+	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(65536)) nubus_card (
 		.clk(clk_sys),
 		.reset(!_cpuReset),
 		.addr(cpuAddr),
@@ -1119,7 +1125,7 @@ module emu
 		.dbg_irq_cnt(), .dbg_ack_cnt(), .dbg_vblank_enable()
 	);
 
-	vram_ram #(.WORDS(196608)) mdc_vram (
+	vram_ram #(.WORDS(65536)) mdc_vram (
 		.clk(clk_sys),
 		.addr(mdc_vram_addr),
 		.din(mdc_vram_dout),
