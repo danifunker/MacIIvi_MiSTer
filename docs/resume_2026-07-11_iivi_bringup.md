@@ -49,12 +49,28 @@ MAME-verified System 7.5.5 disk image is staged for the OS-boot campaign.
 
 ## In-flight at session end — HARVEST THESE FIRST
 
-1. **Lane-fix verification** (bg task; results land in `simproberun/`):
-   800-frame run, screenshots F690/F780 — the frames where the sad Mac
-   appeared pre-fix. EXPECT: gray desktop (no sad Mac), `[NUBUS] CARD`
-   lines with real bytes, boot reaching the no-disk wait ($4080786x).
-   If the sad Mac persists: rerun with `--trace-frames 600,700` and diff
-   the faulting PC against `/tmp/slot_tap_golden`-era MAME data.
+1. **Lane-fix verification: RESULT = sad Mac $0F/$33 PERSISTS** (F780
+   screenshot in `simproberun/`; F700/F800 in the death-chime code
+   $40845Fxx; card reads healthy: [NUBUS] CARD $FF78 etc.). The lane fix
+   is correct semantics and STAYS, but was not the trigger. KEY LEAD:
+   minor code $33 = 51 = Slot Manager error -351 **smRecNotFnd** — the
+   SM parsed our declaration ROM but could not find a required sResource
+   record. This is a DATA/interpretation failure, not a CPU exception.
+   Next moves, in order:
+   a. Bounded trace: rerun probe run with `--trace-frames 560,700` —
+      find where the SM's directory walk diverges (its PC + the decl-ROM
+      addresses it fetches right before giving up).
+   b. MAME full-walk golden: raise HITS in slot_probe_tap.lua to 400
+      (read taps only!) → MAME's COMPLETE decl-ROM read sequence; diff
+      address-by-address/byte-by-byte against our [NUBUS] CARD stream
+      (raise the sim logger caps too). First divergence = the bug.
+   c. Extend mdc_bench: sResource-directory walk simulation (follow the
+      format block's directory offset like the SM does) + card VRAM
+      write/readback + register readback smoke — PrimaryInit touches
+      VRAM/CRTC and none of that is bench-covered yet.
+   d. ByteLanes $78 = lane-3-only ✓ correct; the format block matches
+      MAME byte-for-byte, so suspect the DIRECTORY region (long-offset
+      fields, 24-bit sResource pointers) or super-slot-referenced reads.
 2. **Seed sweep RESOLVED**: seed 4 = core clocks better, HDMI worse
    (-1.49). Reverted to SEED 2. The final rebuild (launched at session
    end) carries the lane fix + seed 2 = the deploy candidate; verify its
