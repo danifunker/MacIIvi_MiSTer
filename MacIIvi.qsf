@@ -75,6 +75,14 @@ set_global_assignment -name SEED 2
 
 # Use real 68HC05 CPU + Egret ROM instead of state machine (cuda_maclc.sv)
 set_global_assignment -name VERILOG_MACRO "USE_EGRET_CPU=1"
+# JTAG forensic probe deck (PSDT/PRST/PFHx/PFLX + dbg_probes): ~2.5-3.5K ALMs.
+# OFF by default on the IIvi (first fit was 118% ALM; the Verilator sim is the
+# primary debug surface). Uncomment for targeted hardware forensics.
+# set_global_assignment -name VERILOG_MACRO "USE_DEBUG_PROBES=1"
+# Display-shape fallback: built-in video as the MiSTer output (dedicated pixel
+# clock) + mdc824 shrunk to 128KB. DEFAULT (macro absent) = mdc824-only:
+# card IS the display (CLK_VIDEO=clk_sys), montype=7, card VRAM 384KB/8bpp.
+# set_global_assignment -name VERILOG_MACRO "ONBOARD_DISPLAY=1"
 
 # Enable the ASC FIFO + sample-output audio path (else asc.sv is a silent stub)
 set_global_assignment -name VERILOG_MACRO "USE_ASC_AUDIO=1"

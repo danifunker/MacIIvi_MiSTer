@@ -380,6 +380,21 @@ module emu
 		.ps2_mouse(ps2_mouse)
 	);
 
+	// ------------------------------------------------------------------------
+	// Display source. DEFAULT = the mdc824 NuBus card is THE display, exactly
+	// like the Mac II core (lbmactwo): CLK_VIDEO is clk_sys and the card's
+	// fractional-accumulator ce_pixel paces the scanout — no second video PLL,
+	// no muxed-clock Fitter Err 15836. The built-in video keeps its register
+	// surfaces (VRAM window / VDAC / montype) for the ROM's POST, but reports
+	// monitor sense 7 ("no display attached"), the real no-monitor-on-DB15 +
+	// NuBus-card configuration, so the ROM adopts the 8*24 as boot display.
+	//
+	// ONBOARD_DISPLAY (MacIIvi.qsf macro) rebuilds the LC-heritage shape:
+	// built-in video on the dedicated pixel clock as the MiSTer output and
+	// the card shrunk to its 128KB boot config — the guaranteed-first-light
+	// fallback while the card-adoption path is being proven on hardware.
+	// ------------------------------------------------------------------------
+`ifdef ONBOARD_DISPLAY
 	assign CLK_VIDEO = clk_vid;
 	assign CE_PIXEL  = v8_ce_pix;   // constant 1 now (pix_ce tied high below)
 
@@ -392,6 +407,20 @@ module emu
 	assign VGA_HS = v8_hsync;
 	assign VGA_F1 = 0;
 	assign VGA_SL = 0;
+`else
+	assign CLK_VIDEO = clk_sys;
+	assign CE_PIXEL  = mdc_ce_pixel;
+
+	// Video Output — the 8*24 card's scanout (vga_blank is a display enable).
+	assign VGA_R  = mdc_r;
+	assign VGA_G  = mdc_g;
+	assign VGA_B  = mdc_b;
+	assign VGA_DE = mdc_blank;
+	assign VGA_VS = mdc_vs;
+	assign VGA_HS = mdc_hs;
+	assign VGA_F1 = 0;
+	assign VGA_SL = 0;
+`endif
 
 	// ------------------------------------------------------------------------
 	// Dedicated pixel clock (pll_video) — true per-monitor scanout rates.
@@ -1010,8 +1039,15 @@ module emu
 	// Monitor ID Selection — OSD-selectable between 640x480 VGA (default,
 	// MAME-faithful) and 512x384 12" RGB. Portrait is not supported. This is
 	// the sense ID the ROM reads to pick V8 timing.
+`ifdef ONBOARD_DISPLAY
 	wire [3:0] v8_monitor_id = status[10] ? 4'h2 :  // 512x384 12" RGB
 	                                         4'h6;   // 640x480 VGA (default)
+`else
+	// mdc824-only: the built-in video reports "no display attached" (sense 7)
+	// so the ROM adopts the NuBus card; the OSD Monitor option instead drives
+	// the card's monitor select (.monitor_512 on the nubus_card instance).
+	wire [3:0] v8_monitor_id = 4'h7;
+`endif
 
 	// VASP-internal CLUT/DAC — same register interface as the LC's discrete
 	// Ariel RAMDAC (MAME vasp.cpp dac_r/dac_w), so the module carries over.
@@ -1083,13 +1119,17 @@ module emu
 	wire [15:0] mdc_vram_dout, mdc_vram_din, mdc_vram_scan_data;
 	wire        mdc_vram_rd, mdc_vram_wr, mdc_vram_ready, mdc_vram_scan_rd;
 
-	// FPGA BRAM budget: the onboard framebuffer (384KB vram_bram) + a 384KB
-	// card VRAM would need ~614 M10K of the Cyclone V's 553 — cannot fit.
-	// Hardware bring-up runs the card at its 128KB boot configuration
-	// (1/2 bpp; the declaration ROM reports the real size to the Slot
-	// Manager). The Verilator sim keeps 384KB/8bpp. Revisit when the
-	// display mux lands (dropping the onboard BRAM frees the budget).
-	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(65536)) nubus_card (
+	// FPGA BRAM budget: the onboard framebuffer (384KB vram_bram) and a 384KB
+	// card VRAM cannot coexist (~614 M10K of the Cyclone V's 553). In the
+	// default mdc824-only shape the onboard BRAM is gone, so the card gets
+	// the full 384KB (8bpp @ 640x480). Under ONBOARD_DISPLAY the card drops
+	// to its 128KB boot configuration (1/2bpp) instead.
+`ifdef ONBOARD_DISPLAY
+	localparam MDC_VRAM_WORDS = 65536;    // 128KB boot config
+`else
+	localparam MDC_VRAM_WORDS = 196608;   // 384KB, 8bpp @ 640x480
+`endif
+	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(MDC_VRAM_WORDS)) nubus_card (
 		.clk(clk_sys),
 		.reset(!_cpuReset),
 		.addr(cpuAddr),
@@ -1125,7 +1165,7 @@ module emu
 		.dbg_irq_cnt(), .dbg_ack_cnt(), .dbg_vblank_enable()
 	);
 
-	vram_ram #(.WORDS(65536)) mdc_vram (
+	vram_ram #(.WORDS(MDC_VRAM_WORDS)) mdc_vram (
 		.clk(clk_sys),
 		.addr(mdc_vram_addr),
 		.din(mdc_vram_dout),
@@ -1153,9 +1193,16 @@ module emu
 	assign nubusDataOut = nubus_no_card ? 16'hFFFF : nubusDataOut_card;
 	assign nubusAck_n   = nubus_no_card ? 1'b0    : nubusAck_card;
 
-	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
-	// FPGA-only — never instantiate in verilator/sim.v (altsource_probe is an
-	// Altera primitive). Read with: bash scripts/read_probes.sh
+	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video) + the
+	// fetch-history/reset-source forensic recorders. FPGA-only — never in
+	// verilator/sim.v (altsource_probe is an Altera primitive). Read with:
+	// bash scripts/read_probes.sh
+	//
+	// MACRO-GATED (USE_DEBUG_PROBES in MacIIvi.qsf) since the IIvi retarget:
+	// the deck + rings + sld-hub cost ~2.5-3.5K ALMs and the first IIvi fit
+	// came in at 118% ALM. The Verilator sim is the primary debug surface;
+	// re-enable the deck only for targeted hardware forensics.
+`ifdef USE_DEBUG_PROBES
 	// PSDT: pseudo-DMA stall timeout visibility — {fires[7:0], max_stall[22:0]}
 	altsource_probe #(
 		.instance_id ("PSDT"), .probe_width (32), .source_width(1),
@@ -1406,6 +1453,7 @@ module emu
 		.selectUnmapped(selectUnmapped),
 		.cpuBusControl(cpuBusControl)
 	);
+`endif  // USE_DEBUG_PROBES
 
 	maclc_v8_video v8_video(
 		.clk_sys(clk_vid),      // scanout runs on the dedicated pixel clock
@@ -1444,6 +1492,12 @@ module emu
 	// On-chip framebuffer (BRAM). CPU VRAM writes land on port A (clk_sys);
 	// video reads port B in the pixel-clock domain — the CDC lives inside the
 	// dual-clock M10K primitive.
+	//
+	// mdc824-only default: this 384KB bank is REMOVED — the $60000000 VRAM
+	// window stays fully SDRAM-backed for the ROM's POST (reads/writes work),
+	// there is just no onboard scanout to feed. v8_video keeps running as a
+	// headless timing generator (pseudoVIA VBL source) over black pixels.
+`ifdef ONBOARD_DISPLAY
 	vram_bram vram_fb(
 		.a_clk(clk_sys),
 		.b_clk(clk_vid),
@@ -1455,6 +1509,9 @@ module emu
 		.b_addr(v8_vram_raddr),    // video scanline prefetch
 		.b_dout(v8_vram_rdata)
 	);
+`else
+	assign v8_vram_rdata = 16'h0000;
+`endif
 
 	// ASC sample outputs (Commit C will route to AUDIO_L/R)
 	wire signed [15:0] asc_sample_l;
