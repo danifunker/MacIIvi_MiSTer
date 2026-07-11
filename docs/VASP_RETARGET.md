@@ -173,6 +173,31 @@ and the L2 model, so it stays out of scope.
   V8 video module stays for the onboard framebuffer until VASP video is done
   (montype can also report "no monitor" to push the ROM to the NuBus card).
 
+## SDRAM-backed video (planned; answers "is SDRAM fast enough?")
+
+Yes — the *chip* is, the *current controller* is not. Numbers:
+
+- Today's `sdram.v` issues ONE single-beat 16-bit op per 8.125MHz slot
+  window (`BURST_LENGTH=1`): **16.25 MB/s total**, shared by the CPU
+  (3 of 4 slots) and floppy staging. Scanout at 640×480@67Hz needs
+  2.6 MB/s at 1bpp, 10.3 at 4bpp, **20.6 at 8bpp**, 61.7 at 24bpp —
+  8bpp alone exceeds the ceiling. This is exactly why lbmactwo's
+  SDRAM-scanout attempt showed the "cyan/green/red noise" and retreated
+  to BRAM (`vram_ram.sv` header), and why both framebuffers live in
+  BRAM today (which in turn caps the FPGA at 128KB card VRAM).
+- The MT48LC16M16 itself at 65MHz with CL2 burst-8 sustains well over
+  100 MB/s. Upgrade path: a dedicated **video port with burst-8 reads
+  feeding a scanline FIFO** (fetch each line's visible words during the
+  previous line: 8bpp/640px = 320 words = 40 bursts ≈ 5µs of a 31.7µs
+  line — ~15% of line time), bank-interleaved with the CPU's
+  single-beat port. CPU-side burst reads become a follow-on synergy for
+  68030 cache-line fills (Phase 3).
+- Payoff: frees BOTH 384KB BRAM framebuffers (SDRAM windows are already
+  reserved in the layout: onboard fb at word $080000, mdc824 VRAM at
+  $100000), restores the card to 384KB+ (8bpp on FPGA), and opens a
+  route to the 8*24's 24bpp later. Sequenced AFTER first hardware
+  light-up — the BRAM path is the known-good bring-up configuration.
+
 ## Known LC-II-isms to retire during bring-up
 
 - `sdram_out_patched` cold-boot branch patch targets the **LC II ROM**
