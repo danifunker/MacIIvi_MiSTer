@@ -28,7 +28,10 @@ MAME-verified System 7.5.5 disk image is staged for the OS-boot campaign.
   (`USE_DEBUG_PROBES`)
 - `4f1d862`+follow-up: SEED experiments (qsf had SEED 2 pinned by LCII all
   along at ~line 51 w/ tuning rationale ~line 360; a stray no-newline append
-  was cleaned; **SEED currently = 4, sweep result unknown at session end**)
+  was cleaned; sweep RESULT: seed 4 fits 90% ALM w/ core clocks +3.1/+4.0
+  but HDMI-domain WORSENS to -1.49 — seeds are not the lever for that
+  domain. REVERTED to SEED 2; ship bring-up with the -1.3ns HDMI-scaler
+  caveat, VGA/direct path unaffected)
 - `95a08e7` MacLCII build/deploy/probe toolkit imported+retargeted
   (`scripts/`, `tools/misterdeploy/`; local.env gitignored, example committed)
 - `f956ad1` MAME no-disk boot heartbeat map → `docs/mame_maciivi_hb2400_4MB_nodisk.txt`
@@ -52,12 +55,10 @@ MAME-verified System 7.5.5 disk image is staged for the OS-boot campaign.
    lines with real bytes, boot reaching the no-disk wait ($4080786x).
    If the sad Mac persists: rerun with `--trace-frames 600,700` and diff
    the faulting PC against `/tmp/slot_tap_golden`-era MAME data.
-2. **Seed-4 Quartus fit** (`output_files/MacIIvi.{fit,sta}.rpt`): compare
-   vs seed-2 result (90% ALM; core clocks +2.6/+3.7ns; **HDMI-domain
-   −1.305ns** — the only violation; LCII closes it at +0.42 so it's
-   placement noise). If seed 4 doesn't close HDMI without hurting core
-   clocks: revert `SEED` to 2 and ship bring-up with the HDMI caveat
-   (scaler-domain only; VGA path unaffected).
+2. **Seed sweep RESOLVED**: seed 4 = core clocks better, HDMI worse
+   (-1.49). Reverted to SEED 2. The final rebuild (launched at session
+   end) carries the lane fix + seed 2 = the deploy candidate; verify its
+   fit.summary/sta.rpt when harvesting.
 3. **System 7.5.5 disk boot** (`simdiskrun/`, screenshots F1200/2000/2800):
    runs the PRE-A0 binary (card reads as empty there → no PrimaryInit, so
    its SCSI/OS evidence is INDEPENDENT of the card fixes). EXPECT happy
