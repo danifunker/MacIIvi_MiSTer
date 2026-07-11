@@ -163,7 +163,16 @@ module nubus_video_mdc824 #(
         rom_word <= rom[local_addr[16:3]];
     wire [7:0] rom_rdata = local_addr[2] ? rom_word[7:0] : rom_word[15:8];
 
-    wire rom_lane_valid = (local_addr[1:0] == 2'b11);
+    // Lane-3 byte visibility on the 16-bit bus: the byte at longword offset
+    // 3 (A1:A0 == 11) is the LOW (LDS) byte of the A1==1 half-word. It must
+    // be served for BYTE reads at the odd address AND for WORD reads at
+    // A1==1 (A0==0, LDS strobed) — the Slot Manager's sResource/driver
+    // copies use word/long accesses, and the old A0-inclusive compare
+    // (local_addr[1:0]==2'b11) returned $FF for every such read, corrupting
+    // the copied driver code -> sad Mac $0F/$33 after PrimaryInit
+    // (2026-07-11; mdc_bench word-read case). D[15:8] (byte 2, lane 2) is
+    // always open ($FF) on this lane-3 card.
+    wire rom_lane_valid = local_addr[1] && uds_lds[0];
 
     // Declaration ROM is baked into the bitstream via $readmemh("boot2.hex")
     // above; no runtime download path is provided. (Previously this listened

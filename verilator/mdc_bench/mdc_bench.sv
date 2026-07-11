@@ -56,6 +56,29 @@ module mdc_bench;
     );
 
     integer timeout;
+    integer errors = 0;
+
+    // Golden copy of the declaration ROM for the sweep
+    reg [15:0] gold [0:16383];
+    initial $readmemh("../rtl/nubus/mdc824_rom.hex", gold);
+
+    // Quiet read returning the data (for the sweep)
+    reg [15:0] rd_val;
+    task bus_read_q(input [31:0] a, input [1:0] strobes);
+        begin
+            @(negedge clk);
+            addr = a; rw_n = 1; select = 1; cpu_as_n = 0; uds_lds = strobes;
+            timeout = 0;
+            @(negedge clk);
+            while (ack_n !== 1'b0 && timeout < 40) begin
+                @(negedge clk); timeout = timeout + 1;
+            end
+            rd_val = (ack_n === 1'b0) ? data_out : 16'hDEAD;
+            @(negedge clk);
+            cpu_as_n = 1; select = 0; uds_lds = 2'b00;
+            repeat (2) @(negedge clk);
+        end
+    endtask
 
     // One 16-bit bus cycle (byte or word) like the TG68 wrapper drives it.
     task bus_read(input [31:0] a, input [1:0] strobes);
@@ -101,7 +124,40 @@ module mdc_bench;
         // Super-slot flavor of the same top byte
         bus_read(32'hEEFFFFFF, 2'b01);
         // And a word read covering both lanes of the top longword's upper half
+        // (Slot Manager driver copies use word/long accesses: must be $FF78)
         bus_read(32'hFEFFFFFE, 2'b11);
+
+        // ---- Full-image lane-3 sweep: every declaration ROM byte, via both
+        // WORD reads (the driver-copy shape) and odd-BYTE reads. ----
+        begin : sweep
+            integer w;
+            reg [7:0] expect_hi, expect_lo;
+            for (w = 0; w < 16384; w = w + 1) begin
+                expect_hi = gold[w][15:8];  // lane-3 byte of longword 2w
+                expect_lo = gold[w][7:0];   // lane-3 byte of longword 2w+1
+                // word read at A1==1 of each longword
+                bus_read_q(32'hFE000000 + 24'hFE0000 + w*8 + 2, 2'b11);
+                if (rd_val !== {8'hFF, expect_hi}) begin
+                    if (errors < 10) $display("SWEEP FAIL w=%0d wordA got=%04x want=FF%02x", w, rd_val, expect_hi);
+                    errors = errors + 1;
+                end
+                bus_read_q(32'hFE000000 + 24'hFE0000 + w*8 + 6, 2'b11);
+                if (rd_val !== {8'hFF, expect_lo}) begin
+                    if (errors < 10) $display("SWEEP FAIL w=%0d wordB got=%04x want=FF%02x", w, rd_val, expect_lo);
+                    errors = errors + 1;
+                end
+                // spot-check byte reads on a stride
+                if ((w & 255) == 0) begin
+                    bus_read_q(32'hFE000000 + 24'hFE0000 + w*8 + 3, 2'b01);
+                    if (rd_val[7:0] !== expect_hi) begin
+                        $display("SWEEP FAIL w=%0d byteA got=%02x want=%02x", w, rd_val[7:0], expect_hi);
+                        errors = errors + 1;
+                    end
+                end
+            end
+            if (errors == 0) $display("SWEEP PASS: all 32768 lane-3 bytes correct (word+byte access)");
+            else $display("SWEEP: %0d ERRORS", errors);
+        end
 
         $display("DONE");
         $finish;
