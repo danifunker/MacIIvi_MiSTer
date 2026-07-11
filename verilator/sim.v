@@ -740,23 +740,37 @@ module emu
 	assign nubusAck_n   = nubus_no_card ? 1'b0    : nubusAck_card;
 
 `ifdef SIMULATION
-	// [NUBUS] access logger: one line per completed slot-space cycle (first
-	// 60 card ACKs + first 20 open-bus), so a run shows the Slot Manager
-	// finding the declaration ROM at $FExxxxxx vs empty $FC/$FD.
-	reg nb_as_d;
+	// [NUBUS] access logger. The decoder's selects are combinational on
+	// !_cpuAS, so they are ALREADY DEASSERTED at the AS-rise instant — the
+	// original logger sampled slot_space there and could never fire (bug
+	// found 2026-07-11 via the MAME slot-tap oracle: the F400 declaration
+	// ROM probe was invisible). Latch the cycle's identity while AS is low;
+	// report at AS-rise from the latches.
+	reg        nb_as_d;
+	reg        nb_cyc_slot, nb_cyc_open;
+	reg [31:0] nb_cyc_addr;
+	reg        nb_cyc_rw;
+	reg [15:0] nb_cyc_data;
 	integer nb_ack_cnt = 0, nb_open_cnt = 0;
 	always @(posedge clk_sys) begin
 		nb_as_d <= _cpuAS;
-		if (!nb_as_d && _cpuAS && slot_space) begin  // AS rising = cycle end
-			if (nubus_no_card) begin
+		if (!_cpuAS && slot_space) begin
+			nb_cyc_slot <= 1'b1;
+			nb_cyc_open <= nubus_no_card;
+			nb_cyc_addr <= cpuAddr;
+			nb_cyc_rw   <= _cpuRW;
+			nb_cyc_data <= _cpuRW ? nubusDataOut : cpuDataOut;
+		end
+		if (!nb_as_d && _cpuAS && nb_cyc_slot) begin  // cycle ended
+			nb_cyc_slot <= 1'b0;
+			if (nb_cyc_open) begin
 				if (nb_open_cnt < 20) begin
-					$display("[NUBUS] OPEN  addr=%h rw=%b -> FFFF", cpuAddr, _cpuRW);
+					$display("[NUBUS] OPEN  addr=%h rw=%b -> FFFF", nb_cyc_addr, nb_cyc_rw);
 					nb_open_cnt <= nb_open_cnt + 1;
 				end
 			end else begin
 				if (nb_ack_cnt < 60) begin
-					$display("[NUBUS] CARD  addr=%h rw=%b data=%h", cpuAddr, _cpuRW,
-					         _cpuRW ? nubusDataOut_card : cpuDataOut);
+					$display("[NUBUS] CARD  addr=%h rw=%b data=%h", nb_cyc_addr, nb_cyc_rw, nb_cyc_data);
 					nb_ack_cnt <= nb_ack_cnt + 1;
 				end
 			end
