@@ -1,0 +1,67 @@
+`verilator_config
+// Expose the cmp's memory-operand latch (ea_data) + the stale last-read source so
+// the sim can verify whether cmp.b of an indexed I/O read uses a stale operand.
+public_flat_rd -module "TG68KdotC_Kernel" -var "ea_data"
+public_flat_rd -module "TG68KdotC_Kernel" -var "last_data_read"
+public_flat_rd -module "TG68KdotC_Kernel" -var "op1out"
+public_flat_rd -module "TG68KdotC_Kernel" -var "op2out"
+// REAL committed CCR (flags(2)=Z) + the operand-settle gate + execute pulse, to
+// see the true flag-commit cycle vs operand settle (the prior "Z" tap was SRin=
+// OP2out(15:8), NOT the committed condition codes).
+public_flat_rd -module "TG68KdotC_Kernel" -var "flags"
+public_flat_rd -module "TG68KdotC_Kernel" -var "store_in_tmp"
+public_flat_rd -module "TG68KdotC_Kernel" -var "execopc"
+// Retire-accurate branch proof: exe_condition (NOT Flags(2) for bne) directly
+// decides take/fall-through; exe_opcode identifies the bne ($6604) at its commit.
+public_flat_rd -module "TG68KdotC_Kernel" -var "exe_condition"
+public_flat_rd -module "TG68KdotC_Kernel" -var "exe_opcode"
+public_flat_rd -module "TG68KdotC_Kernel" -var "decodeopc"
+// [BERRFRAME] taps: 68030 bus-fault frame build + Format-$B RTE consume, to
+// ground-truth the OS continue-past probe bug. make_berr=fault dispatch pulse;
+// berr_frame_pc/berr_ssw/berr_long_frame/berr_fault_addr = the frame AS BUILT;
+// tg68_pc = live PC; rte_mmu_fix_ssw = the STACKED (post-handler) SSW captured at
+// RTE (shows bit9 + DF the handler left); rte_mmu_fix_write/commit = whether the
+// continue-past replay fires; rte_format_word/opcode = the RTE-side decode.
+public_flat_rd -module "TG68KdotC_Kernel" -var "make_berr"
+public_flat_rd -module "TG68KdotC_Kernel" -var "berr_frame_pc"
+public_flat_rd -module "TG68KdotC_Kernel" -var "berr_ssw"
+public_flat_rd -module "TG68KdotC_Kernel" -var "berr_long_frame"
+public_flat_rd -module "TG68KdotC_Kernel" -var "berr_fault_addr"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_berr"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_mmu_berr"
+public_flat_rd -module "TG68KdotC_Kernel" -var "tg68_pc"
+public_flat_rd -module "TG68KdotC_Kernel" -var "rte_format_word"
+public_flat_rd -module "TG68KdotC_Kernel" -var "rte_mmu_fix_ssw"
+public_flat_rd -module "TG68KdotC_Kernel" -var "rte_mmu_fix_write"
+public_flat_rd -module "TG68KdotC_Kernel" -var "rte_mmu_fix_commit"
+public_flat_rd -module "TG68KdotC_Kernel" -var "rte_mmu_fix_opcode"
+// [EXC] exception-dispatch tracer taps: find the fatal bad-F-line / type-7 at
+// Finder launch. trap_* = the exception-type request pulses; trap_vector = the
+// dispatched vector*... offset; opcode_pc/exe_pc = the faulting instruction PC;
+// flagssr = full SR (bit5=S supervisor); svmode = live supervisor mode.
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_1111"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_priv"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_illegal"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_addr_error"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_1010"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_format_error"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_vector"
+public_flat_rd -module "TG68KdotC_Kernel" -var "opcode_pc"
+public_flat_rd -module "TG68KdotC_Kernel" -var "exe_pc"
+public_flat_rd -module "TG68KdotC_Kernel" -var "flagssr"
+public_flat_rd -module "TG68KdotC_Kernel" -var "svmode"
+// [PCRING] torn-jsr-push taps (2026-07-03): capture the push-data sample vs
+// PC-increment edge ordering around a PMMU-walk exit (the $378004 torn return —
+// data_write_tmp latches TG68_PC on clkena_lw edges while the seq +2 commits on
+// the same edge; the walk-exit collapses the sample window). writepc gates the
+// data_write_tmp<=TG68_PC branch; state/memaddr identify the bus cycle;
+// tg68_pc_add shows the pending increment; clkena_in/clkena_lw/pmmu_busy time it.
+public_flat_rd -module "TG68KdotC_Kernel" -var "data_write_tmp"
+public_flat_rd -module "TG68KdotC_Kernel" -var "writepc"
+public_flat_rd -module "TG68KdotC_Kernel" -var "clkena_lw"
+public_flat_rd -module "TG68KdotC_Kernel" -var "clkena_in"
+public_flat_rd -module "TG68KdotC_Kernel" -var "pmmu_busy"
+public_flat_rd -module "TG68KdotC_Kernel" -var "state"
+public_flat_rd -module "TG68KdotC_Kernel" -var "memaddr"
+public_flat_rd -module "TG68KdotC_Kernel" -var "tg68_pc_add"
+public_flat_rd -module "TG68KdotC_Kernel" -var "tg68_pc_brw"

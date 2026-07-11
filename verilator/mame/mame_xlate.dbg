@@ -1,0 +1,8 @@
+focus maincpu
+wpset dd0,4,w
+go
+printf "BREAK PC=%08X A5=%08X\n",pc,a5
+translate 40a0010e
+translate a416b6
+translate 40800000
+go

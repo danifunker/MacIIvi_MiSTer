@@ -75,10 +75,19 @@ int cfg_memSize = 1;       // 0=1MB, 1=4MB
 bool verbose_diag = false;
 #define DLOG(...) do { if (verbose_diag) fprintf(stderr, __VA_ARGS__); } while (0)
 
+// TG68K regfile is a packed [511:0] vector; Verilator exposes it as 16x32-bit
+// words. The kernel's debug taps prove the mapping (d0=regfile[511:480]=word15,
+// a0=regfile[255:224]=word7, a7=regfile[31:0]=word0): Dn = rf[15-n], An = rf[7-n].
+// NOTE: the older [TBL]/[MARCH]/[ERR] detectors used ascending rf[0..13] and so
+// MISLABELED every register — use these macros instead.
+#define RF_D(rf,n) ((uint32_t)(rf)[15-(n)])
+#define RF_A(rf,n) ((uint32_t)(rf)[7-(n)])
+
 // CPU trace
 // ---------
 bool cpu_trace_enable = false;  // Enable after ROM download
 bool cpu_trace_disabled = false; // --no-cpu-trace: skip per-instruction trace (long runs)
+bool pc_heartbeat = false;      // --heartbeat: print the 68k PC once per frame (long runs)
 bool cpu_trace_started = false;  // Wait for ROM load and reset
 FILE* cpu_trace_file = nullptr;
 const char* cpu_trace_filename = "cpu_trace.log";
@@ -87,6 +96,10 @@ const int cpu_trace_max = 0;  // 0 = unlimited
 int post_download_delay = 0;  // Delay after ROM load before tracing
 uint32_t cpu_trace_last_pc = 0xFFFFFFFF;  // For edge detection (new instruction)
 int cpu_trace_last_frame = -1;  // Track frame transitions in trace log
+// --trace-frames A,B: only WRITE trace lines for frames in [A,B] (skip the slow
+// chime so a focused window like the bank-scan stays small). Default = all.
+int trace_from_frame = 0;
+int trace_to_frame = 0x7FFFFFFF;
 
 // Fetch buffer: sliding window of recent code-space fetches (PC -> word).
 // Used to (a) skip extension-word fetches so only opcodes are logged and
@@ -165,6 +178,10 @@ SimBlockDevice blockdevice(console);
 // and --floppy0/1 on the command line.
 std::string scsi_disk_files[2];
 std::string floppy_disk_files[2];
+
+// Boot ROM override (--rom <path>). Empty => default ../releases/boot0.rom.
+// Lets us swap fastmem/nomemcheck ROMs without clobbering the shared boot0.rom.
+std::string rom_file_override;
 
 // Input handling
 // --------------
@@ -310,6 +327,105 @@ int verilate() {
 				}
 			}
 
+			// [LOOPBACK] decisive test for the $A03124 hardware-presence loopback:
+			// MAME reads $F21C00=$00 (separate) -> cmp not-equal -> bne taken; ours
+			// bne falls through. Log the CPU's read VALUE (debug_cpuDataIn) at the
+			// loopback addresses ($F_1C00) — if it reads $FF (unmapped, distinct) the
+			// value is correct and the bug is flag-commit timing; if it reads the
+			// aliased write value, it's a wrong-read-value bug.
+			{
+				static int lb_logs = 0;
+				uint32_t pc = VERTOPINTERN->debug_pc & 0xFFFFFF;
+				if (pc >= 0xA03124 && pc <= 0xA03150 && lb_logs < 400) {
+					uint32_t ca  = top->debug_cpuAddr & 0xFFFFFF;
+					uint32_t din = VERTOPINTERN->debug_cpuDataIn;
+					auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+					uint32_t d1 = (uint32_t)rf[14];   // D1 (regfile is reversed: D0=rf15..D7=rf8)
+					uint32_t op1 = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__op1out;
+					uint32_t op2 = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__op2out;
+					unsigned srin = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__srin;
+					// REAL committed condition codes: flags = ...XNZVC, Z = bit 2.
+					unsigned flags = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__flags;
+					uint32_t eadata = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__ea_data;
+					unsigned sit   = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__store_in_tmp;
+					unsigned exopc = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__execopc;
+					// Boot-sim bus FSM (tg68k.v wrapper, one level above the kernel).
+					unsigned sstate = VERTOPINTERN->emu__DOT__tg68k__DOT__s_state;
+					uint32_t dinr   = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68_din_r;
+					unsigned ebs    = VERTOPINTERN->emu__DOT__tg68k__DOT__eff_busstate;
+					static uint32_t lastkey = 0xFFFFFFFF;
+					uint32_t key = pc ^ (din << 1) ^ (op1 << 5) ^ (op2 << 9) ^ (flags << 13)
+					             ^ (d1 << 3) ^ (ca << 4) ^ (eadata << 7) ^ (sstate << 17)
+					             ^ (exopc << 20) ^ (sit << 21) ^ (dinr << 11) ^ (ebs << 23);
+					if (key != lastkey) {
+						DLOG( "[LOOPBACK] pc=%06X addr=%06X din=%08X D1=%08X OP1=%08X OP2=%08X ea=%08X Zreal=%u CCR=%02X exOPC=%u sit=%u ss=%u dinr=%04X ebs=%u F%d\n",
+							pc, ca, din, d1, op1, op2, eadata, (flags >> 2) & 1, flags & 0x1F,
+							exopc, sit, sstate, dinr & 0xFFFF, ebs, video.count_frame);
+						lb_logs++; lastkey = key;
+					}
+				}
+			}
+
+			// [BNEPROOF] Retire-accurate proof of the bne @ $A0313E direction.
+			// exe_condition (= NOT Flags(2) for bne cc=$6) is what the kernel ACTUALLY
+			// uses to take/fall-through; decodeOPC=1 marks an instruction entering
+			// decode (= actually executed, NOT a discarded prefetch). Logged UN-DEDUPED
+			// every eval in the loop body so a transient Z=1 cannot hide. Also pairs
+			// each bne with the cmp's read stride and the live d0/d1.
+			{
+				static int bp_logs = 0;
+				uint32_t pc = VERTOPINTERN->debug_pc & 0xFFFFFF;
+				if (pc >= 0xA03124 && pc <= 0xA03150 && bp_logs < 1200) {
+					unsigned exeop = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__exe_opcode;
+					unsigned cond  = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__exe_condition;
+					unsigned dec   = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__decodeopc;
+					unsigned exopc = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__execopc;
+					unsigned flags = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__flags;
+					unsigned ss    = VERTOPINTERN->emu__DOT__tg68k__DOT__s_state;
+					uint32_t ca    = top->debug_cpuAddr & 0xFFFFFF;
+					auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+					uint32_t d0 = (uint32_t)rf[15], d1 = (uint32_t)rf[14], d2 = (uint32_t)rf[13];
+					// Only emit at decode boundaries and at the bne's commit, plus any
+					// cycle where Flags shows Z=1 (the thing we must catch or rule out).
+					bool zset = ((flags >> 2) & 1);
+					if (dec || (exeop == 0x6604 && exopc) || zset) {
+						DLOG("[BNEPROOF] pc=%06X addr=%06X exeop=%04X cond=%u dec=%u exOPC=%u Z=%u CCR=%02X ss=%u D0=%08X D1=%08X D2=%08X F%d\n",
+							pc, ca, exeop, cond, dec, exopc, (flags>>2)&1, flags&0x1F, ss, d0, d1, d2, video.count_frame);
+						bp_logs++;
+					}
+				}
+			}
+
+			// [CKSUM] Settle the ROM-checksum POST stall question. The full-ROM sum
+			// loop is at $A46AF0 (move.w (A0)+,D0; add.l D0,D1; subq.l #1,D3; bne),
+			// $3FFFE words; then $A46AFC eor.l D4,D1; $A46AFE beq $a46b04. PASS (Z=1)
+			// -> $A46B04 jmp(A6); FAIL (Z=0) -> $A46B00 move.w #$FFFF,D6 -> caller
+			// $A464EC bne $a48cda (error handler). Retire-accurate via decodeopc.
+			// Logs coarse D3 countdown milestones (is it PROGRESSING vs stuck?) plus
+			// the decisive eor/beq result. D1=rf14 D3=rf12 D4=rf11 (regfile reversed).
+			{
+				static int ck_logs = 0;
+				static uint32_t last_milestone = 0xFFFFFFFF;
+				uint32_t pc = VERTOPINTERN->debug_pc & 0xFFFFFF;
+				if (pc >= 0xA46ADA && pc <= 0xA46B08 && ck_logs < 120) {
+					unsigned dec   = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__decodeopc;
+					unsigned flags = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__flags;
+					auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+					uint32_t d1 = (uint32_t)rf[14], d3 = (uint32_t)rf[12], d4 = (uint32_t)rf[11];
+					uint32_t milestone = d3 >> 14;   // ~16 samples across $3FFFE
+					if (pc == 0xA46AF2 && dec && milestone != last_milestone) {
+						DLOG("[CKSUM] progress D3=%08X D1(sum)=%08X F%d cyc=%llu\n",
+							d3, d1, video.count_frame, (unsigned long long)main_time);
+						last_milestone = milestone; ck_logs++;
+					}
+					if ((pc==0xA46AFC || pc==0xA46AFE || pc==0xA46B00 || pc==0xA46B04) && dec) {
+						DLOG("[CKSUM] RESULT pc=%06X Z=%u CCR=%02X D1(sum^exp)=%08X D4(exp)=%08X F%d\n",
+							pc, (flags>>2)&1, flags&0x1F, d1, d4, video.count_frame);
+						ck_logs++;
+					}
+				}
+			}
+
 			// March progress counters — independent of cpu_trace gating.
 			// $A46910 = one full inner-march region pass completed (cmpi.w #21,d7)
 			// $A4694C = march fully done; $A4A590 = bank-scan driver reached.
@@ -317,6 +433,18 @@ int verilate() {
 				static uint32_t march_last_pc = 0xFFFFFFFF;
 				static int hit_910 = 0, hit_694c = 0, hit_a590 = 0;
 				uint32_t mpc = VERTOPINTERN->debug_pc & 0xFFFFFF;
+				// --heartbeat: sample the PC once per frame so long runs show
+				// whether the CPU is advancing or wedged in a loop (no --verbose flood).
+				if (pc_heartbeat) {
+					static int last_hb_frame = -1;
+					if ((int)video.count_frame != last_hb_frame) {
+						last_hb_frame = (int)video.count_frame;
+						auto &hbrf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+						fprintf(stderr, "[HB] F%d pc=%06X fullpc=%08X a7=%08X a2=%08X\n",
+						        (int)video.count_frame, mpc,
+						        (unsigned)VERTOPINTERN->debug_pc, RF_A(hbrf,7), RF_A(hbrf,2));
+					}
+				}
 				if (mpc != march_last_pc) {
 					{   // STM-entry detector: first jump INTO the serial-monitor
 						// region ($A49800-$A49FFF) from outside, with source PC.
@@ -336,7 +464,7 @@ int verilate() {
 							auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
 							DLOG( "[ERR] ->%06X from %06X F%d D0=%08X D1=%08X D2=%08X D6=%08X D7=%08X\n",
 								mpc, march_last_pc, video.count_frame,
-								(unsigned)rf[0],(unsigned)rf[1],(unsigned)rf[2],(unsigned)rf[6],(unsigned)rf[7]); DLOG("      D4(testmask)=%08X D3=%08X A0=%08X A1=%08X\n",(unsigned)rf[4],(unsigned)rf[3],(unsigned)rf[8],(unsigned)rf[9]); en++;
+								RF_D(rf,0),RF_D(rf,1),RF_D(rf,2),RF_D(rf,6),RF_D(rf,7)); DLOG("      D4(testmask)=%08X D3=%08X A0=%08X A1=%08X\n",RF_D(rf,4),RF_D(rf,3),RF_A(rf,0),RF_A(rf,1)); en++;
 						}
 					}
 					{   // MOVES-BERR fix verification: machine-config word D2 (and D5
@@ -345,7 +473,7 @@ int verilate() {
 						if (mpc==0xA00AB0 && n<8) {
 							auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
 							DLOG( "[D2PROBE] $A00AB0 #%d F%d D2=%08X D5=%08X\n",
-								n, video.count_frame, (unsigned)rf[2], (unsigned)rf[5]); n++;
+								n, video.count_frame, RF_D(rf,2), RF_D(rf,5)); n++;
 						}
 					}
 					{   // boot state-machine: log entry into each of MAME's 11 handlers
@@ -364,9 +492,9 @@ int verilate() {
 						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
 						DLOG( "[MARCH] PASS#%d F%d D0=%08X D1=%08X D2=%08X D4=%08X D6=%08X D7=%08X A0=%08X A1=%08X A2=%08X A3=%08X A4=%08X A5=%08X\n",
 							hit_910, video.count_frame,
-							(unsigned)rf[0],(unsigned)rf[1],(unsigned)rf[2],(unsigned)rf[4],
-							(unsigned)rf[6],(unsigned)rf[7],(unsigned)rf[8],(unsigned)rf[9],
-							(unsigned)rf[10],(unsigned)rf[11],(unsigned)rf[12],(unsigned)rf[13]); }
+							RF_D(rf,0),RF_D(rf,1),RF_D(rf,2),RF_D(rf,4),
+							RF_D(rf,6),RF_D(rf,7),RF_A(rf,0),RF_A(rf,1),
+							RF_A(rf,2),RF_A(rf,3),RF_A(rf,4),RF_A(rf,5)); }
 					else if (mpc == 0xA4694C) { hit_694c++;
 						DLOG( "[MARCH] *** DONE $A4694C hit#%d cyc=%llu F%d ***\n",
 							hit_694c, (unsigned long long)main_time, video.count_frame); }
@@ -378,15 +506,15 @@ int verilate() {
 					else if (mpc == 0xA46584) { static int n=0; if(++n<=12) { // cmpaw #-1,a0 : A0=region start loaded, A5=table base
 						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
 						DLOG( "[TBL] $A46584 #%d F%d D7=%08X A0(start)=%08X A4=%08X A5(tbl)=%08X SP=%08X\n",
-							n, video.count_frame, (unsigned)rf[7], (unsigned)rf[8], (unsigned)rf[12], (unsigned)rf[13], (unsigned)rf[15]); } }
+							n, video.count_frame, RF_D(rf,7), RF_A(rf,0), RF_A(rf,4), RF_A(rf,5), RF_A(rf,7)); } }
 					else if (mpc == 0xA4658A) { static int n=0; if(++n<=12) { // movel a4@+,d0 : D0=region length
 						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
 						DLOG( "[TBL] $A4658A #%d F%d D0(len)=%08X A0=%08X A4=%08X\n",
-							n, video.count_frame, (unsigned)rf[0], (unsigned)rf[8], (unsigned)rf[12]); } }
+							n, video.count_frame, RF_D(rf,0), RF_A(rf,0), RF_A(rf,4)); } }
 					else if (mpc == 0xA4657E) { static int n=0; if(++n<=8) { // moveal sp@,a4 : about to read table ptr from SP
 						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
-						DLOG( "[TBL] $A4657E #%d F%d (D7=3 RAM-region entry) SP=%08X overlay=%d\n",
-							n, video.count_frame, (unsigned)rf[15],
+						DLOG( "[TBL] $A4657E #%d F%d (D7=3 RAM-region entry) SP=%08X A4=%08X A5=%08X overlay=%d\n",
+							n, video.count_frame, RF_A(rf,7), RF_A(rf,4), RF_A(rf,5),
 							(int)VERTOPINTERN->emu__DOT__ac0__DOT__rom_overlay);
 						// READ-ONLY dump of built descriptor table memory before the march
 						// writes it. CPU $9FFFE0..$9FFFFF -> SDRAM words $0FFFF0..$0FFFFF
@@ -396,7 +524,106 @@ int verilate() {
 						DLOG( "[TBLMEM] #%d F%d CPU$9FFFE0:", n, video.count_frame);
 						for (uint32_t w = 0xFFFF0; w <= 0xFFFFE; w += 2)
 							DLOG( " %08X", ((unsigned)M[w] << 16) | (unsigned)M[w+1]);
+						DLOG( "\n");
+						// The REAL descriptor table is at the top of 4MB (CPU $3FFFEx ->
+						// SDRAM word $1FFFFx). Dump CPU $3FFFE0..$3FFFFC and the table-ptr
+						// slot CPU $7FF8..$7FFC (SDRAM $3FFC..$3FFE).
+						DLOG( "[TBLMEM] #%d F%d CPU$3FFFE0:", n, video.count_frame);
+						for (uint32_t w = 0x1FFFF0; w <= 0x1FFFFE; w += 2)
+							DLOG( " %08X", ((unsigned)M[w] << 16) | (unsigned)M[w+1]);
+						DLOG( "  | CPU$7FF8:");
+						for (uint32_t w = 0x3FFC; w <= 0x3FFE; w += 2)
+							DLOG( " %08X", ((unsigned)M[w] << 16) | (unsigned)M[w+1]);
 						DLOG( "\n"); } }
+
+						// [ENUM] correctly-mapped register snapshot at the RAM-enumeration
+						// decision points, to diff control flow + values vs the MAME oracle.
+						{
+							static const struct { uint32_t pc; const char* tag; int cap; } EP[] = {
+								{0xA4A5B2,"B2_btstD0", 4}, {0xA4A5C2,"C2_btstD1", 4},
+								{0xA4A5E4,"E4_PanD",   4}, {0xA4A5EC,"EC_C4set",  4},
+								{0xA4A60C,"0C_topRAM", 4}, {0xA4A626,"26_A5set",  4},
+								{0xA4A65C,"5C_walk0",  4}, {0xA4A666,"66_rgnSt", 24},
+								{0xA4A66C,"6C_rgnSz", 24}, {0xA4A698,"98_stkSet",24},
+								{0xA4A6AE,"AE_final",  8}, {0xA4654A,"4A_rdTbl",  8},
+							};
+							static int ecap[12] = {0};
+							for (int i = 0; i < 12; i++) {
+								if (mpc == EP[i].pc && ecap[i] < EP[i].cap) {
+									auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+									DLOG("[ENUM] %-9s pc=%06X F%d D0=%08X D1=%08X D2=%08X D4=%08X A0=%08X A1=%08X A2=%08X A5=%08X A7=%08X\n",
+										EP[i].tag, mpc, video.count_frame,
+										RF_D(rf,0),RF_D(rf,1),RF_D(rf,2),RF_D(rf,4),
+										RF_A(rf,0),RF_A(rf,1),RF_A(rf,2),RF_A(rf,5),RF_A(rf,7));
+									ecap[i]++;
+								}
+							}
+						}
+
+						// [JMP6] Post-state-machine $A4A2xx-$A4A4xx hardware-init flow that
+						// ends in the crashing jmp(A6) at $A4A454. MAME (our patched ROM):
+						// caller $A4A300 `lea ($a4a308,PC),A6` -> A6=$A4A308 -> jmp(A6) returns
+						// cleanly (60x, no crash). Our core: A6=$FFFFFFAA garbage -> $7FF8 wedge.
+						// Log every new PC in the window with A6/A2/A5 (skip the 256x delay loop
+						// $A4A44E/$A4A450) to find where A6 first goes bad vs MAME.
+						{
+							static int j6 = 0; static int dcnt = 0;
+							static uint32_t last454a6 = 0xDEADBEEF;
+							auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+							// [DERAIL] the 68k PC jumping into $FFFFxxxx (the crash). Log the source pc
+							// (the jmp(An) instr) + all regs so we see WHICH jmp went bad and to what.
+							// Fire ONCE on the good->bad PC transition (mpc enters $FFxxxx from a
+							// normal address) so march_last_pc = the offending jmp/rts and the regs
+							// are pre-garbage. Also dump the FULL 32-bit debug_pc (unmasked) to see
+							// the sign-extension, + all A/D regs + A7(SP).
+							bool bad=(mpc & 0xFF0000u)==0xFF0000u, prevbad=(march_last_pc & 0xFF0000u)==0xFF0000u;
+							if (bad && !prevbad && dcnt < 6) {
+								DLOG("[DERAIL] full_pc=%08X mpc=%06X SRC=%06X F%d | A0=%08X A1=%08X A2=%08X A3=%08X A4=%08X A5=%08X A6=%08X A7=%08X | D0=%08X D1=%08X D2=%08X D5=%08X\n",
+									(unsigned)VERTOPINTERN->debug_pc, mpc, march_last_pc, video.count_frame,
+									RF_A(rf,0),RF_A(rf,1),RF_A(rf,2),RF_A(rf,3),RF_A(rf,4),RF_A(rf,5),RF_A(rf,6),RF_A(rf,7),
+									RF_D(rf,0),RF_D(rf,1),RF_D(rf,2),RF_D(rf,5));
+								dcnt++;
+							}
+							bool log6=false; const char* t6="";
+							if      (mpc==0xA4A290) { t6="ENTRY";    log6=true; } // routine entry (A6=outer ret)
+							else if (mpc==0xA4A2F8) { t6="pollDONE"; log6=true; } // after dbne: D0<0 => timeout
+							else if (mpc==0xA4A31C) { t6="TIMEOUT!"; log6=true; } // bmi error path taken
+							else if (mpc==0xA4A3CE) { t6="D0ne20";   log6=true; } // bne $a4a3ce (D0&$70 != $20)
+							else if (mpc==0xA4A24C) { t6="EXIT(A3)"; log6=true; } // jmp(A3): state-machine exit
+							else if (mpc==0xA4A454) {                             // jmp(A6); dedup by A6
+								uint32_t a6=RF_A(rf,6);
+								if (a6!=last454a6) { t6="jmp(A6)"; log6=true; last454a6=a6; }
+							}
+							if (log6 && j6 < 900) {
+								DLOG("[JMP6] %-9s pc=%06X<-%06X F%d A6=%08X A5=%08X A3=%08X A2=%08X D1=%08X D2=%08X D5=%08X\n",
+									t6, mpc, march_last_pc, video.count_frame,
+									RF_A(rf,6),RF_A(rf,5),RF_A(rf,3),RF_A(rf,2),RF_D(rf,1),RF_D(rf,2),RF_D(rf,5));
+								j6++;
+							}
+						}
+						// [RING] 48-entry circular trace of the derail lead-up. Stores every instr
+						// from F150; on the FIRST abnormal PC (not RAM<4MB / ROM $A0-A7 / VIA $F0xxxx)
+						// it flushes the buffer in order -> the last good entry = the jmp/rts that
+						// derailed, with its opcode + A3/A4/A6/A7/D2.
+						{
+							static uint32_t rpc[48],rop[48],ra2[48],ra5[48],ra6[48],ra7[48],rd2[48];
+							static int ri=0; static bool flushed=false;
+							auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+							bool abn = !((mpc<0x400000u) || (mpc>=0xA00000u && mpc<0xA80000u) || (mpc>=0xF00000u && mpc<0xF10000u));
+							if (video.count_frame>=150 && !flushed) {
+								if (abn) {
+									DLOG("[RING] FLUSH at abnormal pc=%06X full=%08X F%d\n", mpc, (unsigned)VERTOPINTERN->debug_pc, video.count_frame);
+									for (int k=0;k<48;k++){ int idx=(ri+k)%48;
+										DLOG("[RING] %2d pc=%06X op=%04X A2=%08X A5=%08X A6=%08X A7=%08X D2=%08X\n",
+											k, rpc[idx], rop[idx], ra2[idx], ra5[idx], ra6[idx], ra7[idx], rd2[idx]); }
+									flushed=true;
+								} else {
+									rpc[ri%48]=mpc; rop[ri%48]=(unsigned)VERTOPINTERN->debug_opcode;
+									ra2[ri%48]=RF_A(rf,2); ra5[ri%48]=RF_A(rf,5); ra6[ri%48]=RF_A(rf,6);
+									ra7[ri%48]=RF_A(rf,7); rd2[ri%48]=RF_D(rf,2); ri++;
+								}
+							}
+						}
 				}
 			}
 
@@ -422,6 +649,269 @@ int verilate() {
 						prev_rcfgd, rcfgd, video.count_frame,
 						VERTOPINTERN->debug_pc & 0xFFFFFF);
 					prev_rcfgd = rcfgd;
+				}
+			}
+
+			// [BERRFRAME] 68030 bus-fault frame build + Format-$B RTE consume trace.
+			// Ground-truths the OS "continue-past" probe bug. DISP line = the frame as
+			// BUILT (stacked PC/SSW/opcode). RTE line = the STACKED (post-handler) SSW +
+			// whether the rte_mmu_fix continue-past replay fires + where the RTE landed.
+			// Kernel taps via tg68k_debug.vlt. fprintf(stderr) so it always shows; capped
+			// to avoid flooding a BERR storm. Trigger on berr_frame_pc change (each = one
+			// fault dispatch, value held until next fault) + make_berr edge counting.
+			#define KB(n) (VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__##n)
+			if (!*bus.ioctl_download) {
+				static uint32_t bf_prev = 0xFFFFFFFFu;
+				static int      rs_prev = -1;
+				static int      mb_prev = 0;
+				static int      mb_total = 0, bf_n = 0, rte_n = 0, land = 0;
+				const int       CAP = 120;
+
+				int mb = (int)KB(make_berr);
+				if (mb && !mb_prev) mb_total++;
+				mb_prev = mb;
+
+				uint32_t bf = (uint32_t)KB(berr_frame_pc);
+				if (bf != bf_prev) {
+					bf_prev = bf;
+					if (bf_n < CAP) {
+						unsigned ssw = (unsigned)(uint16_t)KB(berr_ssw);
+						fprintf(stderr,
+						  "[BERRFRAME] DISP berr#%d F%d frame_pc=%08X live_pc=%08X ssw=%04X[b9=%u DF=%u RW=%u] long=%d faddr=%08X opc=%04X tberr=%d tmmu=%d\n",
+						  mb_total, video.count_frame, bf, (uint32_t)KB(tg68_pc),
+						  ssw, (ssw>>9)&1u, (ssw>>8)&1u, (ssw>>6)&1u,
+						  (int)KB(berr_long_frame), (uint32_t)KB(berr_fault_addr),
+						  (unsigned)(uint16_t)KB(exe_opcode),
+						  (int)KB(trap_berr), (int)KB(trap_mmu_berr));
+						bf_n++;
+					}
+				}
+
+				int rs = (int)(uint16_t)KB(rte_mmu_fix_ssw);
+				if (rs != rs_prev) {
+					rs_prev = rs;
+					if (rs != 0 && rte_n < CAP) {
+						fprintf(stderr,
+						  "[BERRFRAME] RTE  F%d stacked_ssw=%04X[b9=%u DF=%u] fmt=%04X fix_write=%d fix_commit=%d fix_opc=%04X\n",
+						  video.count_frame, (unsigned)rs, ((unsigned)rs>>9)&1u, ((unsigned)rs>>8)&1u,
+						  (unsigned)(uint16_t)KB(rte_format_word),
+						  (int)KB(rte_mmu_fix_write), (int)KB(rte_mmu_fix_commit),
+						  (unsigned)(uint16_t)KB(rte_mmu_fix_opcode));
+						rte_n++;
+						land = 1;
+					}
+				}
+				if (land && VERTOPINTERN->debug_fetch_valid) {
+					fprintf(stderr, "[BERRFRAME]      landed_pc=%06X opc=%04X\n",
+						VERTOPINTERN->debug_pc & 0xFFFFFFu, VERTOPINTERN->debug_opcode & 0xFFFFu);
+					land = 0;
+				}
+			}
+
+			// [EXC] Exception-dispatch tracer — pins the fatal "bad F-Line" (sim) /
+			// "type 7" (HW) at Finder launch. Edge-detect each trap_* request and log
+			// the vector + faulting PC (opcode_pc) + full SR (flagssr, bit5=S) + the
+			// live opcode. Frame-gated to skip the early-boot storm; capped. The trap
+			// signals are held across the multi-cycle dispatch, so edge-detect on the
+			// rising transition to log once per exception.
+			// NOTE: A-line (trap_1010, vec10) DELIBERATELY EXCLUDED — it is the normal
+			// Mac Toolbox trap-dispatch mechanism ($Axxx opcodes = every Toolbox/OS
+			// call), which fires hundreds of times per frame and would flood the cap
+			// before the fatal F-line at Finder launch. The bomb is a "bad F-Line"
+			// (vec11); we only want the rare fault classes.
+			if (!*bus.ioctl_download && video.count_frame >= 1600) {
+				static int p1111=0, ppriv=0, pillg=0, paddr=0, pfmt=0;
+				static int exc_n = 0; const int ECAP = 400;
+				struct Trap { const char* name; int now; int* prev; };
+				Trap tr[] = {
+					{ "F-LINE  vec11", (int)KB(trap_1111),        &p1111 },
+					{ "PRIVVIOL vec8", (int)KB(trap_priv),        &ppriv },
+					{ "ILLEGAL  vec4", (int)KB(trap_illegal),     &pillg },
+					{ "ADDR-ERR vec3", (int)KB(trap_addr_error),  &paddr },
+					{ "FORMATERR v14", (int)KB(trap_format_error), &pfmt  },
+				};
+				for (auto& t : tr) {
+					if (t.now && !*t.prev && exc_n < ECAP) {
+						// flagssr = SR high byte (SR[15:8]); resets to $27. S=bit5, IPL=bits2:0.
+						unsigned srhi = (unsigned)(uint8_t)KB(flagssr);
+						fprintf(stderr,
+						  "[EXC] F%d %s  vector=%03X opcode_pc=%08X exe_pc=%08X live_pc=%08X SRhi=%02X[S=%u IPL=%u] exe_opcode=%04X svmode=%d\n",
+						  video.count_frame, t.name,
+						  (unsigned)KB(trap_vector) & 0x3FF,
+						  (uint32_t)KB(opcode_pc), (uint32_t)KB(exe_pc), (uint32_t)KB(tg68_pc),
+						  srhi, (srhi>>5)&1u, srhi&7u,
+						  (unsigned)(uint16_t)KB(exe_opcode),
+						  (int)KB(svmode));
+						exc_n++;
+					}
+					*t.prev = t.now;
+				}
+			}
+
+			// [PCRING] torn-jsr-push forensics (2026-07-03). The F1768 F-line
+			// executes at $378004 = a jsr return address pushed 2 LOW (missing
+			// displacement +2), and the pmmu_busy gate on directPC/ea_to_pc was
+			// behavior-inert => the tear is an edge-ORDERING flip between the
+			// data_write_tmp<=TG68_PC sample (clkena_lw domain, writepc=1) and
+			// the seq-arm TG68_PC<=TG68_PC_add commit (clkena_in domain) at a
+			// walk exit. Ring-log every settled-cycle change of that cluster;
+			// dump on (a) the first F-line >=F1600, (b) a state="11" write cycle
+			// carrying the torn value $00378004, with healthy $00378006 pushes
+			// logged one-line for contrast. All output on stderr as [PCRING].
+			{
+				struct RE { uint64_t t; int f; uint32_t pc, add, dwt, ma;
+				            uint8_t wpc, lw, cin, busy, st, brw; };
+				static const int RN = 16384;
+				static RE ring[RN]; static int rw = 0; static bool wrapped = false;
+				static uint32_t ppc=~0u, padd=~0u, pdwt=~0u, pma=~0u; static int pflags=-1;
+				RE e;
+				e.t   = main_time;
+				e.f   = video.count_frame;
+				e.pc  = (uint32_t)KB(tg68_pc);
+				e.add = (uint32_t)KB(tg68_pc_add);
+				e.dwt = (uint32_t)KB(data_write_tmp);
+				e.ma  = (uint32_t)KB(memaddr);
+				e.wpc = (uint8_t)(KB(writepc) & 1);
+				e.lw  = (uint8_t)(KB(clkena_lw) & 1);
+				e.cin = (uint8_t)(KB(clkena_in) & 1);
+				e.busy= (uint8_t)(KB(pmmu_busy) & 1);
+				e.st  = (uint8_t)(KB(state) & 3);
+				e.brw = (uint8_t)(KB(tg68_pc_brw) & 1);
+				int flags = e.wpc | (e.lw<<1) | (e.cin<<2) | (e.busy<<3) | (e.st<<4) | (e.brw<<6);
+				if (e.pc!=ppc || e.add!=padd || e.dwt!=pdwt || e.ma!=pma || flags!=pflags) {
+					ring[rw] = e; rw = (rw+1)%RN; if (rw==0) wrapped = true;
+					ppc=e.pc; padd=e.add; pdwt=e.dwt; pma=e.ma; pflags=flags;
+				}
+				auto dump_ring = [&](const char* why, int last_n) {
+					int n = wrapped ? RN : rw;
+					int from = (last_n > 0 && last_n < n) ? n - last_n : 0;
+					fprintf(stderr, "[PCRING] ==== DUMP (%s) t=%llu F%d entries=%d ====\n",
+					        why, (unsigned long long)main_time, video.count_frame, n - from);
+					for (int i = from; i < n; ++i) {
+						const RE& r = ring[wrapped ? (rw + i) % RN : i];
+						fprintf(stderr, "[PCRING] t=%llu F%d pc=%08X add=%08X dwt=%08X ma=%08X "
+						        "wpc=%u lw=%u cin=%u busy=%u st=%u brw=%u\n",
+						        (unsigned long long)r.t, r.f, r.pc, r.add, r.dwt, r.ma,
+						        r.wpc, r.lw, r.cin, r.busy, r.st, r.brw);
+					}
+					fprintf(stderr, "[PCRING] ==== END DUMP (%s) ====\n", why);
+				};
+				if (video.count_frame >= 1600 && !*bus.ioctl_download) {
+					// (a) full-ring dump on the first F-line dispatch (site-independent)
+					static int pfl = 0; static bool excdumped = false;
+					int fl = (int)KB(trap_1111);
+					if (fl && !pfl && !excdumped) { dump_ring("FLINE", 0); excdumped = true; }
+					pfl = fl;
+					// (b) torn-value push write: state="11" carrying $00378004
+					static int ptorn = 0, torn_n = 0;
+					int torn = (e.st == 3 && e.dwt == 0x00378004u);
+					if (torn && !ptorn && torn_n < 4) {
+						fprintf(stderr, "[PCRING] TORN-PUSH t=%llu F%d ma=%08X\n",
+						        (unsigned long long)main_time, video.count_frame, e.ma);
+						dump_ring("TORNPUSH", 128); torn_n++;
+					}
+					ptorn = torn;
+					// healthy-sibling push one-liners ($00378006) for contrast
+					static int pok = 0, ok_n = 0;
+					int okp = (e.st == 3 && e.dwt == 0x00378006u);
+					if (okp && !pok && ok_n < 8) {
+						fprintf(stderr, "[PCRING] OK-PUSH t=%llu F%d ma=%08X\n",
+						        (unsigned long long)main_time, video.count_frame, e.ma);
+						ok_n++;
+					}
+					pok = okp;
+					// writepc falling edges at the jsr site: the final sample moments
+					static int pwpc = 0, site_n = 0;
+					if (!e.wpc && pwpc && e.pc >= 0x377FF0u && e.pc <= 0x378010u && site_n < 100) {
+						fprintf(stderr, "[PCRING] SITE-SAMPLE-END t=%llu F%d pc=%08X dwt=%08X busy=%u lw=%u st=%u\n",
+						        (unsigned long long)main_time, video.count_frame, e.pc, e.dwt, e.busy, e.lw, e.st);
+						site_n++;
+					}
+					pwpc = e.wpc;
+				}
+			}
+			#undef KB
+
+			// [SR] VIA6522 shift-register + Egret handshake trace. The $A4A18C packet
+			// loop never completes in our core (MAME: 14 iters & exits). Watch whether
+			// the SR transfers bytes (bit_cnt 7->0, IFR[2] fires) and whether the Egret
+			// ever DEASSERTS TREQ (port_b_i bit3). Gated to the post-chime window and
+			// deduped by a composite key so we see edge transitions, not every clk.
+			if (video.count_frame >= 113 && !*bus.ioctl_download) {
+				// [SRBYTE] log each COMPLETED SR byte (serial_event / shift_active 1->0)
+				// with direction (ACR shift-out=$1C vs shift-in=$0C) — the CPU<->Egret
+				// byte stream. MAME exchanges a fixed 14-iteration packet; ours loops
+				// because the Egret returns wrong response bytes. Diff this vs a MAME
+				// lua tap on the VIA SR reg ($F01400) to find the first divergent byte.
+				// [SRBIT] bit-level CB1/CB2/bit_cnt at the FIRST shift-in turnaround
+				// (frame 117 only). Shows whether the VIA samples an idle CB2=1 bit
+				// before the Egret drives valid data (the FF first byte).
+				// [SRTRN] enriched bit-level turnaround capture: spans the last OUT byte
+				// through the first IN bytes. Logs CB1/CB2 as seen by the VIA AND the
+				// Egret's raw CB2 data + output-enable (pb_out[5]/pb_ddr[5]) so we can tell
+				// whether the leading idle byte is (a) the Egret not yet driving CB2 (oe=0,
+				// VIA reads the default 1) or (b) the Egret driving idle data (oe=1, cb2=1).
+				// Also tracks the Egret's CB1 drive (pb_out[4]/pb_ddr[4]).
+				if (video.count_frame >= 114 && video.count_frame <= 121) {
+					static uint32_t trn_key = 0xFFFFFFFF; static int trn_logs = 0;
+					uint32_t cb1b = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_clock;
+					uint32_t cb2v = 0; // cb2_i optimized away by this Verilator (input, no standalone storage); [SRTRN] VIA-SR debug trace only
+					uint32_t bcb  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__bit_cnt;
+					uint32_t acb  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__acr;
+					uint32_t scb  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_active;
+					uint32_t srb  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_reg;
+					uint32_t pbo  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__egret_inst__DOT__pb_out;
+					uint32_t pbd  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__egret_inst__DOT__pb_ddr;
+					uint32_t ecb2=(pbo>>5)&1, ecb2oe=(pbd>>5)&1, ecb1=(pbo>>4)&1, ecb1oe=(pbd>>4)&1;
+					uint32_t hpc  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__egret_inst__DOT__last_pc;
+					bool srmode = (acb & 0x10) || (((acb>>2)&7)==3);  // any SR/ext mode
+					uint32_t bk = cb1b|(cb2v<<1)|(bcb<<2)|(scb<<6)|(ecb2<<7)|(ecb2oe<<8)|((acb&0x1C)<<9);
+					if (srmode && bk != trn_key && trn_logs < 400) {
+						DLOG("[SRTRN] F%d cb1=%u cb2via=%u|egr cb2=%u oe=%u cb1=%u oe=%u|bcnt=%u act=%u dir=%s ACR=%02X SReg=%02X hc05=%04X 68k=%06X\n",
+							video.count_frame, cb1b, cb2v, ecb2, ecb2oe, ecb1, ecb1oe,
+							bcb, scb, ((acb>>2)&7)==7?"OUT":(((acb>>2)&7)==3?"IN ":"?"),
+							acb, srb, hpc, VERTOPINTERN->debug_pc & 0xFFFFFF);
+						trn_key = bk; trn_logs++;
+					}
+					// [DDRT] Egret DDRB (pb_ddr) changes — when does CB2 bit5 flip input<->output
+					// relative to the SR byte boundaries? Logs the HC05 PC driving the flip.
+					static uint32_t ddr_prev = 0xFFFFFFFF; static int ddr_logs = 0;
+					if (pbd != ddr_prev && ddr_logs < 60) {
+						DLOG("[DDRT] F%d DDRB %02X->%02X (cb2oe=%u cb1oe=%u) pb_out=%02X SR(act=%u bcnt=%u dir=%s) hc05=%04X 68k=%06X\n",
+							video.count_frame, ddr_prev==0xFFFFFFFF?pbd:ddr_prev, pbd, (pbd>>5)&1, (pbd>>4)&1, pbo,
+							scb, bcb, ((acb>>2)&7)==7?"OUT":(((acb>>2)&7)==3?"IN ":"?"), hpc, VERTOPINTERN->debug_pc & 0xFFFFFF);
+						ddr_logs++;
+					}
+					ddr_prev = pbd;
+				}
+
+				static uint32_t prev_act = 0; static int byteseq = 0;
+				uint32_t sact = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_active;
+				if (prev_act == 1 && sact == 0 && byteseq < 200) {  // shift just completed
+					uint32_t sreg = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_reg;
+					uint32_t acrv = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__acr;
+					uint32_t pbi  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via_pb_i;
+					DLOG("[SRBYTE] #%d F%d %s SReg=%02X PB=%02X(TREQ=%u BYTEACK=%u TIP=%u) pc=%06X\n",
+						byteseq, video.count_frame,
+						((acrv>>2)&7)==7 ? "OUT->Egret" : (((acrv>>2)&7)==3 ? "IN <-Egret" : "??"),
+						sreg, pbi, (pbi>>3)&1, (pbi>>4)&1, (pbi>>5)&1,
+						VERTOPINTERN->debug_pc & 0xFFFFFF);
+					byteseq++;
+				}
+				prev_act = sact;
+				// [HC5] one-shot HC05 instruction trace (PC + accumulator A/X) for the
+				// FIRST cmd-07 transaction at F117: shows the exact bytes the HC05 sends
+				// (regA at the $15C9 send-routine entry) and the path computing byte 5.
+				{
+					static bool hc5_armed=false; static int hc5_n=0; static uint32_t hc5_prev=0xFFFFFFFF;
+					uint32_t hpc=(uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__egret_inst__DOT__last_pc;
+					if (video.count_frame==117 && !hc5_armed && hpc==0x12C2) hc5_armed=true;
+					if (hc5_armed && hc5_n<2000 && hpc!=hc5_prev) {
+						uint32_t ra=(uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__egret_inst__DOT__u_cpu__DOT__regA;
+						uint32_t rx=(uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__egret_inst__DOT__u_cpu__DOT__regX;
+						DLOG("[HC5] pc=%04X A=%02X X=%02X\n", hpc, ra, rx);
+						hc5_prev=hpc; hc5_n++;
+					}
 				}
 			}
 
@@ -463,7 +953,7 @@ int verilate() {
 							int words = len / 2;
 							cpu_trace_count++;
 							console.AddLog("[F%d] %08X: %04X  %s  @%06X", e.frame, e.pc, e.word, disasm, e.data_addr);
-							if (cpu_trace_file) {
+							if (cpu_trace_file && e.frame >= trace_from_frame && e.frame <= trace_to_frame) {
 								if (e.frame != cpu_trace_last_frame) {
 									fprintf(cpu_trace_file, "--- frame %d ---\n", e.frame);
 									cpu_trace_last_frame = e.frame;
@@ -491,7 +981,7 @@ int verilate() {
 						if (words > FETCH_BUF_SIZE) words = FETCH_BUF_SIZE;
 						cpu_trace_count++;
 						console.AddLog("[F%d] %08X: %04X  %s  @%06X", e.frame, e.pc, e.word, disasm, e.data_addr);
-						if (cpu_trace_file) {
+						if (cpu_trace_file && e.frame >= trace_from_frame && e.frame <= trace_to_frame) {
 							if (e.frame != cpu_trace_last_frame) {
 								fprintf(cpu_trace_file, "--- frame %d ---\n", e.frame);
 								cpu_trace_last_frame = e.frame;
@@ -608,6 +1098,20 @@ int verilate() {
 					uint32_t colour = 0xFF000000 | VERTOPINTERN->VGA_B << 16 | VERTOPINTERN->VGA_G << 8 | VERTOPINTERN->VGA_R;
 					video.Clock(VERTOPINTERN->VGA_HB, VERTOPINTERN->VGA_VB, VERTOPINTERN->VGA_HS, VERTOPINTERN->VGA_VS, colour);
 				}
+				// [RAWVID] un-CE-gated colour range at the top-level pins: every
+				// rising edge, active area only. Distinguishes "module output is
+				// uniform" from "CE_PIXEL sampling misses the colours".
+				if (clk_sys.IsRising()) {
+					static uint8_t rmin = 0xFF, rmax = 0; static uint64_t rawn = 0;
+					if (!VERTOPINTERN->VGA_HB && !VERTOPINTERN->VGA_VB) {
+						uint8_t r = VERTOPINTERN->VGA_R;
+						if (r < rmin) rmin = r; if (r > rmax) rmax = r;
+					}
+					if ((++rawn % 5000000) == 0) {
+						fprintf(stderr, "[RAWVID] n=%llu rmin=%02X rmax=%02X\n", (unsigned long long)rawn, rmin, rmax);
+						rmin = 0xFF; rmax = 0;
+					}
+				}
 		
 				if (clk_sys.IsRising()) {
 					// Serial terminal: tick soft UART and drive SCC RX
@@ -699,6 +1203,9 @@ void show_help() {
 	printf("  --screenshot <frames>         Take screenshots at specified frame numbers\n");
 	printf("                                (comma-separated list, e.g., 100,200,300)\n");
 	printf("  --stop-at-frame <frame>       Exit simulation after specified frame\n");
+	printf("  --rom <path>                  Boot ROM (default ../releases/boot0.rom)\n");
+	printf("                                e.g. --rom ../releases/boot0-nomemcheck.rom\n");
+	printf("  --heartbeat                   Print the 68k PC once per frame (progress on long runs)\n");
 	printf("  -v, --verbose                 Enable verbose bring-up diagnostics\n");
 	printf("                                (overlay/FC/march/RAMCFG/bus/CPU-trace spam)\n");
 	printf("\n");
@@ -810,6 +1317,14 @@ int main(int argc, char** argv, char** env) {
 		} else if (strcmp(argv[i], "--no-cpu-trace") == 0) {
 			cpu_trace_disabled = true;
 			printf("Per-instruction CPU trace disabled (cpu_trace.log will not be written)\n");
+		} else if (strcmp(argv[i], "--trace-frames") == 0 && i + 1 < argc) {
+			// "A,B" — only write trace lines for frames in [A,B]
+			std::string s = argv[++i];
+			size_t comma = s.find(',');
+			trace_from_frame = std::stoi(s.substr(0, comma));
+			trace_to_frame = (comma == std::string::npos) ? trace_from_frame
+			                                              : std::stoi(s.substr(comma + 1));
+			printf("CPU trace restricted to frames [%d,%d]\n", trace_from_frame, trace_to_frame);
 		} else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
 			verbose_diag = true;
 			printf("Verbose bring-up diagnostics enabled\n");
@@ -821,6 +1336,10 @@ int main(int argc, char** argv, char** env) {
 			floppy_disk_files[0] = argv[++i]; // primary floppy (.dsk) -> SDRAM download
 		} else if (strcmp(argv[i], "--floppy1") == 0 && i + 1 < argc) {
 			floppy_disk_files[1] = argv[++i]; // secondary floppy
+		} else if (strcmp(argv[i], "--rom") == 0 && i + 1 < argc) {
+			rom_file_override = argv[++i];    // boot ROM path (default ../releases/boot0.rom)
+		} else if (strcmp(argv[i], "--heartbeat") == 0) {
+			pc_heartbeat = true;              // once-per-frame 68k PC print
 		}
 	}
 
@@ -829,16 +1348,16 @@ int main(int argc, char** argv, char** env) {
 	Verilated::commandArgs(argc, argv);
 	Verilated::traceEverOn(true);
 
-	// Attach bus - using 16-bit ioctl_dout for MacLC
+	// Attach bus - using 16-bit ioctl_dout for MacLCii
 	bus.ioctl_addr = &VERTOPINTERN->ioctl_addr;
 	bus.ioctl_index = &VERTOPINTERN->ioctl_index;
 	bus.ioctl_wait = &VERTOPINTERN->ioctl_wait;
 	bus.ioctl_download = &VERTOPINTERN->ioctl_download;
 	bus.ioctl_wr = &VERTOPINTERN->ioctl_wr;
-	bus.ioctl_dout = &VERTOPINTERN->ioctl_dout;  // 16-bit for MacLC
+	bus.ioctl_dout = &VERTOPINTERN->ioctl_dout;  // 16-bit for MacLCii
 	input.ps2_key = &VERTOPINTERN->ps2_key;
 
-	// Hookup block device for SCSI (2 devices for MacLC)
+	// Hookup block device for SCSI (2 devices for MacLCii)
 	blockdevice.sd_lba[0] = &VERTOPINTERN->sd_lba[0];
 	blockdevice.sd_lba[1] = &VERTOPINTERN->sd_lba[1];
 	blockdevice.sd_rd = &VERTOPINTERN->sd_rd;
@@ -859,7 +1378,7 @@ int main(int argc, char** argv, char** env) {
 	}
 
 #ifndef DISABLE_AUDIO
-	audio.Initialise();
+	if (!headless) audio.Initialise();
 #endif
 
 	// Set up input module
@@ -894,8 +1413,16 @@ int main(int argc, char** argv, char** env) {
 	input.SetMapping(input_menu, SDL_SCANCODE_M);
 #endif
 
-	// Setup video output
-	if (video.Initialise(windowTitle) == 1) { return 1; }
+	// Setup video output. Headless: allocate ONLY the pixel buffer that
+	// video.Clock() fills and save_screenshot() reads — no SDL, no ImGui, no
+	// window. (The --headless flag existed but was never wired; it crashed in
+	// ImGui::NewFrame because SDL/ImGui were still initialised uncondition-
+	// ally. Long sim runs must survive WSLg display outages.)
+	if (headless) {
+		output_ptr = (uint32_t*)malloc(video.output_width * video.output_height * 4);
+		if (!output_ptr) { fprintf(stderr, "headless: framebuffer alloc failed\n"); return 1; }
+		fprintf(stderr, "Headless mode: no window; screenshots + stop-at-frame active\n");
+	} else if (video.Initialise(windowTitle) == 1) { return 1; }
 
 	// Open CPU trace file
 	if (cpu_trace_enable) {
@@ -930,13 +1457,15 @@ int main(int argc, char** argv, char** env) {
 		}
 	}
 
-	// Auto-load Mac LC ROM at startup
-	const char* rom_file = "../releases/boot0.rom";
+	// Auto-load Mac LC ROM at startup (--rom <path> overrides the default).
+	const char* rom_file = rom_file_override.empty()
+	                         ? "../releases/boot0.rom"
+	                         : rom_file_override.c_str();
 	bus.QueueDownload(rom_file, 0, 1);  // index 0 for ROM
 	fprintf(stderr, "Machine type: Mac LC, loading ROM: %s\n", rom_file);
 
 	// Floppy images stream into SDRAM via ioctl, same as a HPS mount.
-	// MacLC uses ioctl_index 1 (F1/primary) and 2 (F2/secondary) — see
+	// MacLCii uses ioctl_index 1 (F1/primary) and 2 (F2/secondary) — see
 	// MacLC.sv dio_a decode. (lbmactwo uses 2/3 because index 1 is its NuBus ROM.)
 	for (int disk_index = 0; disk_index < 2; disk_index++) {
 		if (!floppy_disk_files[disk_index].empty()) {
@@ -968,6 +1497,26 @@ int main(int argc, char** argv, char** env) {
 	bool done = false;
 	while (!done)
 	{
+		// Headless fast path: run the sim, honor screenshots + stop-at-frame,
+		// touch nothing SDL/ImGui.
+		if (headless) {
+			bool took_ss = false;
+			if (screenshot_mode) {
+				auto it = std::find(screenshot_frames.begin(), screenshot_frames.end(), video.count_frame);
+				if (it != screenshot_frames.end()) {
+					save_screenshot(video.count_frame);
+					screenshot_frames.erase(it);
+					took_ss = true;
+				}
+			}
+			if (stop_at_frame_enabled && video.count_frame >= stop_at_frame) {
+				printf("Reached stop frame %d%s, exiting...\n", stop_at_frame,
+				       took_ss ? " after taking screenshot" : "");
+				break;
+			}
+			if (run_enable) { for (int step = 0; step < batchSize; step++) { verilate(); } }
+			continue;
+		}
 		sdl_mouse_dx = 0;
 		sdl_mouse_dy = 0;
 		SDL_Event event;
@@ -1202,10 +1751,12 @@ int main(int argc, char** argv, char** env) {
 	// --------------------
 
 #ifndef DISABLE_AUDIO
-	audio.CleanUp();
+	if (!headless) audio.CleanUp();
 #endif
-	video.CleanUp();
-	input.CleanUp();
+	if (!headless) {
+		video.CleanUp();
+		input.CleanUp();
+	}
 
 	return 0;
 }

@@ -1,0 +1,28 @@
+# Line-ending policy (carried from MacLCII_MiSTer, retargeted to MacIIvi).
+#
+# Scoped to EXACT paths for the template-synced sources: sys/ blobs carry a
+# historical mix of committed line endings (LF, CRLF, mixed) inherited from
+# upstream; a broad *.v/*.sv pattern would force-renormalize them and produce
+# huge whole-file diffs against the MacLCII/Template lineage. The pinned paths
+# below are all stored LF, so the pin is churn-free.
+#
+# Effect: these files are treated as text and always stored/checked out with LF,
+# regardless of the editor or OS (immune to core.autocrlf).
+/MacIIvi.sv        text eol=lf
+/sys/sys_top.v     text eol=lf
+/sys/hps_io.sv     text eol=lf
+/sys/osd.v         text eol=lf
+/sys/sys.qip       text eol=lf
+/sys/audio_out.sv  text eol=lf
+/sys/emu_ports.vh  text eol=lf
+
+# Quartus project files. Quartus on Windows rewrites these with CRLF on every
+# compile, which otherwise shows up as a whole-file diff. Pinning to eol=lf
+# makes git normalize the working tree back to LF.
+/MacIIvi.qsf       text eol=lf
+/MacIIvi.qpf       text eol=lf
+/MacIIvi.sdc       text eol=lf
+
+# Shell scripts — must stay LF: the Verilator sim + ghdl conversion run under
+# WSL/Linux, and a CRLF shebang breaks bash. All current .sh blobs are LF.
+*.sh               text eol=lf

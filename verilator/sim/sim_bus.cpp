@@ -23,7 +23,7 @@ CData* ioctl_wait = NULL;
 CData* ioctl_download = NULL;
 CData* ioctl_upload = NULL;
 CData* ioctl_wr = NULL;
-SData* ioctl_dout = NULL;  // 16-bit for MacLC
+SData* ioctl_dout = NULL;  // 16-bit for MacLCii
 SData* ioctl_din = NULL;
 
 std::queue<SimBus_DownloadChunk> downloadQueue;
@@ -82,7 +82,7 @@ void SimBus::BeforeEval()
 				console.AddLog("ioctl_download complete %d", ioctl_next_addr);
 			}
 			if (ioctl_file) {
-				// Read 2 bytes for 16-bit ioctl_dout (MacLC)
+				// Read 2 bytes for 16-bit ioctl_dout (MacLCii)
 				int byte1 = fgetc(ioctl_file);
 				int byte2 = 0;
 				if (feof(ioctl_file) == 0) {

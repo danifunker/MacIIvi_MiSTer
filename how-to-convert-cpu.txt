@@ -1,0 +1,33 @@
+How to regenerate the Verilator CPU (TG68K.C 030_mmu / MC68030)
+==============================================================
+
+The VHDL in rtl/tg68k/ is the source of truth. Quartus compiles it directly via
+rtl/tg68k/TG68K.qip; Verilator compiles the generated TG68KdotC_Kernel.v.
+
+The easy path: just run rtl/tg68k/convert_to_verilog.sh (it does all of the below
+and prints the next step). Manual steps, for reference:
+
+1- Analyse (order matters: Pack -> ALU -> PMMU_030 -> Cache_030 -> Kernel)
+   ghdl -a -fsynopsys -fexplicit TG68K_Pack.vhd
+   ghdl -a -fsynopsys -fexplicit TG68K_ALU.vhd
+   ghdl -a -fsynopsys -fexplicit TG68K_PMMU_030.vhd
+   ghdl -a -fsynopsys -fexplicit TG68K_Cache_030.vhd
+   ghdl -a -fsynopsys -fexplicit TG68KdotC_Kernel.vhd
+
+2- Synthesise the kernel to Verilog. Use the entity DEFAULTS (do NOT pass -g
+   overrides; GHDL 6.0.0 rejects them as "out of bounds"). The output inlines the
+   ALU and PMMU_030 as submodules, so TG68KdotC_Kernel.v is self-contained.
+
+   ghdl synth -fsynopsys -fexplicit --latches \
+       --out=verilog TG68KdotC_Kernel > TG68KdotC_Kernel.v
+
+3- Rebuild the sim:  (cd verilator && make clean && make)
+
+Notes
+-----
+- MC68030 mode is selected with CPU="10". The Mac bus wrapper (tg68k.v) ties off
+  the PMMU table-walker port, so paged MMU translation is disabled (identity /
+  transparent translation only); wire pmmu_walker_* to a memory arbiter to enable
+  full page-table walks (see TG68K.C README "Integration notes").
+- TG68K.vhd (the upstream top-level) is kept in rtl/tg68k/ for reference but is
+  NOT in the build — the Mac core uses the custom tg68k.v wrapper instead.

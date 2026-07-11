@@ -36,13 +36,59 @@ module tg68k (
 	output reg [31:0] addr,
 
 	// Debug outputs
-	output [1:0] busstate
+	output [1:0] busstate,
+	// continue-past first-fault diagnostic taps (-> dbg_probes)
+	output        dbg_make_berr,
+	output [31:0] dbg_berr_frame_pc,
+	output [31:0] dbg_exe_pc,
+	output [15:0] dbg_exe_opcode,
+	output [15:0] dbg_berr_opcode,
+	output [31:0] dbg_tg68_pc,          // LOGICAL prefetch pointer (pre-MMU) -> dbg_probes
+	// PMMU mode-switch mistranslation capture (FPGA, always available):
+	output [31:0] dbg_pmmu_log,         // pmmu_addr_log  (LOGICAL fetch addr = A5/jmp target)
+	output [31:0] dbg_pmmu_phys,        // pmmu_addr_phys (PHYSICAL translated = derail target)
+	// MMU-input forensics at the derail (which input is wrong: TC? CRP? table?):
+	output [31:0] dbg_pmmu_tc_o,        // TC register
+	output [31:0] dbg_pmmu_crp_o,       // CRP_lo (root table base)
+	output [31:0] dbg_pmmu_wda_o,       // last walk descriptor ADDRESS read
+	output [31:0] dbg_pmmu_wdd_o,       // last walk descriptor DATA read
+	output [31:0] dbg_pmmu_st_o,        // {11'b0, walk wstate[4:0], fault_status[15:0]}
+	output        dbg_walk_cycle_o,     // BUILD#10: 1 while the PMMU walker is borrowing the bus
+	// F-line (vector 11) trap capture — System 7.x "bad F-Line instruction" hunt.
+	// Latches the FIRST and most-recent line-1111 trap dispatch since CPU reset.
+	// op = the faulting F-line opcode (fline_opcode_latch when the trap came from
+	// the PMMU ext-word sub-decode, else the live opcode register), ext = the PMMU
+	// extension word (meaningful only when the ctx flag is set), pc = matching
+	// instruction PC. meta = {count[15:0], 7'b0, first_ctx, 7'b0, last_ctx}.
+	output [31:0] dbg_fline_first_pc,
+	output [31:0] dbg_fline_first_op,   // {op[15:0], ext[15:0]}
+	output [31:0] dbg_fline_last_pc,
+	output [31:0] dbg_fline_last_op,    // {op[15:0], ext[15:0]}
+	output [31:0] dbg_fline_meta
 );
 
+	assign dbg_walk_cycle_o = walk_cycle;
+
 wire  [1:0] tg68_busstate;
+
+// ---------------------------------------------------------------------------
+// 68030 on-chip I/D cache enable (TG68K_Cache_030).
+//   0 = run uncached (today's behaviour, every fetch/load hits the Mac bus)
+//   1 = caches live (read-hit bypass + line fill).
+// Kept at 0 until the Phase 5 sim+MAME+FPGA validation. With it 0 the cache
+// subsystem below is in the generate `else` arm (cache_read_hit tied 0), so the
+// bus FSM is provably identical to the uncached design.
+// ---------------------------------------------------------------------------
+localparam USE_68030_CACHE = 1'b0;
+wire        cache_read_hit;     // current CPU access is a cacheable read that HIT the cache
+wire [15:0] cache_kernel_data;  // 16-bit word fed to the kernel on a cache hit (skips the bus)
+
 // Suppress clkena while the walker is borrowing the bus so the (stalled) CPU
-// pipeline does not advance during a page-table walk.
-wire        tg68_clkena = phi1 && (s_state == 7 || tg68_busstate == 2'b01) && !walk_cycle;
+// pipeline does not advance during a page-table walk. On a cache read-hit the
+// access completes with no bus cycle, so clkena pulses immediately (like a
+// busstate=01 no-access cycle) instead of waiting for s_state 7.
+wire        tg68_clkena = phi1 && (s_state == 7 || tg68_busstate == 2'b01 || cache_read_hit)
+                          && !walk_cycle && !fill_active;
 wire [31:0] tg68_addr;
 wire [15:0] tg68_din;
 reg  [15:0] tg68_din_r;
@@ -75,22 +121,86 @@ wire [15:0] tg68_dout_k;               // kernel data_write, muxed with walker w
 // hold logic below to release the held berr the instant the kernel latches the
 // fault, so the 030 double-bus-fault detector doesn't see the same fault twice.
 wire        kernel_make_berr;
+assign dbg_make_berr = kernel_make_berr;
+wire [31:0] kernel_tg68_pc;             // kernel TG68_PC (logical prefetch ptr), non-sim
+assign dbg_tg68_pc   = kernel_tg68_pc;  // -> dbg_probes (works in FPGA build; dbg_pc is sim-only)
 wire        kernel_trap_berr;
+
+// F-line trap capture taps (always connected; consumed by the latch block below)
+wire        k_trap_1111, k_trapmake, k_fline_ctx;
+wire [15:0] k_opcode, k_fline_op_latch, k_pmmu_brief;
+wire [31:0] k_fline_op_pc;
+
+`ifdef A30_TRACE
+// --- A30 alias-bit divergence probe (LC II post-MMU; sim-only) ---
+wire [31:0] dbg_pc = kernel_tg68_pc;   // alias (kernel TG68_PC now lands on kernel_tg68_pc)
+wire [31:0] dbg_reg_qa, dbg_memaddr_reg, dbg_memaddr_delta, dbg_data_read;
+wire [31:0] dbg_rf_wdata, dbg_a2, dbg_a5, dbg_a7;
+wire        dbg_directPC, dbg_rf_we;
+wire  [3:0] dbg_rf_waddr;
+wire  [7:0] dbg_ustate;
+wire        dbg_use_base;
+wire  [1:0] dbg_setstate, dbg_state;
+wire        dbg_pmmu_busy;        // kernel pmmu_busy (the bsr.w-hold gate)
+wire [31:0] dbg_memaddr_drega;    // memaddr_delta_rega (held by the bsr.w fix)
+// move.b decode-sequence probes: find where the absolute-EA (ld_nn / set_addrlong)
+// transition is lost when the instruction fetch stalls on a PMMU walk.
+wire  [7:0] dbg_next_ustate;      // next_micro_state
+wire [15:0] dbg_last_opc;
+wire [15:0] dbg_opcode = k_opcode;  // kernel opcode now tapped unconditionally (F-line capture)
+wire        dbg_set_addrlong, dbg_decodeOPC, dbg_get_2ndopc, dbg_clkena_lw;
+`endif
+
+// PMMU debug taps made UNCONDITIONAL (2026-06-23) for the FPGA mistranslation capture.
+// Expose the PMMU's per-walk logical address + live CRP-aptr/TC + walk state so the
+// PMMU REQ trace shows whether a wrong root index comes from a bad logical address
+// (debug_pmmu_saved_addr) or a bad loaded CRP (debug_pmmu_crp_lo).
+wire [31:0] dbg_pmmu_saddr, dbg_pmmu_crplo, dbg_pmmu_tc;
+wire  [4:0] dbg_pmmu_wstate;
+// Fault-source forensics: the MMUSR fault class (sticky = FIRST fault), the raw
+// pmmu_fault edge (catches a SECOND, suppressed fault during exception entry), and
+// the last descriptor addr/data the walker read. Decides desc_valid(I) vs limit(L)
+// vs supervisor(S) vs buserr(B) for the $40A03F18 root[10] early-term fault.
+wire [15:0] dbg_pmmu_fstat;
+wire        dbg_pmmu_fault_o;
+wire [31:0] dbg_pmmu_wddata, dbg_pmmu_wdaddr;
 
 reg         walk_cycle;   // 1 = a walker word transfer is borrowing the bus
 reg         walk_word;    // 0 = high word @addr, 1 = low word @addr+2
 reg  [15:0] walk_hi;      // captured high word (big-endian: bits 31:16)
+// Re-read-until-stable (2026-06-24): the borrowed walk READ is intermittently
+// missed by the SDRAM controller (it samples oe only at its t==STATE_CMD_START
+// clk_8 edge; a phase-misaligned borrowed access falls through to AUTO_REFRESH,
+// leaving `dout` stale = $0000, yet DTACK still fires). Result: the PMMU reads a
+// zero descriptor and derails (10MB boot Sad Mac) / faults+retries (slow boot,
+// build #11 2026-06-24). Fix: re-issue the descriptor READ until two consecutive
+// full-32-bit reads agree (each retry lands at a fresh phase, so a missed access
+// is caught), capped so a genuinely-stable descriptor (incl. a real 0) still
+// completes. READS only — descriptor WRITES (U/M bits) keep single-shot.
+reg  [31:0] walk_desc;    // full descriptor captured this read pass
+reg  [31:0] walk_prev;    // previous read pass (for the stable-compare)
+reg  [2:0]  walk_tries;   // read passes so far (0 = first; compare needs >=1)
+localparam [2:0] WALK_MAX_TRIES = 3'd6;
 
 wire [31:0] walk_word_addr = walk_word ? (pmmu_walker_addr | 32'd2) : (pmmu_walker_addr & ~32'd2);
 wire [15:0] walk_dout_word = walk_word ? pmmu_walker_wdat[15:0]     : pmmu_walker_wdat[31:16];
 
-// Effective bus controls: the walker drives the (otherwise parked) main bus
-// during a walk; outside a walk these are exactly the kernel's signals.
-wire [1:0]  eff_busstate = walk_cycle ? (pmmu_walker_we ? 2'b11 : 2'b10) : tg68_busstate;
-wire        eff_rw       = walk_cycle ? ~pmmu_walker_we : tg68_rw;
-wire        eff_uds_n    = walk_cycle ? 1'b0 : tg68_uds_n;
-wire        eff_lds_n    = walk_cycle ? 1'b0 : tg68_lds_n;
-wire [31:0] eff_addr     = walk_cycle ? walk_word_addr : tg68_addr;
+// 68030 cache line-fill bus master (Phase 3). On a cacheable read miss the CPU
+// stalls and the fill engine reads the 16-byte line (8 x 16-bit words) at the
+// line-aligned physical address, then hands it to the cache (i/d_fill_valid).
+// Like the PMMU walker it borrows the Mac bus via the eff_* overrides below.
+// All of these are tied 0 when USE_68030_CACHE=0 (no_cache arm), so eff_*,
+// clkena and the s_state FSM reduce exactly to the uncached design.
+wire        fill_active;     // 1 = fill engine is reading a line on the (parked) bus
+wire [31:0] fill_bus_addr;   // current 16-bit read address during a fill
+
+// Effective bus controls: the walker (highest priority) or the fill engine drive
+// the (otherwise CPU-owned) main bus; outside both these are the kernel's signals.
+wire [1:0]  eff_busstate = walk_cycle ? (pmmu_walker_we ? 2'b11 : 2'b10) : (fill_active ? 2'b10 : tg68_busstate);
+wire        eff_rw       = walk_cycle ? ~pmmu_walker_we : (fill_active ? 1'b1  : tg68_rw);
+wire        eff_uds_n    = walk_cycle ? 1'b0 : (fill_active ? 1'b0 : tg68_uds_n);
+wire        eff_lds_n    = walk_cycle ? 1'b0 : (fill_active ? 1'b0 : tg68_lds_n);
+wire [31:0] eff_addr     = walk_cycle ? walk_word_addr : (fill_active ? fill_bus_addr : tg68_addr);
 
 // The tg68k core doesn't reliably support mixed usage of autovector and non-autovector
 // interrupts, so the TG68K kernel switched to non-autovector interrupts, and the 
@@ -138,6 +248,10 @@ always @(posedge clk) begin
 			if (s_state != 4 && s_state != 3'd0) s_state <= s_state + 1'd1;
 			if (busreq_ack || bus_granted) s_state <= s_state;
 			if (eff_busstate == 2'b01) s_state <= 0;
+			// Cache read-hit: no external bus cycle — hold s_state at 0 (exactly
+			// like a busstate=01 no-access cycle); clkena pulses this phi1 and the
+			// cache supplies the data via the kernel data_in mux below.
+			if (cache_read_hit) s_state <= 0;
 
 			case (s_state)
 				1: if (eff_busstate != 2'b01) begin
@@ -164,13 +278,14 @@ always @(posedge clk) begin
 				s_state <= s_state + 1'd1;
 			if ((busreq_ack || bus_granted) && !busrel_ack) s_state <= s_state;
 			if (eff_busstate == 2'b01) s_state <= 0;
+			if (cache_read_hit) s_state <= 0;   // cache read-hit: no bus cycle (see phi1 branch)
 
 			case (s_state)
 
 				6: begin
-					// During a walk the descriptor word is captured by the walker
-					// FSM (from din); don't clobber the CPU's data_in latch.
-					if (!walk_cycle) tg68_din_r <= tg68_din;
+					// During a walk or a cache line-fill the read word is captured by
+					// that engine's own FSM (from din); don't clobber the CPU data latch.
+					if (!walk_cycle && !fill_active) tg68_din_r <= tg68_din;
 					uds_n_r <= 1;
 					lds_n_r <= 1;
 					as_n_r <= 1;
@@ -288,11 +403,34 @@ end
 	end
 	wire berr_held = (berr | berr_hold) & ~(kernel_make_berr | kernel_trap_berr);
 
+	// 68030 cache-control taps from the kernel. These kernel outputs were
+	// previously left unconnected; they feed the cache subsystem in the generate
+	// block below. When USE_68030_CACHE=0 the cache is not elaborated and these
+	// are simply unused nets (the kernel itself is unaffected by being tapped).
+	wire [31:0] cache_addr_log;     // pmmu_addr_log  (logical  -> cache index/tag)
+	wire [31:0] cache_addr_phys;    // pmmu_addr_phys (physical -> cacheable decode + line fill)
+	wire        cache_inhibit_pmmu; // pmmu_cache_inhibit
+	wire        cacr_ie, cacr_de, cacr_ifreeze, cacr_dfreeze, cacr_wa;
+	// PMMU logical/physical taps out to the JTAG probe deck (mode-switch capture)
+	assign      dbg_pmmu_log  = cache_addr_log;
+	assign      dbg_pmmu_phys = cache_addr_phys;
+	assign      dbg_pmmu_tc_o  = dbg_pmmu_tc;
+	assign      dbg_pmmu_crp_o = dbg_pmmu_crplo;
+	assign      dbg_pmmu_wda_o = dbg_pmmu_wdaddr;
+	assign      dbg_pmmu_wdd_o = dbg_pmmu_wddata;
+	assign      dbg_pmmu_st_o  = {11'b0, dbg_pmmu_wstate, dbg_pmmu_fstat};
+	wire        cache_inv_req;
+	wire [1:0]  cache_op_scope, cache_op_cache;
+	wire [31:0] cache_op_addr;
+
 	TG68KdotC_Kernel tg68k (
 		.clk            ( clk           ),
 		.nReset         ( ~reset        ),
 		.clkena_in      ( tg68_clkena   ),
-		.data_in        ( tg68_din_r    ),
+		// On a cache read-hit the kernel takes data straight from the cache
+		// (no bus cycle ran, so tg68_din_r is stale); otherwise the latched
+		// bus word. cache_read_hit is constant 0 when USE_68030_CACHE=0.
+		.data_in        ( cache_read_hit ? cache_kernel_data : tg68_din_r ),
 		.IPL            ( ipl           ),
 		.IPL_autovector ( 1'b0          ),
 		.berr           ( berr_held     ),
@@ -321,13 +459,340 @@ end
 		// Bus-error status used by the berr-hold release logic above (prevents a
 		// spurious 030 double bus fault on the ROM's FC=7 MOVES probe).
 		.debug_make_berr ( kernel_make_berr ),
-		.debug_trap_berr ( kernel_trap_berr )
+		.debug_trap_berr ( kernel_trap_berr ),
 
-		// All other new 030 ports (skipFetch, regin_out, CACR_out, VBR_out,
-		// cache_*/cacr_*, pmmu_reg_*/pmmu_addr_*, cache_op_addr and the debug_*
-		// bus) are outputs left intentionally unconnected. The on-chip caches
-		// (TG68K_Cache_030) are not instantiated; the kernel runs uncached.
+		// 68030 cache control + PMMU address taps (consumed by the cache below).
+		.pmmu_addr_log      ( cache_addr_log     ),
+		.pmmu_addr_phys     ( cache_addr_phys    ),
+		.pmmu_cache_inhibit ( cache_inhibit_pmmu ),
+		.cacr_ie            ( cacr_ie            ),
+		.cacr_de            ( cacr_de            ),
+		.cacr_ifreeze       ( cacr_ifreeze       ),
+		.cacr_dfreeze       ( cacr_dfreeze       ),
+		.cacr_wa            ( cacr_wa            ),
+		.cache_inv_req      ( cache_inv_req      ),
+		.cache_op_scope     ( cache_op_scope     ),
+		.cache_op_cache     ( cache_op_cache     ),
+		.cache_op_addr      ( cache_op_addr      ),
+		// continue-past diagnostic taps (always connected)
+		.debug_berr_frame_pc ( dbg_berr_frame_pc ),
+		.debug_exe_PC        ( dbg_exe_pc         ),
+		.debug_exe_opcode    ( dbg_exe_opcode     ),
+		.debug_berr_opcode   ( dbg_berr_opcode    ),
+
+		// F-line trap capture taps (always connected; latch block below)
+		.debug_trap_1111           ( k_trap_1111     ),
+		.debug_trapmake            ( k_trapmake      ),
+		.debug_opcode              ( k_opcode        ),
+		.debug_pmmu_brief          ( k_pmmu_brief    ),
+		.debug_fline_context_valid ( k_fline_ctx     ),
+		.debug_fline_opcode_latch  ( k_fline_op_latch ),
+		.debug_fline_opcode_pc     ( k_fline_op_pc   )
+
+`ifdef A30_TRACE
+		// --- A30 alias-bit divergence probe (LC II post-MMU; sim-only) ---
+		,
+		.debug_TG68_PC       ( kernel_tg68_pc ),
+		.debug_reg_QA        ( dbg_reg_qa    ),
+		.debug_memaddr_reg   ( dbg_memaddr_reg ),
+		.debug_memaddr_delta ( dbg_memaddr_delta ),
+		.debug_data_read     ( dbg_data_read ),
+		.debug_exec_directPC ( dbg_directPC  ),
+		.debug_regfile_we    ( dbg_rf_we     ),
+		.debug_regfile_waddr ( dbg_rf_waddr  ),
+		.debug_regfile_wdata ( dbg_rf_wdata  ),
+		.debug_regfile_a2    ( dbg_a2        ),
+		.debug_regfile_a5    ( dbg_a5        ),
+		.debug_regfile_a7    ( dbg_a7        ),
+		.debug_micro_state   ( dbg_ustate    ),
+		.debug_use_base      ( dbg_use_base  ),
+		.debug_setstate      ( dbg_setstate  ),
+		.debug_state         ( dbg_state     ),
+		.debug_pmmu_busy     ( dbg_pmmu_busy ),
+		.debug_memaddr_delta_rega ( dbg_memaddr_drega ),
+		.debug_next_micro_state ( dbg_next_ustate ),
+		.debug_last_opc_read ( dbg_last_opc    ),
+		.debug_set_addrlong  ( dbg_set_addrlong ),
+		.debug_decodeOPC     ( dbg_decodeOPC   ),
+		.debug_get_2ndopc    ( dbg_get_2ndopc  ),
+		.debug_clkena_lw     ( dbg_clkena_lw   )
+`endif
+		// PMMU debug connections UNCONDITIONAL (2026-06-23) for FPGA capture
+		,
+		.debug_pmmu_saved_addr ( dbg_pmmu_saddr  ),
+		.debug_pmmu_crp_lo     ( dbg_pmmu_crplo  ),
+		.debug_pmmu_tc         ( dbg_pmmu_tc     ),
+		.debug_pmmu_wstate     ( dbg_pmmu_wstate ),
+		.debug_pmmu_fault_status ( dbg_pmmu_fstat ),
+		.debug_pmmu_fault        ( dbg_pmmu_fault_o ),
+		.debug_pmmu_walk_desc_addr ( dbg_pmmu_wdaddr ),
+		.debug_pmmu_walk_desc_data ( dbg_pmmu_wddata )
+
+		// Cache control + PMMU address taps are connected above. The remaining
+		// new-030 outputs (skipFetch, regin_out, CACR_out, VBR_out, cacr_ibe/dbe,
+		// pmmu_reg_*) are left unconnected. The on-chip caches are instantiated in
+		// the generate block below, only when USE_68030_CACHE=1.
 	);
+
+	// =======================================================================
+	// F-line (vector 11) trap capture — System 7.x "bad F-Line instruction"
+	// hunt. trap_1111+trapmake assert combinationally through the whole trap
+	// microcode of one instruction, so a rising-edge detect counts each
+	// dispatch exactly once. When the trap comes from the PMMU ext-word
+	// sub-decode (pmove_decode), fline_context_valid=1 and the latched
+	// fline_opcode_latch/fline_opcode_pc identify the instruction (the live
+	// opcode register may already hold prefetched data there); otherwise the
+	// live opcode/exe_pc are the faulting instruction.
+	// =======================================================================
+	wire [15:0] fline_ev_op = k_fline_ctx ? k_fline_op_latch : k_opcode;
+	wire [31:0] fline_ev_pc = k_fline_ctx ? k_fline_op_pc    : dbg_exe_pc;
+	wire        fline_ev    = k_trap_1111 && k_trapmake;
+	reg  [31:0] fline_first_pc = 32'd0, fline_last_pc = 32'd0;
+	reg  [31:0] fline_first_op = 32'd0, fline_last_op = 32'd0;
+	reg  [15:0] fline_cnt = 16'd0;
+	reg         fline_first_ctx = 1'b0, fline_last_ctx = 1'b0, fline_ev_d = 1'b0;
+	always @(posedge clk) begin
+		if (reset) begin
+			fline_cnt      <= 16'd0;  fline_ev_d     <= 1'b0;
+			fline_first_pc <= 32'd0;  fline_first_op <= 32'd0;  fline_first_ctx <= 1'b0;
+			fline_last_pc  <= 32'd0;  fline_last_op  <= 32'd0;  fline_last_ctx  <= 1'b0;
+		end else begin
+			fline_ev_d <= fline_ev;
+			if (fline_ev && !fline_ev_d) begin
+				if (fline_cnt == 16'd0) begin
+					fline_first_pc  <= fline_ev_pc;
+					fline_first_op  <= {fline_ev_op, k_pmmu_brief};
+					fline_first_ctx <= k_fline_ctx;
+				end
+				fline_last_pc  <= fline_ev_pc;
+				fline_last_op  <= {fline_ev_op, k_pmmu_brief};
+				fline_last_ctx <= k_fline_ctx;
+				if (fline_cnt != 16'hFFFF) fline_cnt <= fline_cnt + 16'd1;
+`ifdef SIMULATION
+				$display("FLINE[%0d]: op=%04x ext=%04x pc=%08x ctx=%b t=%0t",
+				         fline_cnt, fline_ev_op, k_pmmu_brief, fline_ev_pc, k_fline_ctx, $time);
+`endif
+			end
+		end
+	end
+	assign dbg_fline_first_pc = fline_first_pc;
+	assign dbg_fline_first_op = fline_first_op;
+	assign dbg_fline_last_pc  = fline_last_pc;
+	assign dbg_fline_last_op  = fline_last_op;
+	assign dbg_fline_meta     = {fline_cnt, 7'b0, fline_first_ctx, 7'b0, fline_last_ctx};
+
+	// =======================================================================
+	// 68030 on-chip Instruction + Data cache (TG68K_Cache_030)
+	//
+	// Phase 2: controller glue + READ-HIT bypass only. The cache indexes by the
+	// kernel's logical address (cache_addr_log) qualified by FC, allocation-gated
+	// to cacheable physical regions. On a read that hits a present line we hand
+	// the word straight to the kernel: cache_read_hit holds the bus FSM at
+	// s_state 0 and clkena pulses immediately, so NO external/SDRAM cycle runs.
+	// Misses and writes fall through to the normal Mac bus cycle.
+	//
+	// Until the Phase 3 line-fill engine lands, the fill-return inputs are tied
+	// inert, so no line is ever populated -> the cache never reports a hit ->
+	// this block is functionally inert even with USE_68030_CACHE=1.
+	// =======================================================================
+	generate if (USE_68030_CACHE) begin : gen_cache
+
+		wire        is_030      = (cpu == 2'b10);
+		// Phase 3 wires the real PMMU busy/fault here. During a page-table walk
+		// the kernel forces busstate=01, so i_req/d_req are already 0 and a hit
+		// cannot occur mid-walk regardless of this gate.
+		wire        xlate_ready = 1'b1;
+
+		wire i_req = is_030 & cacr_ie & (tg68_busstate == 2'b00) & xlate_ready;
+		wire d_req = is_030 & cacr_de & (tg68_busstate == 2'b10 || tg68_busstate == 2'b11) & xlate_ready;
+		wire d_we  = (tg68_busstate == 2'b11);
+
+		// Cacheable physical regions on the V8 24-bit map (rtl/addrDecoder.v):
+		// RAM $000000-$9FFFFF + ROM $A00000-$AFFFFF. Excludes unmapped $B-$E and
+		// I/O + VRAM ($F). As on the real 030, cache-inhibit (CI) blocks new
+		// ALLOCATION, not hits on already-present lines.
+		wire        phys_cacheable = (cache_addr_phys[23:20] <= 4'hA);
+		wire        fill_inhibit   = cache_inhibit_pmmu | ~phys_cacheable;
+
+		wire [31:0] i_data, d_data_out;
+		wire        i_hit, d_hit;
+		wire        i_fill_req, d_fill_req;     // Phase 3 services these
+		wire [31:0] i_fill_addr, d_fill_addr;   // line-aligned physical fill address
+
+		// ---- Line-fill engine state ----
+		// Services the cache's OWN fill requests (i_fill_req/d_fill_req) during IDLE
+		// bus cycles, like the PMMU walker. The miss is delivered by the normal bus
+		// cycle; the fill only POPULATES the line for future hits, so there is no
+		// hit-wait and the engine can never deadlock.
+		localparam FILL_IDLE = 1'b0, FILL_READ = 1'b1;
+		reg          fill_st;        // FILL_IDLE / FILL_READ
+		reg   [2:0]  fill_word;      // 0..7: which 16-bit word of the line
+		reg          fill_is_i;      // 1 = fill the I-cache, 0 = the D-cache
+		reg  [31:0]  fill_base;      // line-aligned (16-byte) physical base (cache's i/d_fill_addr)
+		reg  [127:0] fill_buf;       // accumulates the 8 read words (word k -> [16k +: 16])
+		reg          i_fill_valid_r, d_fill_valid_r;
+
+		assign       fill_active   = (fill_st == FILL_READ);             // bus-owning read phase
+		assign       fill_bus_addr = {fill_base[31:4], fill_word, 1'b0};  // base + 2*word
+
+		wire [127:0] i_fill_data  = fill_buf;
+		wire [127:0] d_fill_data  = fill_buf;
+		wire         i_fill_valid = i_fill_valid_r;
+		wire         d_fill_valid = d_fill_valid_r;
+
+		// Write-through byte lane into the D-cache (kernel write data + UDS/LDS).
+		// Inert in Phase 2 (no present lines); Phase 4 makes write-through live.
+		reg  [31:0] d_data_in;
+		reg  [3:0]  d_be;
+		always @* begin
+			case (cache_addr_log[1:0])
+				2'b00: begin d_data_in = {16'h0000,   tg68_dout_k};      d_be = {2'b00, ~tg68_uds_n, ~tg68_lds_n}; end
+				2'b01: begin d_data_in = {24'h000000, tg68_dout_k[7:0]}; d_be = {3'b000, ~tg68_lds_n};             end
+				2'b10: begin d_data_in = {tg68_dout_k, 16'h0000};        d_be = {~tg68_uds_n, ~tg68_lds_n, 2'b00}; end
+				2'b11: begin d_data_in = {tg68_dout_k[7:0], 24'h000000}; d_be = {~tg68_uds_n, 3'b000};             end
+			endcase
+		end
+
+		TG68K_Cache_030 cache_inst (
+			.clk             ( clk             ),
+			.nreset          ( ~reset          ),
+			.cacr_ie         ( cacr_ie         ),
+			.cacr_de         ( cacr_de         ),
+			.cacr_ifreeze    ( cacr_ifreeze    ),
+			.cacr_dfreeze    ( cacr_dfreeze    ),
+			.cacr_wa         ( cacr_wa         ),
+			.inv_req         ( cache_inv_req   ),
+			.cache_op_scope  ( cache_op_scope  ),
+			.cache_op_cache  ( cache_op_cache  ),
+			.cache_op_addr   ( cache_op_addr   ),
+
+			.i_addr          ( cache_addr_log  ),
+			.i_addr_phys     ( cache_addr_phys ),
+			.i_fc            ( fc              ),
+			.i_req           ( i_req           ),
+			.i_cache_inhibit ( fill_inhibit    ),
+			.i_data          ( i_data          ),
+			.i_hit           ( i_hit           ),
+			.i_fill_req      ( i_fill_req      ),
+			.i_fill_addr     ( i_fill_addr     ),
+			.i_fill_data     ( i_fill_data     ),
+			.i_fill_valid    ( i_fill_valid    ),
+
+			.d_addr          ( cache_addr_log  ),
+			.d_addr_phys     ( cache_addr_phys ),
+			.d_fc            ( fc              ),
+			.d_req           ( d_req           ),
+			.d_we            ( d_we            ),
+			.d_cache_inhibit ( fill_inhibit    ),
+			.d_data_in       ( d_data_in       ),
+			.d_data_out      ( d_data_out      ),
+			.d_be            ( d_be            ),
+			.d_hit           ( d_hit           ),
+			.d_fill_req      ( d_fill_req      ),
+			.d_fill_addr     ( d_fill_addr     ),
+			.d_fill_data     ( d_fill_data     ),
+			.d_fill_valid    ( d_fill_valid    )
+		);
+
+		// 16-bit data demux from the 32-bit cache word, matched to how
+		// TG68K_Cache_030 stores/serves words (ported from upstream
+		// TG68K_CacheCtrl_030 — the controller paired with this exact cache).
+		reg [15:0] data_out_16;
+		always @* begin
+			case (cache_addr_log[1:0])
+				2'b00: data_out_16 = (tg68_busstate == 2'b00) ? i_data[15:0]  : d_data_out[15:0];
+				2'b10: data_out_16 = (tg68_busstate == 2'b00) ? i_data[31:16] : d_data_out[31:16];
+				2'b01: data_out_16 = {8'h00, d_data_out[15:8]};
+				2'b11: data_out_16 = {8'h00, d_data_out[31:24]};
+			endcase
+		end
+
+		// Read-hit = present I-line on a fetch, or present D-line on a data read
+		// (never a write). Suppressed during a walk and during a fill.
+		assign cache_read_hit    = ~walk_cycle & ~fill_active &
+		                           ((i_hit & i_req) | (d_hit & d_req & ~d_we));
+		assign cache_kernel_data = data_out_16;
+
+		// Line-fill FSM. The cache asserts i_fill_req/d_fill_req (with i/d_fill_addr,
+		// line-aligned physical) on a read miss and holds it until filled. We service
+		// it only when the kernel bus is PARKED (busstate=01, no walk/walker pending) —
+		// the same stable phi1 @ s_state 0 window the walker uses — and borrow the bus
+		// for 8 sequential 16-bit reads, stalling the CPU (clkena gated by fill_active).
+		// Because the cache chose the address+line, our fill data lands in exactly the
+		// line it will hit on; and because the original miss was already delivered by a
+		// normal bus cycle, there is no hit-wait -> no deadlock (worst case = the line
+		// just isn't populated yet, i.e. a future miss).
+		always @(posedge clk) begin
+			if (reset) begin
+				fill_st        <= FILL_IDLE;
+				fill_word      <= 3'd0;
+				fill_is_i      <= 1'b0;
+				fill_base      <= 32'd0;
+				fill_buf       <= 128'd0;
+				i_fill_valid_r <= 1'b0;
+				d_fill_valid_r <= 1'b0;
+			end else begin
+				i_fill_valid_r <= 1'b0;   // single-cycle valid pulses
+				d_fill_valid_r <= 1'b0;
+				case (fill_st)
+					FILL_IDLE:
+						if (phi1 && s_state == 3'd0 && tg68_busstate == 2'b01 &&
+						    !walk_cycle && !pmmu_walker_req && (i_fill_req | d_fill_req)) begin
+							fill_st   <= FILL_READ;
+							fill_word <= 3'd0;
+							fill_is_i <= i_fill_req;                        // I-cache has priority
+							fill_base <= i_fill_req ? i_fill_addr : d_fill_addr;
+						end
+					FILL_READ: begin
+						if (phi2 && s_state == 3'd6)
+							fill_buf[fill_word*16 +: 16] <= din;     // capture line word k
+						if (phi1 && s_state == 3'd7) begin
+							if (fill_word != 3'd7)
+								fill_word <= fill_word + 1'b1;       // next word
+							else begin
+								fill_st <= FILL_IDLE;                 // 16 bytes read -> populate + done
+								if (fill_is_i) i_fill_valid_r <= 1'b1;
+								else           d_fill_valid_r <= 1'b1;
+							end
+						end
+					end
+				endcase
+			end
+		end
+
+`ifdef CACHE_TRACE
+		// Cache fill-FSM probe: every state transition (capped) + a stuck-detector
+		// that fires if the FSM sits out of IDLE too long (the suspected deadlock).
+		reg        ct_fst_d;
+		reg [31:0] ct_busy_cnt, ct_tr_cnt;
+		always @(posedge clk) begin
+			if (reset) begin ct_fst_d <= FILL_IDLE; ct_busy_cnt <= 0; ct_tr_cnt <= 0; end
+			else begin
+				ct_fst_d    <= fill_st;
+				ct_busy_cnt <= (fill_st == FILL_IDLE) ? 32'd0 : (ct_busy_cnt + 1'b1);
+				if (fill_st != ct_fst_d && ct_tr_cnt < 32'd4000) begin
+					ct_tr_cnt <= ct_tr_cnt + 1'b1;
+					$display("CACHE fst %0d->%0d word=%0d is_i=%b ireq=%b dreq=%b ihit=%b dhit=%b crh=%b ifreq=%b dfreq=%b ss=%0d bs=%b alog=%h aphys=%h fi_inh=%b @%0t",
+						ct_fst_d, fill_st, fill_word, fill_is_i, i_req, d_req, i_hit, d_hit,
+						cache_read_hit, i_fill_req, d_fill_req, s_state, tg68_busstate,
+						cache_addr_log, cache_addr_phys, fill_inhibit, $time);
+				end
+				// Deadlock detector: FSM stuck out of IDLE for >2000 cycles.
+				if (ct_busy_cnt == 32'd2000)
+					$display("CACHE *** STUCK *** fst=%0d word=%0d is_i=%b ireq=%b dreq=%b ihit=%b dhit=%b ivld=%b dvld=%b ss=%0d bs=%b alog=%h aphys=%h @%0t",
+						fill_st, fill_word, fill_is_i, i_req, d_req, i_hit, d_hit,
+						i_fill_valid_r, d_fill_valid_r, s_state, tg68_busstate,
+						cache_addr_log, cache_addr_phys, $time);
+			end
+		end
+`endif
+
+	end else begin : no_cache
+		assign cache_read_hit    = 1'b0;
+		assign cache_kernel_data = 16'h0;
+		assign fill_active       = 1'b0;
+		assign fill_bus_addr     = 32'd0;
+	end endgenerate
 
 	// Drive the Mac data bus from the walker during descriptor write-backs,
 	// otherwise from the kernel.
@@ -359,20 +824,37 @@ end
 				    s_state == 3'd0 && tg68_busstate == 2'b01) begin
 					walk_cycle <= 1'b1;
 					walk_word  <= 1'b0;   // high word first
+					walk_tries <= 3'd0;   // re-read pass counter (READs)
 				end
 			end else begin
-				// Capture the read word at the data phase (s_state 6, phi2).
+				// Capture the read word at the data phase (s_state 6, phi2). The low
+				// word completes the 32-bit descriptor into walk_desc (compared below).
 				if (phi2 && s_state == 3'd6) begin
-					if (!walk_word) walk_hi          <= din;
-					else            pmmu_walker_data <= {walk_hi, din};
+					if (!walk_word) walk_hi   <= din;
+					else            walk_desc <= {walk_hi, din};
 				end
 				// Word transfer completes at s_state 7 (phi1).
 				if (phi1 && s_state == 3'd7) begin
 					if (!walk_word) begin
 						walk_word <= 1'b1;        // proceed to low word
+					end else if (pmmu_walker_we) begin
+						// descriptor WRITE: single-shot (no read-back to verify)
+						walk_cycle      <= 1'b0;
+						pmmu_walker_ack <= 1'b1;
+					end else if ((walk_tries != 3'd0 && walk_desc == walk_prev) ||
+					             walk_tries >= WALK_MAX_TRIES) begin
+						// descriptor READ stable (two passes agree) or retry cap hit:
+						// accept it. walk_desc was latched at s_state 6 above.
+						walk_cycle       <= 1'b0;
+						pmmu_walker_data <= walk_desc;
+						pmmu_walker_ack  <= 1'b1;
 					end else begin
-						walk_cycle      <= 1'b0;  // descriptor done
-						pmmu_walker_ack <= 1'b1;  // data already latched at s_state 6
+						// not yet stable: re-issue the read from the high word. Each
+						// retry lands at a fresh SDRAM phase, so a missed (refresh-
+						// shadowed) access is caught on a subsequent pass.
+						walk_prev  <= walk_desc;
+						walk_tries <= walk_tries + 3'd1;
+						walk_word  <= 1'b0;
 					end
 				end
 			end
@@ -393,12 +875,12 @@ end
 	//  * a heartbeat dump of the CPU/walker bus state so a post-pmove(tc) stall
 	//    is visible (the main cpu_trace goes blind once the kernel parks the bus
 	//    in a never-completing walk). Enable with +define+PMMU_TRACE.
-	reg        walk_cycle_d, mberr_d, tberr_d, wreq_d;
+	reg        walk_cycle_d, mberr_d, tberr_d, wreq_d, pfault_d;
 	reg [31:0] dbg_cyc;
 	reg [31:0] dbg_walks;
 	always @(posedge clk) begin
 		if (reset) begin
-			walk_cycle_d <= 0; mberr_d <= 0; tberr_d <= 0; wreq_d <= 0;
+			walk_cycle_d <= 0; mberr_d <= 0; tberr_d <= 0; wreq_d <= 0; pfault_d <= 0;
 			dbg_cyc <= 0; dbg_walks <= 0;
 		end else begin
 			dbg_cyc      <= dbg_cyc + 1'b1;
@@ -407,20 +889,40 @@ end
 			mberr_d      <= kernel_make_berr;
 			tberr_d      <= kernel_trap_berr;
 
-			// walk request edge (kernel asked for a descriptor)
-			if (pmmu_walker_req && !wreq_d && dbg_walks < 32'd400) begin
-				$display("PMMU REQ #%0d addr=%h we=%b (kernel PC~%h) @%0t",
-				         dbg_walks, pmmu_walker_addr, pmmu_walker_we, tg68_addr, $time);
+			// walk request edge (kernel asked for a descriptor) — gated on the
+			// descriptor address being in the top-of-RAM page-table region
+			// ($3F0000-$3FFFFF, where the CRP table $3FE820 lives), NOT on the PC,
+			// so the $0CB2 DATA-access walk (PC=$0CB2) is captured. Determines
+			// walk-vs-stale-ATC for the $0CB2->$fffffff2 mistranslation.
+			if (pmmu_walker_req && !wreq_d && dbg_walks < 32'd4000 &&
+			    pmmu_walker_addr >= 32'h003F0000 && pmmu_walker_addr <= 32'h003FFFFF) begin
+				$display("PMMU REQ #%0d addr=%h we=%b log=%h crp=%h tc=%h ws=%0d (PC~%h) @%0t",
+				         dbg_walks, pmmu_walker_addr, pmmu_walker_we,
+				         dbg_pmmu_saddr, dbg_pmmu_crplo, dbg_pmmu_tc, dbg_pmmu_wstate,
+				         tg68_addr, $time);
 				dbg_walks <= dbg_walks + 1'b1;
 			end
 			// walk completion (ack pulse)
-			if (pmmu_walker_ack && dbg_walks < 32'd400)
-				$display("PMMU ACK  data=%h @%0t", pmmu_walker_data, $time);
+			if (pmmu_walker_ack &&
+			    pmmu_walker_addr >= 32'h003F0000 && pmmu_walker_addr <= 32'h003FFFFF)
+				$display("PMMU ACK  data=%h kpc=%h waddr=%h @%0t", pmmu_walker_data, tg68_addr, pmmu_walker_addr, $time);
 
 			if (kernel_make_berr && !mberr_d)
 				$display("PMMU make_berr  addr=%h s_state=%0d busstate=%b @%0t", tg68_addr, s_state, tg68_busstate, $time);
 			if (kernel_trap_berr && !tberr_d)
 				$display("PMMU trap_berr  addr=%h @%0t", tg68_addr, $time);
+
+			// Raw pmmu_fault rising edge — fires for EVERY walker fault, including a
+			// second one suppressed during exception entry (trap_berr already pending).
+			// fstat = MMUSR class (sticky=FIRST fault): B=bit15 L=14 S=13 W=11 I=10.
+			// saddr = the faulting logical addr (live per-walk); wddata = last desc word.
+			pfault_d <= dbg_pmmu_fault_o;
+			if (dbg_pmmu_fault_o && !pfault_d)
+				$display("PMMU FAULT  saddr=%h fstat=%h (B=%b L=%b S=%b W=%b I=%b) ws=%0d descaddr=%h descdata=%h @%0t",
+				         dbg_pmmu_saddr, dbg_pmmu_fstat,
+				         dbg_pmmu_fstat[15], dbg_pmmu_fstat[14], dbg_pmmu_fstat[13],
+				         dbg_pmmu_fstat[11], dbg_pmmu_fstat[10], dbg_pmmu_wstate,
+				         dbg_pmmu_wdaddr, dbg_pmmu_wddata, $time);
 
 			// heartbeat: periodic bus-state dump (catches a stalled/looping walk)
 			if (dbg_cyc[17:0] == 18'd0)
@@ -430,6 +932,139 @@ end
 		end
 	end
 	`endif
+`ifdef A30_TRACE
+	// --- A30 alias-bit divergence probe (LC II post-MMU; sim-only) ---
+	// Goal: find where the $40 ROM-alias bit (A30) is dropped on the way to the
+	// post-MMU continuation jmp. Logs (sampled on the kernel clkena edge):
+	//  (1) control flow ENTERING the $x0A0xxxx continuation page (PC[27:16]==0x0A0):
+	//      shows the new PC + the EA source register (reg_QA) + memaddr_reg/delta
+	//      so we can see whether the jmp target carried $40 (alias) or $00A (bare).
+	//  (2) every address-register WRITE whose value lands in the $x0Axxxxx region
+	//      (wdata[23:20]==0xA): catches the load that sets A5/A2 to the continuation
+	//      pointer, revealing if bit30 ($40) is present at the moment it is stored.
+	//  (3) any An write of a $40000000-set value (bit31:28==0x4): proof the regfile
+	//      can hold A30 at all, and which register/value.
+	reg [31:0] a30_pc_d;
+	reg [31:0] a30_cyc;
+	always @(posedge clk) begin
+		if (reset) begin
+			a30_pc_d <= 32'hFFFFFFFF;
+			a30_cyc  <= 32'h0;
+		end else if (tg68_clkena) begin
+			a30_cyc <= a30_cyc + 1'b1;
+
+			// (1) entered the $x0A0xxxx continuation page
+			if (dbg_pc[27:16] == 12'h0A0 && a30_pc_d[27:16] != 12'h0A0)
+				$display("A30[ENTER-A0] cyc=%0d PC=%h (was %h) reg_QA=%h memreg=%h memdelta=%h data_read=%h A7=%h directPC=%b @%0t",
+				         a30_cyc, dbg_pc, a30_pc_d, dbg_reg_qa, dbg_memaddr_reg,
+				         dbg_memaddr_delta, dbg_data_read, dbg_a7, dbg_directPC, $time);
+
+			// (1b) every rts/return PC-load (directPC) while executing in the $x0A
+			//      ROM region — shows the popped return value (data_read) + live SP (A7),
+			//      to settle whether the $a00948 rts pops a clobbered/low return.
+			if (dbg_directPC && (dbg_pc[27:20] == 8'h0A))
+				$display("A30[RTS] cyc=%0d pop=%h newPC=%h A7=%h @%0t",
+				         a30_cyc, dbg_data_read, dbg_pc, dbg_a7, $time);
+
+			// Per-cycle micro-state + address-source dump around the failing bsr.w push
+			// ($40A0012C bsr $a00910, ~cyc 12359300-12359325). Shows the exact cycle the
+			// push write fires and which EA it uses (memaddr_reg+delta vs branch target).
+			if (a30_cyc > 32'd12359298 && a30_cyc < 32'd12359330)
+				$display("A30[UST] cyc=%0d ust=%0d pc=%h memreg=%h memdelta=%h use_base=%b setstate=%b state=%b rfwe=%b waddr=%h wdata=%h",
+				         a30_cyc, dbg_ustate, dbg_pc, dbg_memaddr_reg, dbg_memaddr_delta,
+				         dbg_use_base, dbg_setstate, dbg_state, dbg_rf_we, dbg_rf_waddr, dbg_rf_wdata);
+
+			// Per-cycle EA-build dump around the failing `move.b d1,$cb2.w` ($40A03F18,
+			// right after `pmove (8,A0),TC`, ~cyc 12462805-12462825). CONFIRM whether the
+			// bsr.w-fix HOLD (pmmu_busy='1' AND state(1)='1' -> freeze memaddr_delta_rega)
+			// engages during the absolute-short operand fetch, pinning the EA at the PC
+			// instead of letting $0CB2 latch. Logs the hold gate (pmmu_busy + state) and
+			// the held value (memaddr_delta_rega) vs the combined memaddr_delta / addr.
+			if (a30_cyc > 32'd12462795 && a30_cyc < 32'd12462830)
+				$display("A30[MOVB] cyc=%0d ust=%0d nxt=%0d pc=%h opc=%h lopc=%h dec=%b g2=%b addrl=%b clw=%b pbusy=%b ubase=%b ss=%b st=%b drega=%h memdelta=%h addr=%h",
+				         a30_cyc, dbg_ustate, dbg_next_ustate, dbg_pc, dbg_opcode, dbg_last_opc,
+				         dbg_decodeOPC, dbg_get_2ndopc, dbg_set_addrlong, dbg_clkena_lw,
+				         dbg_pmmu_busy, dbg_use_base, dbg_setstate, dbg_state,
+				         dbg_memaddr_drega, dbg_memaddr_delta, addr);
+
+			a30_pc_d <= dbg_pc;
+		end
+	end
+
+	// --- Stack-region ($1FF380-$1FF3FF) bus-cycle logger ---
+	// The failing rts has A7=$1FF3C4 (correct/high) yet pops $0 -> derail. So the
+	// stacked return at $1FF3C4 is wrong. Watch every data read/write to the stack
+	// region: the bsr push should WRITE $40A00130 to $1FF3C4; the rts should READ it
+	// back. If the push writes the wrong value/addr, or the read sees $0, this shows it.
+	always @(posedge clk) begin
+		if (!reset && phi2 && s_state == 3'd6 && !walk_cycle && eff_busstate != 2'b01 &&
+		    // (a) anything aliasing the $1FF3xx stack region (any top nibble), OR
+		    //     (b) ALL data cycles during the continuation window (cyc ~12.359M)
+		    //     so the bsr push is captured wherever its address lands.
+		    (addr[27:8] == 20'h1FF3 ||
+		     (a30_cyc > 32'd12359150 && a30_cyc < 32'd12359650))) begin
+			$display("A30[STK] %s addr=%h data=%h busstate=%b kpc=%h cyc=%0d @%0t",
+			         tg68_rw ? "RD" : "WR", addr,
+			         tg68_rw ? tg68_din : tg68_dout_k, tg68_busstate, tg68_addr, a30_cyc, $time);
+		end
+	end
+
+	// --- $1FF35A dispatch probe (LC II post-MMU, NEXT blocker) ---
+	// After the (now-fixed) bsr.w push, trace the path through the $00A1491E
+	// jump-table dispatcher (jmp ($2,PC,D5.w)) to the $001FF35A wedge. Logs each
+	// instruction boundary in the continuation/dispatcher/stack pages ($x0A0xxxx,
+	// $x0A1xxxx, $xx1FF3xx) + every PC-load (directPC) + EA context (memaddr_reg/
+	// delta/use_base/reg_QA/data_read) + PMMU-walk status (walk_cycle/walker_req).
+	// Answers: is the jmp target (D5/computed EA) right vs MAME ($40A07A5A), and
+	// does the EA/target-fetch stall on a PMMU walk (same address-corruption class)?
+	// Bounded: arms just before the push, stops 1500 cyc after PC first enters $1FF3xx.
+	reg        disp_armed;
+	reg        disp_wedged;
+	reg [15:0] disp_cnt;
+	reg [31:0] disp_pc_d;
+	always @(posedge clk) begin
+		if (reset) begin
+			disp_armed  <= 1'b0;
+			disp_wedged <= 1'b0;
+			disp_cnt    <= 16'd0;
+			disp_pc_d   <= 32'hFFFFFFFF;
+		end else if (tg68_clkena) begin
+			if (a30_cyc > 32'd12359000) disp_armed <= 1'b1;
+			if (disp_armed && (dbg_pc[23:8] == 16'h1FF3 || dbg_pc[31:24] == 8'hFF)) disp_wedged <= 1'b1;
+			if (disp_wedged) disp_cnt <= disp_cnt + 1'b1;
+
+			if (disp_armed && !(disp_wedged && disp_cnt > 16'd1500)) begin
+				if (((dbg_pc[23:16] == 8'hA0 || dbg_pc[23:16] == 8'hA1 ||
+				      dbg_pc[23:8] == 16'h1FF3) && dbg_pc != disp_pc_d)
+				    || dbg_directPC || walk_cycle)
+					$display("A30[DISP] cyc=%0d pc=%h(was %h) dPC=%b ust=%0d memreg=%h memdelta=%h ubase=%b QA=%h dread=%h a2=%h a7=%h ss=%b st=%b walk=%b wreq=%b waddr=%h bs=%b addr=%h",
+					         a30_cyc, dbg_pc, disp_pc_d, dbg_directPC, dbg_ustate,
+					         dbg_memaddr_reg, dbg_memaddr_delta, dbg_use_base, dbg_reg_qa,
+					         dbg_data_read, dbg_a2, dbg_a7, dbg_setstate, dbg_state,
+					         walk_cycle, pmmu_walker_req, pmmu_walker_addr, tg68_busstate, tg68_addr);
+			end
+			disp_pc_d <= dbg_pc;
+		end
+	end
+
+	// --- $0CB0-$0CBF byte-lane watchpoint (LC II post-MMU, $1FF35A wedge root) ---
+	// The A-trap MMU-mode flag $0CB2 is $46 in our core but 0 in MAME, sending us into
+	// a spurious pmove-TC reconfig -> bus error. The setup `move.b #$1,$cb2.w` ($A03E14)
+	// is a BYTE write to an EVEN address; suspect it lands on the wrong byte lane (odd),
+	// leaving $0CB2 stale. Log every bus access to $0CB0-$0CBF with the UDS/LDS lane and
+	// both data bytes, so we can see exactly which lane the byte write/read uses.
+	always @(posedge clk) begin
+		if (!reset && phi2 && s_state == 3'd6 && !walk_cycle && eff_busstate != 2'b01 &&
+		    addr[27:4] == 24'h0000CB) begin
+			$display("A30[CB] %s addr=%h uds=%b lds=%b data=%h(hi=%h lo=%h) bs=%b kpc=%h cyc=%0d",
+			         tg68_rw ? "RD" : "WR", addr, tg68_uds_n, tg68_lds_n,
+			         tg68_rw ? din : tg68_dout_k,
+			         (tg68_rw ? din : tg68_dout_k) >> 8, (tg68_rw ? din : tg68_dout_k) & 16'hFF,
+			         tg68_busstate, tg68_addr, a30_cyc);
+		end
+	end
+`endif
+
 // Expose busstate for debugging
 assign busstate = tg68_busstate;
 

@@ -487,6 +487,20 @@ void SimVideo::Clock(bool hblank, bool vblank, bool hsync, bool vsync, uint32_t 
 	if (count_pixel < stats_xMin) { stats_xMin = count_pixel; }
 	if (count_line < stats_yMin) { stats_yMin = count_line; }
 
+	// [VIDDBG] one line per frame: DE duty, colour range, line count. Cheap,
+	// stderr-only; used to bisect "DE never asserts" vs "datapath constant".
+	{
+		static uint64_t dbg_de = 0; static uint32_t dbg_cmin = 0xFFFFFFFF, dbg_cmax = 0;
+		static int dbg_hbf = 0;
+		if (de) { dbg_de++; if (colour < dbg_cmin) dbg_cmin = colour; if (colour > dbg_cmax) dbg_cmax = colour; }
+		if (hb_falling) dbg_hbf++;
+		if (vs_rising) {
+			fprintf(stderr, "[VIDDBG] f=%d de_px=%llu cmin=%08X cmax=%08X hbf=%d lineMax=%d pixMax=%d\n",
+				count_frame, (unsigned long long)dbg_de, dbg_cmin, dbg_cmax, dbg_hbf, stats_yMax, stats_xMax);
+			dbg_de = 0; dbg_cmin = 0xFFFFFFFF; dbg_cmax = 0; dbg_hbf = 0;
+		}
+	}
+
 	last_hblank = hblank;
 	last_vblank = vblank;
 	last_hsync = hsync;

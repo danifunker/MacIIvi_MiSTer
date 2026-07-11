@@ -1,0 +1,3 @@
+focus maincpu
+dasm /tmp/berr_site.dasm,0xa0dbc0,0x80
+go

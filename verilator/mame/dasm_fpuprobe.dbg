@@ -1,0 +1,6 @@
+focus maincpu
+dasm /tmp/fpu_handler.dasm,0xa48284,0x100
+dasm /tmp/fpu_illhandler.dasm,0xa48252,0x40
+dasm /tmp/fpu_nofpu.dasm,0xa481cc,0x80
+dasm /tmp/fpu_suite_tail.dasm,0xa47e80,0x200
+quit

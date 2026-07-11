@@ -1,10 +1,10 @@
-# MacLC Verilator Simulation Architecture
+# MacLCii Verilator Simulation Architecture
 
-This document describes the verilator simulation setup for the MacLC core.
+This document describes the verilator simulation setup for the MacLCii core.
 
 ## Overview
 
-The verilator simulation allows running the MacLC FPGA core in software for debugging and development. It replaces MiSTer-specific hardware interfaces with simulation-friendly equivalents.
+The verilator simulation allows running the MacLCii FPGA core in software for debugging and development. It replaces MiSTer-specific hardware interfaces with simulation-friendly equivalents.
 
 ## File Structure
 
@@ -101,7 +101,7 @@ Requirements:
 
 ## Data Widths
 
-The simulation uses 16-bit data paths to match the MacLC hardware:
+The simulation uses 16-bit data paths to match the MacLCii hardware:
 
 | Signal | Width | Description |
 |--------|-------|-------------|

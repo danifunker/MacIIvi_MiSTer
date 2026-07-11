@@ -1,0 +1,256 @@
+//
+// sdram.v
+//
+// sdram controller implementation for the MiST board
+//
+// Copyright (c) 2015 Till Harbaum <till@harbaum.org>
+//
+// This source file is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published
+// by the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This source file is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+//
+
+module sdram
+(
+	// interface to the MT48LC16M16 chip
+	output              sd_clk,
+	inout  reg [15:0]   sd_data,    // 16 bit bidirectional data bus
+	output reg [12:0]   sd_addr,    // 13 bit multiplexed address bus
+	output     [1:0]    sd_dqm,     // two byte masks
+	output reg [1:0]    sd_ba,      // two banks
+	output              sd_cs,      // a single chip select
+	output              sd_we,      // write enable
+	output              sd_ras,     // row address select
+	output              sd_cas,     // columns address select
+
+	// cpu/chipset interface
+	input               init,       // init signal after FPGA config to initialize RAM
+	input               clk_64,     // sdram is accessed at 64MHz
+	input               clk_8,      // 8MHz chipset clock to which sdram state machine is synchonized
+
+	input [15:0]        din,        // data input from chipset/cpu
+	output reg [15:0]   dout,       // data output to chipset/cpu
+	input [23:0]        addr,       // 24 bit word address
+	input [1:0]         ds,         // upper/lower data strobe
+	input               oe,         // cpu/chipset requests read
+	input               we,         // cpu/chipset requests write
+	output              ram_ready   // 1 = dout holds valid data for the address on `addr`
+);
+
+localparam RASCAS_DELAY   = 3'd2;   // tRCD=20ns -> 3 cycles@128MHz
+localparam BURST_LENGTH   = 3'b000; // 000=1, 001=2, 010=4, 011=8
+localparam ACCESS_TYPE    = 1'b0;   // 0=sequential, 1=interleaved
+localparam CAS_LATENCY    = 3'd2;   // 2/3 allowed
+localparam OP_MODE        = 2'b00;  // only 00 (standard operation) allowed
+localparam NO_WRITE_BURST = 1'b1;   // 0= write burst enabled, 1=only single access write
+
+localparam MODE = { 3'b000, NO_WRITE_BURST, OP_MODE, CAS_LATENCY, ACCESS_TYPE, BURST_LENGTH};
+
+
+// ---------------------------------------------------------------------
+// ------------------------ cycle state machine ------------------------
+// ---------------------------------------------------------------------
+
+// The state machine runs at 128Mhz synchronous to the 8 Mhz chipset clock.
+// It wraps from T15 to T0 on the rising edge of clk_8
+
+localparam STATE_FIRST     = 3'd0;   // first state in cycle
+localparam STATE_CMD_START = 3'd0;   // state in which a new command can be started
+localparam STATE_CMD_CONT  = STATE_CMD_START  + RASCAS_DELAY; // command can be continued
+localparam STATE_READ      = STATE_CMD_CONT + CAS_LATENCY + 4'd2;  // +2 for 65MHz margin (was +1)
+localparam STATE_LAST      = 3'd7;  // last state in cycle
+
+reg [2:0] t;
+always @(posedge clk_64) begin
+	// 128Mhz counter synchronous to 8 Mhz clock
+	// force counter to pass state 0 exactly after the rising edge of clk_8
+	if(((t == STATE_LAST)  && ( clk_8 == 0)) ||
+		((t == STATE_FIRST) && ( clk_8 == 1)) ||
+		((t != STATE_LAST) && (t != STATE_FIRST)))
+			t <= t + 3'd1;
+end
+
+// ---------------------------------------------------------------------
+// --------------------------- startup/reset ---------------------------
+// ---------------------------------------------------------------------
+
+// JEDEC SDR-SDRAM init: ~118us of NOPs after the clock starts (the chip
+// wants 100us of stable clock before the first command — the FPGA was just
+// reconfigured, so the SDRAM clock was dead/floating until now), then
+// PRECHARGE ALL -> 8x AUTO REFRESH -> LOAD MODE. The previous sequence
+// (31 chipset cycles ~4us, ZERO refreshes; its "wait 1ms" comment was wrong)
+// relied on the chip state the PREVIOUS core left behind; whether the mode
+// register write took was per-load luck — suspected cause of the cold-load
+// flakiness that clears after loading a different core first.
+// The ladder is content-preserving (NOPs/refreshes/MRS only), so it is also
+// safe to re-run via `init` on a warm user reset while the ROM is in SDRAM.
+reg [9:0] reset;
+always @(posedge clk_64) begin
+	if(init)	reset <= 10'h3ff;
+	else if((t == STATE_LAST) && (reset != 0))
+		reset <= reset - 10'd1;
+end
+
+initial reset = 10'h3FF;
+
+// ---------------------------------------------------------------------
+// ------------------ generate ram control signals ---------------------
+// ---------------------------------------------------------------------
+
+// all possible commands
+localparam CMD_INHIBIT         = 4'b1111;
+localparam CMD_NOP             = 4'b0111;
+localparam CMD_ACTIVE          = 4'b0011;
+localparam CMD_READ            = 4'b0101;
+localparam CMD_WRITE           = 4'b0100;
+localparam CMD_BURST_TERMINATE = 4'b0110;
+localparam CMD_PRECHARGE       = 4'b0010;
+localparam CMD_AUTO_REFRESH    = 4'b0001;
+localparam CMD_LOAD_MODE       = 4'b0000;
+
+reg [3:0] sd_cmd;   // current command sent to sd ram
+
+// drive control signals according to current command
+assign sd_cs  = sd_cmd[3];
+assign sd_ras = sd_cmd[2];
+assign sd_cas = sd_cmd[1];
+assign sd_we  = sd_cmd[0];
+assign sd_dqm = sd_addr[12:11];
+
+reg oe_latch, we_latch;
+
+// Address-capture latch (2026-06-25): the SDRAM column (issued at the CAS phase,
+// STATE_CMD_CONT) must use the address sampled at the command slot
+// (STATE_CMD_START), NOT a live `addr`. A normal CPU access holds `addr` stable
+// across the whole slot, so for it latched == live and this changes nothing. But
+// the BORROWED PMMU-walk bus cycle's address is not stable from the slot to the
+// CAS phase: taking the column from live `addr` row/column-mismatched and returned
+// the WRONG location's data -> bad page-table descriptor -> the 10MB-boot Sad Mac
+// / intermittent boot (the failure point shifts with bus phase, so it sometimes
+// happens to align and boots). The row is already taken at the slot
+// (sd_addr <= {addr[23],addr[19:8]} below), so the access already relies on `addr`
+// being valid then; this just makes the column use that same instant. Write DATA
+// and byte strobes stay LIVE (valid only at the CAS phase). This replaces the
+// 2026-06-24 pending-service latch, whose late re-service path corrupted normal
+// SDRAM accesses (gray-stall, builds #13/#14/#16).
+reg [23:0] addr_latch;
+
+// Read-data-valid handshake (2026-06-25): a RAM/VRAM READ's DTACK (in MacLC.sv)
+// must wait for the SDRAM to ACTUALLY finish the read, not fire at slot-start. The
+// borrowed PMMU-walk read otherwise gets a slot-start DTACK and the walker latches
+// `dout` before the read completes -> it captures stale bus data (the 10MB-boot Sad
+// Mac). That the re-read retry boots PROVES the data is in SDRAM and the single read
+// was merely mis-timed. dout_addr/dout_valid record which address `dout` currently
+// holds; any write invalidates it, so a read can never return pre-write data.
+reg [23:0] dout_addr;
+reg        dout_valid;
+assign ram_ready = dout_valid && (dout_addr == addr);
+
+always @(posedge clk_64) begin
+	sd_cmd <= CMD_INHIBIT;  // default: idle
+	sd_data <= 16'bZZZZZZZZZZZZZZZZ;
+
+	if(reset != 0) begin
+		dout_valid <= 1'b0;
+		// init ladder, one command slot per chipset cycle (~123ns apart):
+		// 1023..65 = NOP wait, 64 = PRECHARGE ALL, 56/52/../28 = 8x AUTO
+		// REFRESH, 2 = LOAD MODE. tRP/tRFC/tMRD are all satisfied by orders
+		// of magnitude at this spacing.
+		if(t == STATE_CMD_START) begin
+
+			if(reset == 64) begin
+				sd_cmd <= CMD_PRECHARGE;
+				sd_addr[10] <= 1'b1;      // precharge all banks
+			end
+
+			if(reset >= 28 && reset <= 56 && reset[1:0] == 2'b00)
+				sd_cmd <= CMD_AUTO_REFRESH;
+
+			if(reset == 2) begin
+				sd_cmd <= CMD_LOAD_MODE;
+				sd_addr <= MODE;
+			end
+
+		end
+	end else begin
+		// normal operation
+
+		// RAS phase
+		// -------------------  cpu/chipset read/write ----------------------
+		if(t == STATE_CMD_START) begin
+			{oe_latch, we_latch} <= {oe, we};
+			if (we) dout_valid <= 1'b0;   // a write invalidates the read-data cache
+			if (we || oe) begin
+				// Capture the access address NOW for the CAS column (see the
+				// addr_latch comment above). A12 = addr[23]: unlock the UPPER
+				// 16MB of the 32MB MT48LC16M16 — the relocated motherboard bank
+				// (mb_hi -> addr[23]=1) lands up there; all other users keep
+				// addr[23]=0 (lower 16MB, unchanged).
+				addr_latch <= addr;
+				sd_cmd <= CMD_ACTIVE;
+				sd_addr <= { addr[23], addr[19:8] };
+				sd_ba <= addr[21:20];
+		// ------------------------ no access --------------------------
+			end else begin
+				sd_cmd <= CMD_AUTO_REFRESH;
+			end
+		end
+
+		// CAS phase. The column comes from the LATCHED address, so a borrowed
+		// walk read's row and column always reference the same location. Write
+		// DATA and the byte strobes stay LIVE — they are only valid at CAS.
+		if(t == STATE_CMD_CONT && (we_latch || oe_latch)) begin
+			sd_cmd <= we_latch?CMD_WRITE:CMD_READ;
+			if (we_latch) sd_data <= din;
+			// always return both bytes in a read. The cpu may not
+			// need it, but the caches need to be able to store everything
+			sd_addr <= { we_latch ? ~ds : 2'b00, 2'b10,
+			             addr_latch[22], addr_latch[7:0] };  // auto precharge
+		end
+
+		// Data ready: latch dout AND publish it as valid for addr_latch, so the
+		// RAM-read DTACK in MacLC.sv only fires once this read has truly completed.
+		if (t == STATE_READ && oe_latch) begin
+			dout       <= sd_data;
+			dout_addr  <= addr_latch;
+			dout_valid <= 1'b1;
+		end
+
+	end
+end
+
+altddio_out
+#(
+	.extend_oe_disable("OFF"),
+	.intended_device_family("Cyclone V"),
+	.invert_output("OFF"),
+	.lpm_hint("UNUSED"),
+	.lpm_type("altddio_out"),
+	.oe_reg("UNREGISTERED"),
+	.power_up_high("OFF"),
+	.width(1)
+)
+sdramclk_ddr
+(
+	.datain_h(1'b0),
+	.datain_l(1'b1),
+	.outclock(clk_64),
+	.dataout(sd_clk),
+	.aclr(1'b0),
+	.aset(1'b0),
+	.oe(1'b1),
+	.outclocken(1'b1),
+	.sclr(1'b0),
+	.sset(1'b0)
+);
+
+endmodule

@@ -1,0 +1,3 @@
+focus maincpu
+dasm /tmp/mmu_probe.dasm,0xa41600,0x120
+go

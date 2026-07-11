@@ -1,7 +1,7 @@
 //
 // sim_ram.v
 //
-// Simple RAM module for Verilator simulation of MacLC
+// Simple RAM module for Verilator simulation of MacLCii
 // Replaces the SDRAM controller with synchronous RAM
 //
 

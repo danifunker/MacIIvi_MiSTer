@@ -1,0 +1,3 @@
+focus maincpu
+dasm /tmp/berr_handler.dasm,0xa0db20,0xe0
+go

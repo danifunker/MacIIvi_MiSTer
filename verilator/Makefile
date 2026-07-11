@@ -20,6 +20,9 @@ V_DEFINE += --trace-fst
 # Uncomment for a FOCUSED HC05 stuck-loop trace (no flood) - prints the Egret PC +
 # BYTEACK/TIP/TREQ every ~32k fetches. Use to pinpoint the byte-4 SR/BYTEACK hang.
 # V_DEFINE += +define+EGRET_SRDEBUG=1
+# V_DEFINE += +define+PMMU_TRACE=1  (PMMU walker/stall + $A03Fxx mode-switch reconfig walk capture + PMMU FAULT class; uncomment to enable)
+# V_DEFINE += +define+A30_TRACE=1   (LC II post-MMU bsr.w/PMMU + $1FF35A dispatch + $0CB0-$0CBF watchpoint + A30[MOVB] decode-sequence trace)
+# V_DEFINE += +define+CACHE_TRACE=1  (68030 I/D cache fill-FSM probe: transitions + stuck detector)
 V_DEFINE +=
 
 UNAME_S := $(shell uname -s)
@@ -59,13 +62,13 @@ V_OPT =  --x-assign fast --x-initial fast --noassert
 #CC_OPT = -O
 CC_OPT =
 
-# MacLC RTL source files
+# MacLCii RTL source files
 V_SRC = \
+	tg68k_debug.vlt \
 	sim.v \
 	sim_ram.v \
-	$(RTL)/tg68k/TG68K_ALU.v \
-	$(RTL)/tg68k/TG68K_Pack.sv \
 	$(RTL)/tg68k/TG68KdotC_Kernel.v \
+	$(RTL)/tg68k/TG68K_Cache_030.v \
 	$(RTL)/tg68k/tg68k.v \
 	$(RTL)/addrController_top.v \
 	$(RTL)/addrDecoder.v \
@@ -84,6 +87,7 @@ V_SRC = \
 	$(RTL)/swim.v \
 	$(RTL)/floppy.v \
 	$(RTL)/floppy_track_encoder.v \
+	$(RTL)/mfm_track_encoder.v \
 	$(RTL)/scsi.v \
 	$(RTL)/ncr5380.sv \
 	$(RTL)/scc.v \

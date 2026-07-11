@@ -1,0 +1,6 @@
+focus maincpu
+wpset dd0,4,w
+go
+wpclear
+printf "BREAK PC=%08X A5=%08X A3=%08X\n",pc,a5,a3
+go

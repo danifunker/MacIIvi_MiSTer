@@ -53,3 +53,38 @@ c5_pin_model_dump.txt
 # ghdl VHDL->Verilog conversion artifacts (rtl/tg68k)
 rtl/tg68k/*.o
 rtl/tg68k/work-obj*.cf
+
+# --- Verilator sim (carried from MacLCII_MiSTer) ---
+greybox_tmp
+imgui.ini
+cpu_trace.log
+ram_debug.log
+verilator/obj_dir
+verilator/*.png
+verilator/*.out
+verilator/*.err
+verilator/build*.log
+verilator/berrframe*.log
+verilator/trace.fst
+verilator/asc_sim.log
+verilator/sim_stdout.log
+# ad-hoc sim-run CWDs (parallel Vemu runs; screenshots/traces land there)
+sim*run/
+# analysis scratchpad
+scratch/
+# python tooling artifacts
+__pycache__/
+*.pyc
+# repo-root runtime / build scratch (sim + MiSTer state -- not source)
+/cfg/
+/nvram/
+/snap/
+/diff/
+/.claude/
+cr_ie_info.json
+*.zip
+*.stp
+quartus_build*.log
+# MAME rom lanes -- Apple ROM images (regenerated; see docs/mame_compare.md)
+verilator/mame/roms/
+verilator/mame/roms_nomemcheck/

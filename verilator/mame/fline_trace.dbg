@@ -1,0 +1,2 @@
+trace /tmp/m71.tr,maincpu,,{tracelog "%08X %04X\n",pc,w@pc}
+go

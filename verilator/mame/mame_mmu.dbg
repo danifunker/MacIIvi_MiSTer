@@ -1,0 +1,6 @@
+focus maincpu
+wpset dd0,4,w
+go
+printf "PC=%08X A5=%08X  TC=%08X  TT0=%08X TT1=%08X\n",pc,a5,tc,tt0,tt1
+printf "CRP=%08X%08X  SRP=%08X%08X\n",crp>>32,crp&0xffffffff,srp>>32,srp&0xffffffff
+go

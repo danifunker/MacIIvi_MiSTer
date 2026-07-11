@@ -17,14 +17,14 @@ struct SimBlockDevice {
 public:
 
 	IData* sd_lba[kVDNUM];
-	CData* sd_rd;           // 2-bit in MacLC
-	CData* sd_wr;           // 2-bit in MacLC
-	CData* sd_ack;          // 2-bit in MacLC
-	CData* sd_buff_addr;    // 8-bit for MacLC
-	SData* sd_buff_dout;    // 16-bit for MacLC
-	SData* sd_buff_din[kVDNUM];  // 16-bit for MacLC
+	CData* sd_rd;           // 2-bit in MacLCii
+	CData* sd_wr;           // 2-bit in MacLCii
+	CData* sd_ack;          // 2-bit in MacLCii
+	CData* sd_buff_addr;    // 8-bit for MacLCii
+	SData* sd_buff_dout;    // 16-bit for MacLCii
+	SData* sd_buff_din[kVDNUM];  // 16-bit for MacLCii
 	CData* sd_buff_wr;
-	CData* img_mounted;     // 2-bit in MacLC
+	CData* img_mounted;     // 2-bit in MacLCii
 	CData* img_readonly;
 	QData* img_size;
 

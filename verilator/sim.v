@@ -188,8 +188,8 @@ module emu
 	assign AUDIO_L = asc_sample_l;
 	assign AUDIO_R = asc_sample_r;
 
-	// Mac LC memory configuration
-	wire [7:0] configRAMSize = 8'h24; // 2MB: no SIMM, 2MB board only
+	// Mac LC II memory configuration
+	wire [7:0] configRAMSize = 8'h04; // 4MB: no SIMM, 4MB soldered board (LC II base)
 	wire [7:0] pvia_ram_config_out;   // Active RAM config from pseudovia
 	wire       pvia_ram_configured;   // ROM has programmed V8 config ($0 mirror enable)
 
@@ -277,6 +277,31 @@ module emu
 		end
 	end
 
+`ifdef PMMU_TRACE
+	// DTACK-side probe (pairs with the PMMU walker probe in tg68k.v). Counts, per
+	// ~262k-cycle window, how often the dtack_en SET condition's terms are true,
+	// to explain why a stalled walker read never gets DTACK. During the stall the
+	// last windows show the frozen picture.
+	reg [31:0] dbg_dcyc, c_aslow, c_slot, c_setcond, c_den, c_selram;
+	always @(posedge clk_sys) begin
+		if (!_cpuReset) begin
+			dbg_dcyc<=0; c_aslow<=0; c_slot<=0; c_setcond<=0; c_den<=0; c_selram<=0;
+		end else begin
+			dbg_dcyc <= dbg_dcyc + 1'b1;
+			if (!_cpuAS)                                     c_aslow   <= c_aslow + 1'b1;
+			if (cpuBusControl && mem_latch_d)                c_slot    <= c_slot + 1'b1;
+			if (!_cpuAS && cpuBusControl && mem_latch_d)     c_setcond <= c_setcond + 1'b1;
+			if (dtack_en)                                    c_den     <= c_den + 1'b1;
+			if (selectRAM)                                   c_selram  <= c_selram + 1'b1;
+			if (dbg_dcyc[17:0] == 18'd0) begin
+				$display("DTACK WIN cyc=%0d aslow=%0d slot=%0d setcond=%0d den=%0d selram=%0d cpuAddr=%h selROM=%b selVRAM=%b dtack=%b @%0t",
+				         dbg_dcyc, c_aslow, c_slot, c_setcond, c_den, c_selram, cpuAddr, selectROM, selectVRAM, _cpuDTACK, $time);
+				c_aslow<=0; c_slot<=0; c_setcond<=0; c_den<=0; c_selram<=0;
+			end
+		end
+	end
+`endif
+
 	// VRAM ($F40000-$FBFFFF, cpuAddr[23:21]==111) must use async DTACK like RAM,
 	// not the 6800 E-clock VPA peripheral path — the VPA path samples on a fixed
 	// E-phase that misses the SDRAM cpu-slot and returns stale data, mis-sizing
@@ -306,6 +331,20 @@ module emu
 	                        (slot_space && !_cpuAS) ? 1'b0 :
 	                        selectSCSIDMA ? ~scsiDREQ :
 	                        (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
+
+	// Peripheral (VPA) read-data register — mirror of MacLC.sv periph_din_reg
+	// (fit-stabilization for the deep SCSI-CSR read cone; ported from MacLC
+	// 0c8844b). Functionally transparent: VPA reads latch at s_state 6, ≥5
+	// clk_sys after select settle, absorbing the +1 register latency. Mirrored
+	// here so the sim exercises the registered path rather than trusting that
+	// transparency claim FPGA-only.
+	wire vpa_periph_read = !fc7_iack && !fc7_berr && !slot_space && !_cpuAS &&
+	                       (cpuAddr[23:21] == 3'b111) && !selectVRAM && !selectSCSIDMA;
+	reg [15:0] periph_din_reg;
+	always @(posedge clk_sys) periph_din_reg <= dataControllerDataOut;
+	wire [15:0] cpu_din_muxed = slot_space      ? 16'hFFFF :
+	                            vpa_periph_read ? periph_din_reg :
+	                                              dataControllerDataOut;
 
 	// Programmer's switch / Level-7 NMI — mirror of MacLC.sv (there the trigger is
 	// the "R5" OSD button status[5]; in sim it is the nmi_pulse input driven by
@@ -413,7 +452,7 @@ module emu
 		.reset      ( !_cpuReset ),
 		.phi1       ( cpu_en_p  ),
 		.phi2       ( cpu_en_n  ),
-		.cpu        ( {status_cpu[1], |status_cpu} ),
+		.cpu        ( 2'b10 ),  // 68030 (Mac LC II); old selectable form: {status_cpu[1], |status_cpu}
 
 		.dtack_n    ( _cpuDTACK  ),
 		.rw_n       ( tg68_rw    ),
@@ -436,7 +475,7 @@ module emu
 
 		.ipl        ( _cpuIPL ),
 		.berr       ( cpu_berr ),
-		.din        ( slot_space ? 16'hFFFF : dataControllerDataOut ),
+		.din        ( cpu_din_muxed ),
 		.dout       ( tg68_dout ),
 		.longword   ( tg68_longword ),
 		.addr       ( tg68_a ),
@@ -574,6 +613,7 @@ module emu
 
 	ariel_ramdac ariel(
 		.clk_sys(clk_sys),
+		.clk_pix(clk_sys),   // sim: single domain (FPGA: pixel clock)
 		.reset(~n_reset),
 		.reg_addr(cpuAddr[10:0]),
 		.uds_n(_cpuUDS),
@@ -650,9 +690,17 @@ module emu
 		.irq(asc_irq)
 	);
 
+	// Historic 16.25 MHz pixel cadence: the sim keeps scanout on clk_sys with a
+	// /2 advance enable (the FPGA now runs the module on a real per-monitor
+	// pixel clock with pix_ce=1 — see rtl/pll_video.v / MacLC.sv). Keeping the
+	// sim on the old grid preserves boot frame counts (screenshot @350 etc).
+	reg sim_pix_ce = 1'b0;
+	always @(posedge clk_sys) sim_pix_ce <= ~sim_pix_ce;
+
 	maclc_v8_video v8_video(
 		.clk_sys(clk_sys),
 		.clk8_en_p(clk8_en_p),
+		.pix_ce(sim_pix_ce),
 		.reset(~n_reset),
 
 		.video_mode(v8_video_mode),
@@ -685,7 +733,8 @@ module emu
 	wire [15:0] v8_vram_rdata;
 
 	vram_bram vram_fb(
-		.clk(clk_sys),
+		.a_clk(clk_sys),
+		.b_clk(clk_sys),   // sim: single domain (FPGA: b_clk = pixel clock)
 		.a_addr(vram_bram_waddr),
 		.a_din(memoryDataOut),
 		.a_be({~_cpuUDS, ~_cpuLDS}),
@@ -796,6 +845,8 @@ module emu
 
 		.insertDisk({dsk_ext_ins, dsk_int_ins}),
 		.diskSides({dsk_ext_ds, dsk_int_ds}),
+		.diskMFM(2'b00),   // sim: MFM/ISM floppy path not exercised
+		.diskHD(2'b00),
 		.diskEject(diskEject),
 		.dskReadAddrInt(dskReadAddrInt),
 		.dskReadAckInt(dskReadAckInt),
@@ -943,7 +994,12 @@ module emu
 	wire [15:0] ram_do_patched =
 		(!_romOE && memoryAddr == 23'h52322F && ram_do_raw == 16'h6600) ? 16'h6000 : ram_do_raw;
 	wire [15:0] ram_do   = download_cycle ? 16'hffff : (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux : ram_do_patched;
-	wire [15:0] extra_rom_data_demux = memoryAddr[0] ?
+	// Disk byte-parity select: must be dskReadAddr[0], NOT memoryAddr[0] (which
+	// is dskReadAddr[1] after the >>1 word conversion drops bit 0). See the long
+	// note at the matching demux in MacLC.sv — the old bit selected the wrong
+	// byte on odd addresses and corrupted every floppy sector. Keep in sync.
+	wire dsk_byte_odd = dskReadAckExt ? dskReadAddrExt[0] : dskReadAddrInt[0];
+	wire [15:0] extra_rom_data_demux = dsk_byte_odd ?
 						   {ram_do_raw[7:0],ram_do_raw[7:0]}:{ram_do_raw[15:8],ram_do_raw[15:8]};
 
 	sim_ram ram

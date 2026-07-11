@@ -1,0 +1,6 @@
+focus maincpu
+bpset 0xa416b2
+go
+printf "HIT pmove tc PC=%08X A3=%08X A5=%08X A4=%08X\n",pc,a3,a5,a4
+printf "TCsrc@A3=%08X  next4=%08X\n",dword(a3),dword(a3+4)
+go
