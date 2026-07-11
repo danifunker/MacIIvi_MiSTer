@@ -71,14 +71,17 @@ both (and so the LC-II boot is the silicon oracle for this core). Re-synced:
   diffs (1 CACR 030-mask, 5 PRM-undefined exception CCR, 1 RTM known-bad oracle).
   BERR/HALT validated by running the imported VHDL fault benches under ghdl
   (`tb_berr_frame` 15/15, fetch-fault/recovery/whichamiga/walker-timeout pass).
-- **Phase 2 (in progress)** — `rtl/tg68k/cpu030_wrapper.v` written: Mac async bus
-  (AS/UDS/LDS/DTACK) + E-clock/VMA + auto-vectors + **`berr_hold`** (the one
-  BERR/HALT item Minimig lacked, ported from MacLC). MMU/cache bypassed for now
-  (TC.E=0 → logical=physical; bare kernel has no cache). Lints clean.
-  **Open blocker:** the MacIIvi chipset (VASP-equivalent addr/dataController)
-  doesn't exist yet, so the wrapper has no Mac bus to drive — next step is to
-  bring over the MacLC chipset and retarget V8→VASP (or validate the wrapper by
-  dropping it into the existing MacLC core per the LC-test strategy).
+- **Phase 2 ✓ (RESOLVED 2026-07-11, superseding the cpu030_wrapper path)** —
+  the open blocker ("the MacIIvi chipset doesn't exist") was closed by
+  importing the **entire MacLCII core at `a254a02`** (its `tg68k.v` is the
+  proven Mac-bus 68030 wrapper; `cpu030_wrapper.v` was dropped) and
+  retargeting V8→VASP per `docs/VASP_RETARGET.md`. The full-system Verilator
+  sim now boots the IIvi ROM end-to-end to the no-startup-disk screen
+  (checksum, 4MB RAM march, Egret 341s0851, VASP I/O, gray desktop + cursor),
+  frame-aligned with the MAME `maciivi` oracle
+  (`docs/mame_maciivi_hb2400_4MB_nodisk.txt`). Phases 3-5 below (post-boot
+  cache wiring, PMMU-in-bus-path validation on this chipset, full-system
+  bring-up) proceed on that foundation with the OS-boot campaign.
 - **BERR/HALT division:** BERR *generation* (NuBus empty-slot timeout, FC=7 probe)
   stays in the chipset (`nubus_arbiter.sv`, already present); the CPU only
   *handles* BERR (validated). BERR+HALT *retry* is unbuilt across all cores
