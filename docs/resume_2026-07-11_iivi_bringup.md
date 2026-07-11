@@ -75,13 +75,18 @@ MAME-verified System 7.5.5 disk image is staged for the OS-boot campaign.
    (-1.49). Reverted to SEED 2. The final rebuild (launched at session
    end) carries the lane fix + seed 2 = the deploy candidate; verify its
    fit.summary/sta.rpt when harvesting.
-3. **System 7.5.5 disk boot** (`simdiskrun/`, screenshots F1200/2000/2800):
-   runs the PRE-A0 binary (card reads as empty there → no PrimaryInit, so
-   its SCSI/OS evidence is INDEPENDENT of the card fixes). EXPECT happy
-   Mac → Welcome. The image (`simdiskrun/boot755_copy.hd`, copy of
-   `../MacLCII_MiSTer/scratch/mame755.hd`) is MAME-VERIFIED to boot
-   maciivi. (Plain 7.1 does NOT boot a IIvi — needs Enabler 001; the MAME
-   screenshot of that rejection dialog was captured this session.)
+3. **System 7.5.5 disk boot: TRIUMPH** (`simdiskrun/` screenshots):
+   F2000 = the full-color "Mac OS / Starting up..." screen with live
+   progress bar; F2800 = the EXTENSION PARADE (6 icons marching). System
+   stack at $2F9xxx exactly matching MAME's 7.5.5 boot; RAM-resident
+   System code executing from F1500. Run capped at F3000 mid-parade —
+   Finder is likely a few hundred frames further. (Pre-A0 binary: card
+   invisible there, so this is pure SCSI/OS-path evidence. Plain 7.1
+   does NOT boot a IIvi — needs Enabler 001; MAME rejection screenshot
+   captured.) NEXT: rerun on the CURRENT binary to ~F4000 — with the
+   card discovered, watch whether the smRecNotFnd sad-Mac interferes
+   BEFORE the OS loads, or whether the OS boots and Monitors shows the
+   8*24 (then set main display + capture PRAM -> releases/MacIIvi.nvr).
 
 ## Next actions (in order)
 
