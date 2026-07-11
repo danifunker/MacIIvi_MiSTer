@@ -1,20 +1,27 @@
 # MacIIvi_MiSTer
 
-A **Macintosh IIvi** core for MiSTer — MC68030 @ 15.6672 MHz with the
-on-chip PMMU, VASP system ASIC, built-in video, 3 NuBus slots, and
-**no FPU** (the IIvi's 68882 socket is empty in the stock machine).
+A **Macintosh IIvi / Performa 600** core for MiSTer — MC68030 @
+15.6672 MHz with the on-chip PMMU, VASP system ASIC, built-in video,
+3 NuBus slots (mdc824 video card as the primary display), and **no FPU**
+(the 68882 socket is empty in both stock machines). The OSD "Machine"
+option selects the IIvi or Performa 600 personality (box-ID); memory
+options are 4/8/20/36 MB (36 MB needs a 64 MB SDRAM module; the 68 MB
+hardware max is deferred pending 128 MB modules).
 
-The core RTL does not exist yet. This repo is currently in its
-**testbench-first phase**: the verification infrastructure — MAME-derived
-instruction corpora, simulator benches, and real-hardware test images —
-is built and verified *before* the core, so every piece of RTL lands
-against a known-good oracle. The master plan is
-**[68030_PMMU_TESTBENCH.md](68030_PMMU_TESTBENCH.md)**.
+**The core RTL exists and boots** (simulator-first phase — no MiSTer
+hardware deploys yet): the chipset is the **MacLCII core imported at
+commit `a254a02`** and retargeted V8→VASP per MAME
+([docs/VASP_RETARGET.md](docs/VASP_RETARGET.md) is the delta record;
+[CLAUDE.md](CLAUDE.md) has the WSL sim workflow). Current sim status:
+the IIvi ROM ($067C) passes its checksum and full RAM march with the
+Egret 341s0851 handshake, VBR/CACR/PMMU init, and a clean 640×480
+raster. NuBus/mdc824 integration is next; then boot chime / happy Mac.
 
-Heritage: ported from `lbmactwo_MiSTer` (Mac II / 68020 project), with
-all FPU material removed and everything retargeted to the 68030+PMMU.
-The physical validation machine is a **Macintosh LC II** — same
-15.6672 MHz 68030, so every CPU/PMMU test byte runs unmodified.
+Verification heritage (still the foundation): the MAME-derived
+instruction corpora, simulator benches, and real-hardware test images
+below — master plan **[68030_PMMU_TESTBENCH.md](68030_PMMU_TESTBENCH.md)**.
+The CPU stays byte-identical to `../MacLCII_MiSTer`'s (silicon-oracled
+on a real LC II); CPU fixes land there first, then sync here.
 
 ## What's here
 
