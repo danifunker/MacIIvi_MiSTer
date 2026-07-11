@@ -69,6 +69,7 @@ module emu
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 		"OA,Monitor,640x480 VGA,512x384 12in RGB;",
 		"-;",
+		"O4,Machine,Mac IIvi,Performa 600;",
 		"O23,Memory,4MB,8MB,20MB,36MB;",
 		"-;",
 		"R5,Interrupt (NMI / MacsBug);",
@@ -109,6 +110,7 @@ module emu
 	always @(posedge clk_sys) if (dio_download && dio_index == 0) rom_loaded <= 1'b1;
 
 	reg [1:0] status_mem = 2'b00;        // latched memory selection (status[3:2])
+	reg       status_p600 = 1'b0;        // latched machine select (status[4]): 0=Mac IIvi, 1=Performa 600
 	localparam [1:0] status_cpu = 2'b10; // 68020
 	reg       n_reset = 0;
 	reg       pram_force_reset = 1'b0;  // "Reset PRAM & Core" -> system reset pulse
@@ -134,8 +136,9 @@ module emu
 				n_reset <= 0;
 			end
 			else if(rst_cnt) begin
-				rst_cnt    <= rst_cnt - 1'd1;
-				status_mem <= status[3:2];
+				rst_cnt     <= rst_cnt - 1'd1;
+				status_mem  <= status[3:2];
+				status_p600 <= status[4];
 			end
 			else begin
 				n_reset <= 1;
@@ -1494,6 +1497,7 @@ module emu
 		.selectPseudoVIA(selectPseudoVIA),
 		.pseudovia_data_in(pseudovia_dout),
 		.selectBoxID(selectBoxID),
+		.machine_p600(status_p600),
 		.selectUnmapped(selectUnmapped),
 		
 		// peripherals

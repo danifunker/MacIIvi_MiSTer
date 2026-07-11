@@ -815,6 +815,9 @@ module emu
 		.selectPseudoVIA(selectPseudoVIA),
 		.pseudovia_data_in(pseudovia_dout),
 		.selectBoxID(selectBoxID),
+		// sim boots as a Mac IIvi; flip to 1'b1 for Performa 600 identity
+		// ($A55A2017) — CLI plumb can come later if A/B runs need it
+		.machine_p600(1'b0),
 		// was left unconnected in the LC II sim (floated 0) — the IIvi RAM
 		// probe depends on unmapped reads returning open-bus $FFFF
 		.selectUnmapped(selectUnmapped),

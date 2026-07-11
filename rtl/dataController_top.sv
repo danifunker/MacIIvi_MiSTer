@@ -51,7 +51,8 @@ module dataController_top(
 	input [7:0] vdac_data_in,
 	input selectPseudoVIA,
 	input [7:0] pseudovia_data_in,
-	input selectBoxID,            // $5FFFFFFC machine-ID longword ($A55A2016 = IIvi)
+	input selectBoxID,            // $5FFFFFFC machine-ID longword
+	input machine_p600,           // 0 = Mac IIvi ($A55A2016), 1 = Performa 600 ($A55A2017)
 	input selectUnmapped,
 
 	// RAM/ROM:
@@ -285,9 +286,14 @@ module dataController_top(
     wire [15:0] vdacDataOut_full = {vdac_data_in, vdac_data_in};
     wire [15:0] pviaDataOut_full = {pseudovia_data_in, pseudovia_data_in};
     wire [15:0] ascDataOut_full = {asc_data_in, asc_data_in};
-    // Machine-ID longword at $5FFFFFFC (MAME maciivx.cpp maciivi_map):
-    // $A55A2016 on the 16-bit bus = word $A55A at +$0 (A1=0), $2016 at +$2.
-    wire [15:0] boxIDDataOut = cpuAddrRegLo[0] ? 16'h2016 : 16'hA55A;
+    // Machine-ID longword at $5FFFFFFC. The ROM masks the value with #$7 and
+    // indexes its BoxFlag table at $4084AB4A (verified by disassembly):
+    //   low3=5 -> IIvx, low3=6 -> Mac IIvi (also the unknown-ID fallback),
+    //   low3=7 -> Performa 600. MAME maciivx.cpp confirms $A55A2015/16 for
+    //   IIvx/IIvi; P600 is the remaining $A55A2017.
+    // 16-bit bus: word $A55A at +$0 (A1=0), $2016/$2017 at +$2.
+    wire [15:0] boxIDDataOut = cpuAddrRegLo[0] ? (machine_p600 ? 16'h2017 : 16'h2016)
+                                               : 16'hA55A;
 
     assign cpuDataOut = selectIWM ? swimDataOut :
                         selectVIA ? viaDataOut_full :
