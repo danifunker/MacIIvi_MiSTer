@@ -155,14 +155,16 @@ module addrController_top(
 	wire [24:0] vram_sdram_word = SDRAM_VRAM_BASE + {6'b0, vram_cpu_offset[19:1]};
 
 	// ---- On-chip framebuffer (BRAM) write mirror ----
-	// The video engine scans 1-8bpp at a fixed 1024-byte (512-word) stride, but
-	// only the first words_per_line words of each line are visible. Pack out the
-	// stride gap (packed = line*words_per_line + col) so 640-wide modes fit the
-	// 384KB BRAM; for 16bpp@512 (words_per_line=512) packing == natural offset.
-	wire [9:0]  vram_line = vram_cpu_offset[19:10];   // scanline (stride 1024B)
-	wire [8:0]  vram_colw = vram_cpu_offset[9:1];     // word within the line (0..511)
-	wire [18:0] vram_packed = vram_line * words_per_line + {10'd0, vram_colw};
-	wire        vram_col_visible = ({2'b0, vram_colw} < words_per_line);
+	// VASP scans with a fixed 2048-byte (1024-word) row stride at every depth
+	// (MAME vasp.cpp screen_update: vram8[(y*2048)+x/8] — DIFFERENT from the
+	// LC V8's 1024-byte rows; this is the "slightly different video"). Only
+	// the first words_per_line words of each row are visible; pack out the
+	// stride gap (packed = line*words_per_line + col) so the visible screen
+	// fits the BRAM.
+	wire [8:0]  vram_line = vram_cpu_offset[19:11];   // scanline (VASP stride 2048B)
+	wire [9:0]  vram_colw = vram_cpu_offset[10:1];    // word within the row (0..1023)
+	wire [18:0] vram_packed = vram_line * words_per_line + {9'd0, vram_colw};
+	wire        vram_col_visible = ({1'b0, vram_colw} < words_per_line);
 	assign vram_waddr = vram_packed[17:0];
 	// One write per CPU VRAM bus cycle (memoryLatch), only for visible columns
 	// (off-screen stride padding is dropped so it can't corrupt the next line).
