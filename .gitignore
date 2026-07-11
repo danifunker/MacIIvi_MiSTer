@@ -88,3 +88,4 @@ quartus_build*.log
 # MAME rom lanes -- Apple ROM images (regenerated; see docs/mame_compare.md)
 verilator/mame/roms/
 verilator/mame/roms_nomemcheck/
+scripts/local.env
