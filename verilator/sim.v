@@ -163,17 +163,27 @@ module emu
 	///////////////////////////////////////////////////
 
 	wire v8_ce_pix;
-	assign CE_PIXEL  = v8_ce_pix;  // real pixel-clock enable (was hardwired 1 -> doubled every pixel)
 
-	// Video Output - Mac LC V8 video system
-	assign VGA_R  = v8_vga_r;
-	assign VGA_G  = v8_vga_g;
-	assign VGA_B  = v8_vga_b;
-	wire VGA_DE = v8_de;
-	assign VGA_VS = v8_vsync;
-	assign VGA_HS = v8_hsync;
-	assign VGA_HB = v8_hblank;
-	assign VGA_VB = v8_vblank;
+	// Display source select: run with +mdc824 to (a) strap the built-in
+	// video's monitor sense to "no display" (montype 7) so the ROM must
+	// adopt the NuBus 8*24 as its boot display, and (b) route the card's
+	// scanout to the sim display. Default = built-in video, montype 6.
+	reg disp_mdc824 = 1'b0;
+	initial disp_mdc824 = ($test$plusargs("mdc824") != 0);
+
+	assign CE_PIXEL  = disp_mdc824 ? mdc_ce_pixel : v8_ce_pix;
+
+	// Video Output — built-in (V8-heritage) video or the mdc824 card.
+	// Card vga_blank is a display-enable (1 = visible); sim wants
+	// active-high blanking on HB/VB, so invert (lbmactwo sim pattern).
+	assign VGA_R  = disp_mdc824 ? mdc_r : v8_vga_r;
+	assign VGA_G  = disp_mdc824 ? mdc_g : v8_vga_g;
+	assign VGA_B  = disp_mdc824 ? mdc_b : v8_vga_b;
+	wire VGA_DE = disp_mdc824 ? mdc_blank : v8_de;
+	assign VGA_VS = disp_mdc824 ? mdc_vs : v8_vsync;
+	assign VGA_HS = disp_mdc824 ? mdc_hs : v8_hsync;
+	assign VGA_HB = disp_mdc824 ? ~mdc_blank : v8_hblank;
+	assign VGA_VB = disp_mdc824 ? ~mdc_blank : v8_vblank;
 
 	// Frame counter for debug logging
 	reg [31:0] sim_frame_count = 0;
@@ -604,9 +614,10 @@ module emu
 	// Use actual video mode from pseudovia (ROM configures this via register 0x10)
 	wire [2:0] v8_video_mode = pvia_video_config[2:0];
 
-	// Monitor ID Selection - 640x480 VGA (default, matches MacIIvi.sv default and
-	// MAME's V8 screen). 512x384 is OSD-selectable on FPGA; sim uses the default.
-	wire [3:0] v8_monitor_id = 4'h6;
+	// Monitor ID Selection - 640x480 VGA (default, matches MacIIvi.sv default
+	// and MAME's VASP screen). With +mdc824 the built-in video reports "no
+	// display attached" (sense 7) so the ROM hunts NuBus for its boot screen.
+	wire [3:0] v8_monitor_id = disp_mdc824 ? 4'h7 : 4'h6;
 
 	ariel_ramdac ariel(
 		.clk_sys(clk_sys),
