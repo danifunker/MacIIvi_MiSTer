@@ -52,7 +52,14 @@ module asc(
 	// Sample rate: MAME streams the ASC at 22257 Hz. 32.5 MHz / 22257 ≈ 1460.
 	localparam SAMPLE_DIV = 16'd1460;
 
-	reg [7:0]  fifo_a [0:1023];
+	// FIFO A storage. M10K-shaped on purpose: dedicated write process and a
+	// dedicated registered-read process (fifo_a_q, below the main block). The
+	// old code read fifo_a[rptr_a] combinationally inside the same always
+	// block that wrote it, which kept the whole 1KB array in ALM registers
+	// (~4.5K ALMs of the 118% first-fit overflow). fifo_a_q lags an rptr_a
+	// change by one clk — harmless, pops are SAMPLE_DIV (1460) clocks apart.
+	(* ramstyle = "M10K,no_rw_check" *) reg [7:0] fifo_a [0:1023];
+	reg [7:0]  fifo_a_q;
 	reg [9:0]  wptr_a, rptr_a;
 	reg [10:0] count_a;          // 0..1024
 	reg [15:0] sample_div;
@@ -114,12 +121,14 @@ module asc(
 			regs[0] <= 8'hE8; // Version (RO)
 		end else begin
 			// Sample-rate divider + FIFO A pop (MONO: same sample to L and R).
+			// Sample comes from the registered read port fifo_a_q (see the
+			// dedicated read/write processes below the main block).
 			if (pop_tick) begin
 				sample_div  <= 0;
 				sample_tick <= 1'b1;
 				if (count_a != 0) begin
-					sample_l <= {~fifo_a[rptr_a][7], fifo_a[rptr_a][6:0], 8'h00};
-					sample_r <= {~fifo_a[rptr_a][7], fifo_a[rptr_a][6:0], 8'h00};
+					sample_l <= {~fifo_a_q[7], fifo_a_q[6:0], 8'h00};
+					sample_r <= {~fifo_a_q[7], fifo_a_q[6:0], 8'h00};
 				end
 				// when empty, hold the last sample (matches MAME asc_v8)
 			end else begin
@@ -131,7 +140,6 @@ module asc(
 				wptr_a <= 0; rptr_a <= 0; count_a <= 0;
 			end else begin
 				if (fifo_a_push) begin
-					fifo_a[wptr_a] <= data_in;
 					wptr_a <= wptr_a + 1'b1;
 				end
 				if (pop_a)
@@ -165,6 +173,14 @@ module asc(
 				irq <= 1'b1;
 		end
 	end
+
+	// FIFO A block-RAM ports (M10K-shaped; see the array declaration note).
+	// Write: one dedicated process. Read: registered, continuously tracking
+	// rptr_a — settled long before the next pop uses fifo_a_q.
+	always @(posedge clk)
+		if (fifo_a_push) fifo_a[wptr_a] <= data_in;
+	always @(posedge clk)
+		fifo_a_q <= fifo_a[rptr_a];
 
 	reg [7:0] data_out_reg;
 	always @(*) begin

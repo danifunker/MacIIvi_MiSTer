@@ -61,6 +61,18 @@ reg [7:0] key_color;
 // Latched palette entry for CPU read/modify/write of individual components
 reg [23:0] palette_latch;
 
+// Port-A latch-refill pipeline (see the port-A process near the bottom).
+// The old code read palette[data_in] / palette[palette_addr+1] with a
+// combinational index inside the write block — that defeated the M10K
+// attribute and kept the whole CLUT in ALM registers (~3.2K ALMs of the
+// 118% first-fit overflow). Latch refills now go through the registered
+// port: set the pending address, the port serves it on the next
+// write-free cycle, palette_latch loads one cycle after that. CPU
+// accesses are hundreds of clk_sys apart, so the latch is always settled
+// before the next component access.
+reg        latch_rd_pend, latch_rd_stage;
+reg [7:0]  latch_rd_addr;
+
 // Reset-based initialization
 reg        init_active;
 reg [8:0]  init_addr;  // 9-bit to count to 256
@@ -141,17 +153,29 @@ always @(posedge clk_sys) begin
         ariel_written <= 1'b0;
         key_color <= 8'd0;
         palette_latch <= 24'h0;
+        latch_rd_pend <= 1'b0;
+        latch_rd_stage <= 1'b0;
+        latch_rd_addr <= 8'd0;
         init_active <= 1'b1;
         init_addr <= 9'd0;
     end else if (init_active) begin
-        // Initialize palette from reset counter (one entry per clock).
-        // Rainbow init replaces old greyscale ramp — every pixel_index value
-        // now maps to a visually distinct color.
-        palette[init_addr[7:0]] <= {init_r, init_g, init_b};
+        // Initialize palette from the reset counter (one entry per clock);
+        // the array write itself happens in the port-A process below.
         if (init_addr == 9'd255)
             init_active <= 1'b0;
         init_addr <= init_addr + 9'd1;
-    end else if (req_stb) begin
+    end else begin
+        // Latch-refill service: consume a pending port-A read (set by
+        // REG_ADDR writes / entry advances) on a write-free cycle; the
+        // registered pal_a_q lands in palette_latch one cycle later.
+        if (latch_rd_stage) begin
+            palette_latch  <= pal_a_q;
+            latch_rd_stage <= 1'b0;
+        end else if (latch_rd_pend && !pal_a_we) begin
+            latch_rd_stage <= 1'b1;
+            latch_rd_pend  <= 1'b0;
+        end
+        if (req_stb) begin
         if (we) begin
             ariel_written <= 1'b1;
             case (byte_reg)
@@ -159,24 +183,17 @@ always @(posedge clk_sys) begin
                     // Writing address resets the R/G/B component counter
                     palette_addr <= data_in;
                     color_comp <= 2'd0;
-                    // Latch current palette entry for component writes
-                    palette_latch <= palette[data_in];
+                    // Queue the latch refill through port A (registered read)
+                    latch_rd_pend <= 1'b1;
+                    latch_rd_addr <= data_in;
                 end
                 REG_PALETTE: begin
-                    // Write to current color component, cycle through R, G, B
+                    // Component write goes to the array via the port-A process
+                    // (pal_a_we/pal_a_wdata); keep the latch's running copy here.
                     case (color_comp)
-                        2'd0: begin
-                            palette_latch[23:16] <= data_in;
-                            palette[palette_addr] <= {data_in, palette_latch[15:0]};
-                        end
-                        2'd1: begin
-                            palette_latch[15:8] <= data_in;
-                            palette[palette_addr] <= {palette_latch[23:16], data_in, palette_latch[7:0]};
-                        end
-                        2'd2: begin
-                            palette_latch[7:0] <= data_in;
-                            palette[palette_addr] <= {palette_latch[23:8], data_in};
-                        end
+                        2'd0: palette_latch[23:16] <= data_in;
+                        2'd1: palette_latch[15:8]  <= data_in;
+                        2'd2: palette_latch[7:0]   <= data_in;
                         default: ;
                     endcase
 
@@ -184,8 +201,10 @@ always @(posedge clk_sys) begin
                     if (color_comp == 2'd2) begin
                         color_comp <= 2'd0;
                         palette_addr <= palette_addr + 8'd1;
-                        // Latch next entry for subsequent writes
-                        palette_latch <= palette[palette_addr + 8'd1];
+                        // Queue the next entry's latch refill (served after
+                        // this cycle's array write completes)
+                        latch_rd_pend <= 1'b1;
+                        latch_rd_addr <= palette_addr + 8'd1;
                     end else begin
                         color_comp <= color_comp + 2'd1;
                     end
@@ -212,7 +231,8 @@ always @(posedge clk_sys) begin
                     if (color_comp == 2'd2) begin
                         color_comp <= 2'd0;
                         palette_addr <= palette_addr + 8'd1;
-                        palette_latch <= palette[palette_addr + 8'd1];
+                        latch_rd_pend <= 1'b1;
+                        latch_rd_addr <= palette_addr + 8'd1;
                     end else begin
                         color_comp <= color_comp + 2'd1;
                     end
@@ -221,7 +241,30 @@ always @(posedge clk_sys) begin
                 REG_KEY_COLOR: data_out <= key_color;
             endcase
         end
+        end  // req_stb
     end
+end
+
+// ---------------------------------------------------------------------------
+// Palette port A (clk_sys): ONE registered read/write port — together with
+// the clk_pix read in the video-lookup process this is the dual-clock
+// true-dual-port shape Quartus maps to M10K. Reads return old data on a
+// same-address write (no_rw_check); the latch-refill service above never
+// consumes a read issued in a write cycle, so that corner is unreachable.
+wire pal_a_cpu_wr = req_stb && we && (byte_reg == REG_PALETTE);
+wire pal_a_we     = init_active | pal_a_cpu_wr;
+wire [7:0] pal_a_addr = init_active  ? init_addr[7:0] :
+                        pal_a_cpu_wr ? palette_addr   :
+                                       latch_rd_addr;
+wire [23:0] pal_a_wdata =
+    init_active            ? {init_r, init_g, init_b}                          :
+    (color_comp == 2'd0)   ? {data_in, palette_latch[15:0]}                    :
+    (color_comp == 2'd1)   ? {palette_latch[23:16], data_in, palette_latch[7:0]} :
+                             {palette_latch[23:8], data_in};
+reg [23:0] pal_a_q;
+always @(posedge clk_sys) begin
+    if (pal_a_we) palette[pal_a_addr] <= pal_a_wdata;
+    pal_a_q <= palette[pal_a_addr];
 end
 
 endmodule
