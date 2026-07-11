@@ -2,7 +2,7 @@
 //============================================================================
 //  Macintosh LC - Verilator Simulation Wrapper
 //
-//  Adapted from MacLC.sv for simulation
+//  Adapted from MacIIvi.sv for simulation
 //============================================================================
 
 module emu
@@ -321,18 +321,18 @@ module emu
 	// the probe completes inline and boot diverts into the STM serial diagnostic.
 	wire        fc7_berr = (cpuFC == 3'b111) && !fc7_iack;
 	// NuBus/PDS slot space ($F1000000-$FEFFFFFF) must BUS-ERROR on a cardless
-	// LC — full rationale in MacLC.sv (phantom PDS card → System 7 boot Sad
+	// LC — full rationale in MacIIvi.sv (phantom PDS card → System 7 boot Sad
 	// Macs). Keep both tops identical.
 	wire        slot_space = (cpuAddrFullHi >= 8'hF1) && (cpuAddrFullHi <= 8'hFE);
 	// SCSI pseudo-DMA ($F06000/$F12000) uses async DTACK gated by the NCR5380 DREQ
-	// instead of the 6800-style VPA path the rest of $F0xxxx uses — see MacLC.sv.
+	// instead of the 6800-style VPA path the rest of $F0xxxx uses — see MacIIvi.sv.
 	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space) ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
 	assign      _cpuDTACK = fc7_berr ? 1'b1 :
 	                        (slot_space && !_cpuAS) ? 1'b0 :
 	                        selectSCSIDMA ? ~scsiDREQ :
 	                        (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
 
-	// Peripheral (VPA) read-data register — mirror of MacLC.sv periph_din_reg
+	// Peripheral (VPA) read-data register — mirror of MacIIvi.sv periph_din_reg
 	// (fit-stabilization for the deep SCSI-CSR read cone; ported from MacLC
 	// 0c8844b). Functionally transparent: VPA reads latch at s_state 6, ≥5
 	// clk_sys after select settle, absorbing the +1 register latency. Mirrored
@@ -346,7 +346,7 @@ module emu
 	                            vpa_periph_read ? periph_din_reg :
 	                                              dataControllerDataOut;
 
-	// Programmer's switch / Level-7 NMI — mirror of MacLC.sv (there the trigger is
+	// Programmer's switch / Level-7 NMI — mirror of MacIIvi.sv (there the trigger is
 	// the "R5" OSD button status[5]; in sim it is the nmi_pulse input driven by
 	// --nmi-at-frame). Verifies the level-7 autovector path our CPU+glue takes.
 	reg        nmi_req   = 1'b0;
@@ -409,8 +409,8 @@ module emu
 	// 68030 faults because nothing decodes the cycle.
 	// Slot-space: ACK with $FFFF (NuBus open-bus, the LBMacTwo
 	// empty-slot mechanism) — TG68 berr is not handler-recoverable for
-	// normal cycles. Keep both tops identical (MacLC.sv has the rationale).
-	// Pseudo-DMA stall timeout → BERR — mirror of MacLC.sv (rationale there).
+	// normal cycles. Keep both tops identical (MacIIvi.sv has the rationale).
+	// Pseudo-DMA stall timeout → BERR — mirror of MacIIvi.sv (rationale there).
 	localparam SDMA_TIMEOUT = 23'd8125000;  // ~250 ms @ 32.5 MHz
 	reg [22:0] sdma_stall_ctr = 23'd0;
 	reg        sdma_berr      = 1'b0;
@@ -607,7 +607,7 @@ module emu
 	// Use actual video mode from pseudovia (ROM configures this via register 0x10)
 	wire [2:0] v8_video_mode = pvia_video_config[2:0];
 
-	// Monitor ID Selection - 640x480 VGA (default, matches MacLC.sv default and
+	// Monitor ID Selection - 640x480 VGA (default, matches MacIIvi.sv default and
 	// MAME's V8 screen). 512x384 is OSD-selectable on FPGA; sim uses the default.
 	wire [3:0] v8_monitor_id = 4'h6;
 
@@ -634,11 +634,11 @@ module emu
 
 	// Pseudovia register select is byte-granular and needs A0, which the 16-bit bus
 	// drops (cpuAddr[0] is forced 0). Use the real A0 from the CPU (tg68_a[0]) for the
-	// register LSB, matching MacLC.sv. Without it, odd registers alias to the even one
+	// register LSB, matching MacIIvi.sv. Without it, odd registers alias to the even one
 	// below — notably the V8 RAM-config reg $01 (which enables the $0 motherboard
 	// mirror) aliases to reg $00 (port_b), so ram_configured never sets and the boot's
 	// relocation trampoline reads a non-mirrored $0 stack -> garbage. (sim-only bug;
-	// MacLC.sv already used tg68_a[0] here.)
+	// MacIIvi.sv already used tg68_a[0] here.)
 	pseudovia pvia(
 		.clk_sys(clk_sys),
 		.reset(~n_reset),
@@ -650,7 +650,7 @@ module emu
 		.vblank_irq(v8_vblank),
 		.slot_irq(pds_slot_irq),
 		.asc_irq(asc_irq),
-		// SCSI flags RE-TIED-OFF (2026-06-12 evening) — matches MacLC.sv
+		// SCSI flags RE-TIED-OFF (2026-06-12 evening) — matches MacIIvi.sv
 		// (full reversal history there: the dack=14592 post-Happy-Mac
 		// crash-restart tracks THIS wiring, not the phantom card; the
 		// "driver sleeps without it" rationale was actually the LocalTalk
@@ -692,7 +692,7 @@ module emu
 
 	// Historic 16.25 MHz pixel cadence: the sim keeps scanout on clk_sys with a
 	// /2 advance enable (the FPGA now runs the module on a real per-monitor
-	// pixel clock with pix_ce=1 — see rtl/pll_video.v / MacLC.sv). Keeping the
+	// pixel clock with pix_ce=1 — see rtl/pll_video.v / MacIIvi.sv). Keeping the
 	// sim on the old grid preserves boot frame counts (screenshot @350 etc).
 	reg sim_pix_ce = 1'b0;
 	always @(posedge clk_sys) sim_pix_ce <= ~sim_pix_ce;
@@ -725,7 +725,7 @@ module emu
 	);
 
 	// On-chip framebuffer (BRAM). Video reads port B (Phase 2); CPU VRAM writes
-	// are mirrored into port A. Single clk_sys domain => coherent. Must match MacLC.sv.
+	// are mirrored into port A. Single clk_sys domain => coherent. Must match MacIIvi.sv.
 	wire [10:0] v8_words_per_line;
 	wire [17:0] vram_bram_waddr;
 	wire        vram_bram_we;
@@ -805,7 +805,7 @@ module emu
 		.selectSCSIDMA(selectSCSIDMA),
 		.scsiDREQ(scsiDREQ),
 		.scsiIRQ(scsiIRQ),
-		// JTAG probe feeds — FPGA-only (dbg_probes.sv lives in MacLC.sv;
+		// JTAG probe feeds — FPGA-only (dbg_probes.sv lives in MacIIvi.sv;
 		// altsource_probe is an Altera primitive, never bring it into sim)
 		.dbg_scsi(),
 		.dbg_scsi2(),
@@ -886,7 +886,7 @@ module emu
 	// Floppy disk image tracking
 	reg dsk_int_ds, dsk_ext_ds;
 	reg dsk_int_ss, dsk_ext_ss;
-	// DiskCopy 4.2 header skip — mirror of MacLC.sv (rationale there).
+	// DiskCopy 4.2 header skip — mirror of MacIIvi.sv (rationale there).
 	reg dc42_name_ok;
 	reg dc42_skip;
 	wire dsk_int_ins = dsk_int_ds || dsk_int_ss;
@@ -986,7 +986,7 @@ module emu
 	wire        ram_we   = download_cycle ? 1'b1                  : !_ramWE;
 	wire        ram_oe   = download_cycle ? 1'b0                  : (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
 	wire [15:0] ram_do_raw;
-	// --- Force cold-boot path (warm-reset hang workaround) — keep in sync with MacLC.sv.
+	// --- Force cold-boot path (warm-reset hang workaround) — keep in sync with MacIIvi.sv.
 	// Patch the boot ROM's warm-vs-cold `bne.w` at ROM byte $4655E (SDRAM word
 	// $52322F) to UNCONDITIONAL (0x6600 -> 0x6000) as it is fetched, so every boot
 	// runs the full cold RAM march. No-op on a cold boot (branch already taken);
@@ -996,7 +996,7 @@ module emu
 	wire [15:0] ram_do   = download_cycle ? 16'hffff : (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux : ram_do_patched;
 	// Disk byte-parity select: must be dskReadAddr[0], NOT memoryAddr[0] (which
 	// is dskReadAddr[1] after the >>1 word conversion drops bit 0). See the long
-	// note at the matching demux in MacLC.sv — the old bit selected the wrong
+	// note at the matching demux in MacIIvi.sv — the old bit selected the wrong
 	// byte on odd addresses and corrupted every floppy sector. Keep in sync.
 	wire dsk_byte_odd = dskReadAckExt ? dskReadAddrExt[0] : dskReadAddrInt[0];
 	wire [15:0] extra_rom_data_demux = dsk_byte_odd ?

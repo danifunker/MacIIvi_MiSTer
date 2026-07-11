@@ -1,4 +1,4 @@
-| Focused Format-$B continue-past RTE unit test for TG68 (MacLCii).
+| Focused Format-$B continue-past RTE unit test for TG68 (MacIIvi).
 | Reproduces the Mac OS bus-error-protected probe in isolation:
 |   install BERR handler -> touch a faulting address -> handler clears DF
 |   (SSW bit 8) + DIB, then RTE to "continue past".

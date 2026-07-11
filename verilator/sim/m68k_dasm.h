@@ -1,6 +1,6 @@
 /*
  * Minimal header for Musashi 68000 disassembler
- * For use in MacLCii Verilator simulation
+ * For use in MacIIvi Verilator simulation
  */
 
 #ifndef M68K_DASM_H

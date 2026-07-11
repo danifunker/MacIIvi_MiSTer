@@ -1,4 +1,4 @@
-# MacLCii project timing constraints (read after sys/sys_top.sdc).
+# MacIIvi project timing constraints (read after sys/sys_top.sdc).
 #
 # ----------------------------------------------------------------------------
 # TG68 kernel multicycle — REQUIRED for reliable timing closure.
@@ -67,7 +67,7 @@ set_multicycle_path -hold  -end 1 \
 # ----------------------------------------------------------------------------
 # Peripheral (VPA) read-data register — SCSI read-path fit-stabilization.
 # ----------------------------------------------------------------------------
-# periph_din_reg (MacLC.sv) captures the peripheral read mux (dataControllerDataOut)
+# periph_din_reg (MacIIvi.sv) captures the peripheral read mux (dataControllerDataOut)
 # one clk_sys stage before the CPU samples it on VPA/6800 cycles. Its deepest input
 # cone is the SCSI CSR's scsi_bsy bit (scsi.v phase -> |target_bsy -> CSR -> far
 # route -> 7-way mux) — historically THE fit-sensitive net (bit6/scsi_bsy read

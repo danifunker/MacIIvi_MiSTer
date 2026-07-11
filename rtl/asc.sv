@@ -10,7 +10,7 @@
 // Register file at $F14800-$F1480F, stride 1: register = (addr - 0x800).
 // IMPORTANT: the odd-numbered registers (MODE $801, FIFOMODE $803, CLOCK $807)
 // live at odd byte addresses, so the top level MUST feed the real A0 into
-// `addr` (see MacLC.sv / sim.v: .addr({cpuAddr[11:1], tg68_a[0]})). If A0 is
+// `addr` (see MacIIvi.sv / sim.v: .addr({cpuAddr[11:1], tg68_a[0]})). If A0 is
 // dropped, the odd regs alias onto the even reg below them and the boot-chime
 // FIFOMODE-clear / MODE-start / FIFOSTAT-poll handshake never completes.
 //

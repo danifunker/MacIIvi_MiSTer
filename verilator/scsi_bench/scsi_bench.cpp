@@ -5,7 +5,7 @@
 // (byte at global offset d == d & 0xFF) and checks the stream the host
 // reads back for swapped / dropped / duplicated bytes.
 //
-// The real system paces DACK reads with DTACK = ~dreq (MacLC.sv:637): the
+// The real system paces DACK reads with DTACK = ~dreq (MacIIvi.sv:637): the
 // CPU *starts* the bus cycle unconditionally (i_dma_rd rises immediately,
 // which is when ncr5380 pre-latches the longword second word), then stalls
 // until dreq. How many clk32 cycles after dreq-rise the CPU samples rdata

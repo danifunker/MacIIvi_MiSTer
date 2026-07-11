@@ -886,7 +886,7 @@ module adb_device(
 	//   probe[11:8]  = mouse_addr  (boot default 3; should change after System ADBReInit)
 	//   probe[15:12] = kbd_addr    (boot default 2)
 	//   probe[31:16] = last Listen-Register-3 payload {addr/flags byte, handler byte}
-	// Enabled via the USE_ADB_ISSP macro in MacLCii.qsf; absent from release/Verilator builds.
+	// Enabled via the USE_ADB_ISSP macro in MacIIvi.qsf; absent from release/Verilator builds.
 	// ---- mouse/keyboard data-path diagnostics (separate block; does not touch FSM) ----
 	reg [7:0] dbg_mtalk, dbg_ktalk, dbg_mmove, dbg_mresp;
 	reg [7:0] dbg_kbd_evt, dbg_ksrq;

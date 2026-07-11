@@ -31,4 +31,4 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/v8_clocks.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/egret/egret_wrapper.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/egret/m68hc05_alu.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/egret/m68hc05_core.sv
-set_global_assignment -name SYSTEMVERILOG_FILE MacLC.sv
+set_global_assignment -name SYSTEMVERILOG_FILE MacIIvi.sv

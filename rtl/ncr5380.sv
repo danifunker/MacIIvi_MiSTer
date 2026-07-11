@@ -745,7 +745,7 @@ module ncr5380
 	assign dbg_wr = dbg_wr_mux;
 
 	// NOTE: lbmactwo's JTAG In-System Source/Probe (altsource_probe) blocks for
-	// target_wrsnap/target_selsnap were removed in the MacLCii port — this core has
+	// target_wrsnap/target_selsnap were removed in the MacIIvi port — this core has
 	// no Quartus ISSP infrastructure and does not depend on the Altera primitive.
 	// The dbg_* module outputs are still driven (left unconnected upstream); the
 	// per-target wrsnap/selsnap snapshot wires are simply unused here.

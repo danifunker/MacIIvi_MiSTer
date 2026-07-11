@@ -39,7 +39,7 @@ public:
 	CData* ioctl_download;
 	CData* ioctl_upload;
 	CData* ioctl_wr;
-	SData* ioctl_dout;  // 16-bit for MacLCii
+	SData* ioctl_dout;  // 16-bit for MacIIvi
 	SData* ioctl_din;
 
 	void BeforeEval(void);

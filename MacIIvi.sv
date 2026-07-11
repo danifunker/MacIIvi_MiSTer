@@ -55,7 +55,7 @@ module emu
 	
 	`include "build_id.v"
 	localparam CONF_STR = {
-		"MacLCii;UART57600:115200;",
+		"MacIIvi;UART57600:115200;",
 		"-;",
 		"F1,DSKIMG,Mount Pri Floppy;",
 		"F2,DSKIMG,Mount Sec Floppy;",
@@ -476,7 +476,7 @@ module emu
 
 	// Video-domain reset: hold scanout in reset until its PLL locks, released
 	// synchronously in clk_vid. (*_meta = 2FF first stage, false-pathed in
-	// MacLCii.sdc.)
+	// MacIIvi.sdc.)
 	reg vidrst_meta = 1'b1, vidrst_s = 1'b1;
 	always @(posedge clk_vid) begin
 		vidrst_meta <= ~n_reset || ~pll_video_locked;
@@ -765,7 +765,7 @@ module emu
 	// window absorbs the +1 latency completely (sampled at s_state 6, settled by
 	// ~s_state 3), so no DTACK/VMA change is needed and the memory (DTACK) read
 	// path — including SCSI pseudo-DMA (selectSCSIDMA) and the PMMU walker's RAM
-	// reads — is byte-for-byte unchanged. MacLCii.sdc adds a conservative 2×
+	// reads — is byte-for-byte unchanged. MacIIvi.sdc adds a conservative 2×
 	// multicycle on `-to periph_din_reg` (supersedes the old constraint-only
 	// `-from {*ncr5380*} -to {*tg68_din_r*}` relaxation). periph_din_reg is only
 	// CONSUMED during VPA reads, when its combinational input is held stable by
@@ -1423,7 +1423,7 @@ module emu
 	//                  samples. If it counts on hardware but you hear nothing,
 	//                  the ASC works and the issue is downstream (sys_top/output/
 	//                  build). If it's frozen, the ASC isn't being clocked/selected.
-	// Enabled via the USE_AUDIO_ISSP macro in MacLCii.qsf; absent from release/sim.
+	// Enabled via the USE_AUDIO_ISSP macro in MacIIvi.qsf; absent from release/sim.
 	//   probe[15:0]  = current ASC sample (signed)
 	//   probe[31:16] = ASC write count — edge-detected CPU writes to the ASC. If this
 	//                  advances, the CPU IS feeding the ASC (issue is the ASC/output);

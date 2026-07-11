@@ -1,11 +1,11 @@
-// JTAG In-System probes for MacLCii — ported from the LBMacTwo dbg_min.sv
+// JTAG In-System probes for MacIIvi — ported from the LBMacTwo dbg_min.sv
 // methodology (same instance IDs and layouts wherever a probe has an
 // LBMacTwo twin, so the decode knowledge and reader tooling carry over).
 //
 // Read with:  bash scripts/read_probes.sh          (all probes, decoded)
 //             quartus_stp_tcl -t scripts/sample_loop.tcl 120   (loop sampler)
 //
-// FPGA-ONLY: this module is instantiated from MacLC.sv (never sim.v), so
+// FPGA-ONLY: this module is instantiated from MacIIvi.sv (never sim.v), so
 // the altsource_probe Altera primitive never reaches Verilator. Keep it
 // that way — do NOT add it to the simulator top.
 //

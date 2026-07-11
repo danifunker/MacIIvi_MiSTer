@@ -1,6 +1,6 @@
 // Focused standalone testbench for TG68K_PMMU_030.
 //
-// Goal: reproduce + diagnose the MacLCii boot Sad Mac, which is a PMMU
+// Goal: reproduce + diagnose the MacIIvi boot Sad Mac, which is a PMMU
 // mistranslation of the 32-bit ROM alias during the 24->32-bit MMU mode switch.
 //
 // MAME oracle (the CORRECT walk):

@@ -1,10 +1,10 @@
-# MacLCii Verilator Simulation Architecture
+# MacIIvi Verilator Simulation Architecture
 
-This document describes the verilator simulation setup for the MacLCii core.
+This document describes the verilator simulation setup for the MacIIvi core.
 
 ## Overview
 
-The verilator simulation allows running the MacLCii FPGA core in software for debugging and development. It replaces MiSTer-specific hardware interfaces with simulation-friendly equivalents.
+The verilator simulation allows running the MacIIvi FPGA core in software for debugging and development. It replaces MiSTer-specific hardware interfaces with simulation-friendly equivalents.
 
 ## File Structure
 
@@ -12,7 +12,7 @@ The verilator simulation allows running the MacLCii FPGA core in software for de
 
 | File | Description |
 |------|-------------|
-| `sim.v` | Top-level simulation wrapper adapted from MacLC.sv |
+| `sim.v` | Top-level simulation wrapper adapted from MacIIvi.sv |
 | `sim_ram.v` | Simple 8MB synchronous RAM replacing SDRAM |
 | `sim_main.cpp` | C++ testbench with GUI (ImGui) |
 | `Makefile` | Build configuration for verilator |
@@ -101,7 +101,7 @@ Requirements:
 
 ## Data Widths
 
-The simulation uses 16-bit data paths to match the MacLCii hardware:
+The simulation uses 16-bit data paths to match the MacIIvi hardware:
 
 | Signal | Width | Description |
 |--------|-------|-------------|

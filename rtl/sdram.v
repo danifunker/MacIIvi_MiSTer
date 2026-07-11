@@ -144,7 +144,7 @@ reg oe_latch, we_latch;
 // SDRAM accesses (gray-stall, builds #13/#14/#16).
 reg [23:0] addr_latch;
 
-// Read-data-valid handshake (2026-06-25): a RAM/VRAM READ's DTACK (in MacLC.sv)
+// Read-data-valid handshake (2026-06-25): a RAM/VRAM READ's DTACK (in MacIIvi.sv)
 // must wait for the SDRAM to ACTUALLY finish the read, not fire at slot-start. The
 // borrowed PMMU-walk read otherwise gets a slot-start DTACK and the walker latches
 // `dout` before the read completes -> it captures stale bus data (the 10MB-boot Sad
@@ -218,7 +218,7 @@ always @(posedge clk_64) begin
 		end
 
 		// Data ready: latch dout AND publish it as valid for addr_latch, so the
-		// RAM-read DTACK in MacLC.sv only fires once this read has truly completed.
+		// RAM-read DTACK in MacIIvi.sv only fires once this read has truly completed.
 		if (t == STATE_READ && oe_latch) begin
 			dout       <= sd_data;
 			dout_addr  <= addr_latch;

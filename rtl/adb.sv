@@ -1,4 +1,4 @@
-/* ADB implementation for MacLCii */
+/* ADB implementation for MacIIvi */
 
 module adb(
 	input            clk,

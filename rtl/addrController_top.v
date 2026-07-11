@@ -113,7 +113,7 @@ module addrController_top(
 	// H1 (perf): video scanout reads the on-chip BRAM framebuffer (vram_bram),
 	// not SDRAM, so the CPU owns slots 00/01/11 (3 of 4 slots). The remaining
 	// "extra" slot (10) serves floppy disk reads. NOTE: the dtack glue in
-	// MacLC.sv/sim.v must assert per-cpu-slot (the 3 slots 11,00,01 are
+	// MacIIvi.sv/sim.v must assert per-cpu-slot (the 3 slots 11,00,01 are
 	// CONTIGUOUS, so a rising-edge detector would see only one edge per round
 	// and HALVE throughput).
 	assign cpuBusControl = (busCycle == 2'b00) || (busCycle == 2'b01) || (busCycle == 2'b11);
@@ -196,7 +196,7 @@ module addrController_top(
 	// placed ROM at $280000 — INSIDE the 8MB SIMM SDRAM region ($100000-$4FFFFF),
 	// so a 10MB RAM fill overwrote the ROM image and crashed the boot. $500000 sits
 	// safely between the SIMM ($100000-$4FFFFF) and VRAM ($580000). Must match the
-	// download mapping in MacLC.sv and verilator/sim.v.
+	// download mapping in MacIIvi.sv and verilator/sim.v.
 
 	// VRAM CPU access: CPU $F40000-$FBFFFF → SDRAM word $580000+
 	// Offset from VRAM start = cpuAddr[19:0] - $40000

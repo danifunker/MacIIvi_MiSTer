@@ -17,15 +17,15 @@ static DebugConsole console;
 
 IData* sd_lba[kVDNUM]= {NULL,NULL,NULL,NULL,NULL,
                    NULL,NULL,NULL,NULL,NULL};
-CData* sd_rd=NULL;           // 2-bit in MacLCii
-CData* sd_wr=NULL;           // 2-bit in MacLCii
-CData* sd_ack=NULL;          // 2-bit in MacLCii
-CData* sd_buff_addr=NULL;    // 8-bit for MacLCii
-SData* sd_buff_dout=NULL;    // 16-bit for MacLCii
+CData* sd_rd=NULL;           // 2-bit in MacIIvi
+CData* sd_wr=NULL;           // 2-bit in MacIIvi
+CData* sd_ack=NULL;          // 2-bit in MacIIvi
+CData* sd_buff_addr=NULL;    // 8-bit for MacIIvi
+SData* sd_buff_dout=NULL;    // 16-bit for MacIIvi
 SData* sd_buff_din[kVDNUM]= {NULL,NULL,NULL,NULL,NULL,
-                   NULL,NULL,NULL,NULL,NULL};  // 16-bit for MacLCii
+                   NULL,NULL,NULL,NULL,NULL};  // 16-bit for MacIIvi
 CData* sd_buff_wr=NULL;
-CData* img_mounted=NULL;     // 2-bit in MacLCii
+CData* img_mounted=NULL;     // 2-bit in MacIIvi
 CData* img_readonly=NULL;
 QData* img_size=NULL;
 
@@ -93,7 +93,7 @@ void SimBlockDevice::BeforeEval(int cycles)
    //fprintf(stderr,"current_disk = %d *sd_rd %x ack_delay %x reading %d writing %d\n",current_disk,*sd_rd,ack_delay,reading,writing);
 
     if (current_disk == i) {
-    // send data - 16-bit word at a time for MacLCii
+    // send data - 16-bit word at a time for MacIIvi
     if (ack_delay==1) {
       if (reading && (*sd_buff_wr==0) &&  (bytecnt<kBLKSZ)) {
          // Read 2 bytes and combine into 16-bit word

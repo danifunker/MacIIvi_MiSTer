@@ -19,7 +19,7 @@
 //                            OSD cannot select Portrait today)
 //
 // STATIC configuration = C0=28 (25.175 MHz VGA): the FSM's change-detect in
-// MacLC.sv inits to this value, so a VGA boot performs NO runtime reconfig at
+// MacIIvi.sv inits to this value, so a VGA boot performs NO runtime reconfig at
 // all — the first pixel-clock build (static /12 + boot-time retarget) BERR-
 // stormed on HW: the PLL unlock/relock glitched CLK_VIDEO right while the HPS
 // was mounting SD images and ascal was locking, degrading SCSI serving into

@@ -1195,7 +1195,7 @@ int verilate() {
 }
 
 void show_help() {
-	printf("Mac LC Hardware Simulator\n");
+	printf("Mac IIvi Hardware Simulator\n");
 	printf("Usage: ./Vemu [options]\n\n");
 	printf("Options:\n");
 	printf("  -h, --help                    Show this help message\n");
@@ -1348,16 +1348,16 @@ int main(int argc, char** argv, char** env) {
 	Verilated::commandArgs(argc, argv);
 	Verilated::traceEverOn(true);
 
-	// Attach bus - using 16-bit ioctl_dout for MacLCii
+	// Attach bus - using 16-bit ioctl_dout for MacIIvi
 	bus.ioctl_addr = &VERTOPINTERN->ioctl_addr;
 	bus.ioctl_index = &VERTOPINTERN->ioctl_index;
 	bus.ioctl_wait = &VERTOPINTERN->ioctl_wait;
 	bus.ioctl_download = &VERTOPINTERN->ioctl_download;
 	bus.ioctl_wr = &VERTOPINTERN->ioctl_wr;
-	bus.ioctl_dout = &VERTOPINTERN->ioctl_dout;  // 16-bit for MacLCii
+	bus.ioctl_dout = &VERTOPINTERN->ioctl_dout;  // 16-bit for MacIIvi
 	input.ps2_key = &VERTOPINTERN->ps2_key;
 
-	// Hookup block device for SCSI (2 devices for MacLCii)
+	// Hookup block device for SCSI (2 devices for MacIIvi)
 	blockdevice.sd_lba[0] = &VERTOPINTERN->sd_lba[0];
 	blockdevice.sd_lba[1] = &VERTOPINTERN->sd_lba[1];
 	blockdevice.sd_rd = &VERTOPINTERN->sd_rd;
@@ -1465,8 +1465,8 @@ int main(int argc, char** argv, char** env) {
 	fprintf(stderr, "Machine type: Mac LC, loading ROM: %s\n", rom_file);
 
 	// Floppy images stream into SDRAM via ioctl, same as a HPS mount.
-	// MacLCii uses ioctl_index 1 (F1/primary) and 2 (F2/secondary) — see
-	// MacLC.sv dio_a decode. (lbmactwo uses 2/3 because index 1 is its NuBus ROM.)
+	// MacIIvi uses ioctl_index 1 (F1/primary) and 2 (F2/secondary) — see
+	// MacIIvi.sv dio_a decode. (lbmactwo uses 2/3 because index 1 is its NuBus ROM.)
 	for (int disk_index = 0; disk_index < 2; disk_index++) {
 		if (!floppy_disk_files[disk_index].empty()) {
 			int ioctl_index = disk_index == 0 ? 1 : 2;
