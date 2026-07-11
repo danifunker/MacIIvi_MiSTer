@@ -46,11 +46,12 @@ module dataController_top(
 	
 	input selectASC,
 	input [7:0] asc_data_in,
-	
-	input selectAriel,
-	input [7:0] ariel_data_in,
+
+	input selectVDAC,             // VASP-internal CLUT/DAC (same interface as the LC's Ariel)
+	input [7:0] vdac_data_in,
 	input selectPseudoVIA,
 	input [7:0] pseudovia_data_in,
+	input selectBoxID,            // $5FFFFFFC machine-ID longword ($A55A2016 = IIvi)
 	input selectUnmapped,
 
 	// RAM/ROM:
@@ -281,17 +282,21 @@ module dataController_top(
     wire [15:0] sccDataOut_full = { sccDataOut, sccDataOut };
     // scsiDataOut is already 16-bit: ncr5380 returns cur_data_pair on word
     // pseudo-DMA reads and { rdata8, rdata8 } otherwise — no duplication here.
-    wire [15:0] arielDataOut_full = {ariel_data_in, ariel_data_in};
+    wire [15:0] vdacDataOut_full = {vdac_data_in, vdac_data_in};
     wire [15:0] pviaDataOut_full = {pseudovia_data_in, pseudovia_data_in};
     wire [15:0] ascDataOut_full = {asc_data_in, asc_data_in};
+    // Machine-ID longword at $5FFFFFFC (MAME maciivx.cpp maciivi_map):
+    // $A55A2016 on the 16-bit bus = word $A55A at +$0 (A1=0), $2016 at +$2.
+    wire [15:0] boxIDDataOut = cpuAddrRegLo[0] ? 16'h2016 : 16'hA55A;
 
     assign cpuDataOut = selectIWM ? swimDataOut :
                         selectVIA ? viaDataOut_full :
                         selectSCC ? sccDataOut_full :
                         selectSCSI ? scsiDataOut :
-                        selectAriel ? arielDataOut_full :
+                        selectVDAC ? vdacDataOut_full :
                         selectPseudoVIA ? pviaDataOut_full :
                         selectASC ? ascDataOut_full :
+                        selectBoxID ? boxIDDataOut :
                         // Unmapped reads: return 16'hFFFF (MAME's open-bus
                         // convention). Previously returned 16'h0000 which was
                         // deterministic — the boot ROM's RAM-probe XOR-pattern
@@ -411,14 +416,10 @@ module dataController_top(
 
 	assign _viaIrq = ~viaIrq;
 
-	// Port A - Mac LC configuration sense lines.
-	// MAME v8.cpp via_in_a(): return 0xd4 | (config & 1), where config bit0 =
-	// FPU present. The LC has no FPU, so the correct value is $D4 (not the old
-	// $55 placeholder). NOTE: setting $D4 alone does NOT avoid the STM serial
-	// monitor (confirmed: with $D4 our VIA matches MAME exactly yet still enters
-	// STM), so the STM-entry root cause is elsewhere (boot state machine). Keep
-	// $55 until the real cause is found, to avoid mixing unconfirmed changes.
-	assign via_pa_i = 8'h55;
+	// Port A — IIvi/VASP configuration sense lines.
+	// MAME vasp.cpp via_in_a() returns a fixed $D5 (no FPU/config bit games
+	// like the LC's V8). MAME-true from day one for the IIvi ROM.
+	assign via_pa_i = 8'hd5;
 	// Sound volume still comes from PA[2:0] output latch
 	assign snd_vol = ~via_pa_oe[2:0] | via_pa_o[2:0];
 	assign driveSel = ~via_pa_oe[4] | via_pa_o[4];  // Drive select from VIA PA4

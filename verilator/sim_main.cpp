@@ -627,30 +627,9 @@ int verilate() {
 				}
 			}
 
-			// --- Candidate-B gating verification: track pseudovia V8 RAM-config
-			// register (ram_cfg) changes vs the F45 enumeration / table build.
-			// Logs reset-init + every ROM write, with frame, PC and bits[7:6].
-			{
-				static int prev_ramcfg = -1;
-				int rc = (int)VERTOPINTERN->emu__DOT__pvia__DOT__ram_cfg;
-				if (rc != prev_ramcfg) {
-					DLOG( "[RAMCFG] %02X->%02X F%d pc=%06X bits76=%d%d\n",
-						prev_ramcfg & 0xFF, rc & 0xFF, video.count_frame,
-						VERTOPINTERN->debug_pc & 0xFFFFFF, (rc>>7)&1, (rc>>6)&1);
-					prev_ramcfg = rc;
-				}
-				// Decisive: did the ram_configured latch ever trip (ROM wrote
-				// config reg $01)? If it stays 0, $0 low-mem globals stay unmapped
-				// -> divergence at $A499xx (reads $19A.w/$DE0.w return garbage).
-				static int prev_rcfgd = -1;
-				int rcfgd = (int)VERTOPINTERN->emu__DOT__pvia_ram_configured;
-				if (rcfgd != prev_rcfgd) {
-					DLOG( "[RAMCFGD] ram_configured %d->%d F%d pc=%06X\n",
-						prev_rcfgd, rcfgd, video.count_frame,
-						VERTOPINTERN->debug_pc & 0xFFFFFF);
-					prev_rcfgd = rcfgd;
-				}
-			}
+			// (LC II "Candidate-B" V8 RAM-config trace removed: the IIvi/VASP
+			// has no RAM-config register banking — RAM is one contiguous block
+			// per MAME vasp.cpp; see docs/VASP_RETARGET.md.)
 
 			// [BERRFRAME] 68030 bus-fault frame build + Format-$B RTE consume trace.
 			// Ground-truths the OS "continue-past" probe bug. DISP line = the frame as

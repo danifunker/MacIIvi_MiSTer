@@ -1,7 +1,8 @@
 //============================================================================
-//  Macintosh LC
+//  Macintosh IIvi
 //
-//  Based on MacPlus core by Sorgelig
+//  VASP chipset core derived from the MacLCII core (imported @ a254a02);
+//  lineage: MacPlus core by Sorgelig / Plus Too.
 //  Copyright (C) 2025-2026 Dani Sarfati
 //
 //  This program is free software; you can redistribute it and/or modify it
@@ -68,7 +69,7 @@ module emu
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 		"OA,Monitor,640x480 VGA,512x384 12in RGB;",
 		"-;",
-		"O23,Memory,4MB,2MB,10MB;",
+		"O23,Memory,4MB,8MB,20MB,36MB;",
 		"-;",
 		"R5,Interrupt (NMI / MacsBug);",
 		"R6,Reset PRAM & Core;",
@@ -499,23 +500,20 @@ module emu
 	assign AUDIO_S = 1;
 	assign AUDIO_MIX = 0;
 
-	// Mac LC II memory configuration
-	// V8 RAM config byte (MAME encoding):
-	//   Bits 7:6 = SIMM bank A size (00=0MB, 01=2MB, 10=4MB, 11=8MB)
-	//   Bit 5 = Motherboard bank B (0=4MB, 1=2MB)
-	//   Bit 2 = Always set on read (handled in pseudovia)
-	// The Mac LC II solders 4MB (bank B, bit5=0); MAME's maclc2 sets baseram_is_4M.
-	// Supported menu configs (status[3:2]):
-	//   4MB  = $04  (4MB board, no SIMM)            <- LC II base / default
-	//   2MB  = $24  (2MB board, no SIMM)            <- 2MB-board fallback
-	//   10MB = $E4  (2MB board used + 8MB SIMM)     <- bank B forced to 2MB (MAME)
-	// NOTE: the 10MB path is not yet verified against MAME (-ramsize 10M); only
-	// the base configs are exercised. See docs and addrController_top.v.
-	wire [7:0] configRAMSize = (status[3:2] == 2'b00) ? 8'h04 :  // 4MB (LC II base)
-	                           (status[3:2] == 2'b01) ? 8'h24 :  // 2MB
-	                                                    8'hE4;   // 10MB
-	wire [7:0] pvia_ram_config_out;   // Active RAM config from pseudovia
-	wire       pvia_ram_configured;   // ROM has programmed V8 RAM config ($0 mirror enable)
+	// Macintosh IIvi memory configuration — VASP model (docs/VASP_RETARGET.md):
+	// one CONTIGUOUS block at $0 (4MB motherboard + one SIMM bank), no V8-style
+	// config-register banking. The ROM sizes memory by probing; open-bus $FFFF
+	// above ram_size ends the probe. Menu configs (status[3:2], latched at
+	// reset into status_mem):
+	//   4MB  = motherboard only (Apple base config, default)
+	//   8MB  = 4 + 4x1MB SIMMs
+	//   20MB = 4 + 4x4MB SIMMs
+	//   36MB = 4 + 32MB (MAME "36M" option) — REQUIRES a 64MB SDRAM module
+	// (68MB hardware max deferred: exceeds a 64MB module.)
+	wire [25:0] ram_size_bytes = (status_mem == 2'b00) ? 26'h0400000 :  // 4MB
+	                             (status_mem == 2'b01) ? 26'h0800000 :  // 8MB
+	                             (status_mem == 2'b10) ? 26'h1400000 :  // 20MB
+	                                                     26'h2400000;   // 36MB
 				  
 	// Serial Ports
 	wire serialOut;
@@ -530,9 +528,13 @@ module emu
 	wire [7:0] ariel_pixel_addr;
 	wire [23:0] ariel_palette_data;
 	wire [7:0] ariel_reg_dout;
-	wire selectAriel;      // From address decoder
+	wire selectVDAC;       // From address decoder (VASP-internal CLUT/DAC)
 	wire selectPseudoVIA;  // From address decoder
 	wire selectVRAM;       // From address decoder
+	wire selectBoxID;      // $5FFFFFFC machine-ID longword
+	wire selectSuperSlot;  // NuBus $C/$D/$E super-slot space
+	wire selectSlot;       // NuBus $FC/$FD/$FE slot space
+	wire [1:0] slotNum;    // 0=$C 1=$D 2=$E
 	wire [7:0] pseudovia_dout;
 	wire pseudovia_irq;
 
@@ -576,12 +578,10 @@ module emu
 	wire _memoryUDS, _memoryLDS;
 	wire dioBusControl;
 	wire cpuBusControl;
-	wire [22:0] memoryAddr;  // 23-bit SDRAM word address from address controller (lower 16MB)
-	wire        mb_hi;       // motherboard-bank select -> sdram_addr[23] (relocates bank to upper 16MB)
+	wire [24:0] memoryAddr;  // 25-bit SDRAM word address from address controller
 	wire [15:0] memoryDataOut;
 	wire memoryLatch;
 	// peripherals
-	wire pds_slot_irq = 1'b0;  // PDS slot interrupt — single point for future PDS work
 	wire vid_alt;
 	wire memoryOverlayOn, selectSCSI, selectSCC, selectIWM, selectVIA, selectRAM, selectROM, selectASC, selectUnmapped;
 	wire selectSCSIDMA;   // SCSI pseudo-DMA window (DACK) from address decoder
@@ -590,7 +590,7 @@ module emu
 	// JTAG probe feeds from the SCSI engine (consumed by dbg_probes below)
 	wire [15:0] dbg_scsi_w, dbg_scsi2_w, dbg_scsi4_w, dbg_scsi5_w;
 	wire [31:0] dbg_ncr_w, dbg_ncr2_w, dbg_wr_w;
-	wire [23:0] overlay_trigger_addr;
+	wire [31:0] overlay_trigger_addr;
 	wire [15:0] dataControllerDataOut;
 
 	// floppy disk image interface
@@ -641,38 +641,27 @@ module emu
 		end
 	end
 
-	// VRAM ($F40000-$FBFFFF, cpuAddr[23:21]==111) must use async DTACK like RAM,
-	// not the 6800 E-clock VPA peripheral path — the VPA path samples on a fixed
-	// E-phase that misses the SDRAM cpu-slot and returns stale data, mis-sizing
-	// the video bank and leaving the screen black.
 	// FC=7 is the 68k CPU space. cpuAddr[19:16] is the CPU-space cycle-type field:
 	//   $F = interrupt acknowledge  -> autovector via VPA (Mac autovectored IRQs)
 	//   else ($0 breakpoint, $2 coprocessor, ...) = no responder -> bus error.
-	// The boot ROM probes for hardware with `moves.w $22000,D1` (SFC=7), an
-	// access that MUST bus-error; asserting VPA there wrongly completes the probe
-	// and corrupts the machine-config word, routing the boot into the STM
-	// serial diagnostic instead of the desktop. See memory: stm-root-cause-moves-berr.
+	// The boot ROM probes for hardware with `moves` accesses (SFC=7) that MUST
+	// bus-error; asserting VPA there wrongly completes the probe and corrupts
+	// the machine-config word. (LC lineage: memory stm-root-cause-moves-berr.)
 	wire        fc7_iack = (cpuFC == 3'b111) && (cpuAddr[19:16] == 4'hF);
 	// FC=7 non-IACK = CPU space with no responder (breakpoint/coprocessor/probe).
-	// It MUST bus-error: suppress BOTH VPA and DTACK so no responder completes the
-	// cycle, regardless of the (possibly garbage) address the EA computed. The boot
-	// ROM's `moves.w $22000,D1` (SFC=7) relies on this fault; if VPA/DTACK answer it
-	// the probe completes inline and boot diverts into the STM serial diagnostic.
+	// It MUST bus-error: suppress BOTH VPA and DTACK so no responder completes
+	// the cycle, regardless of the (possibly garbage) address the EA computed.
 	wire        fc7_berr = (cpuFC == 3'b111) && !fc7_iack;
-	// NuBus/PDS slot space ($F1000000-$FEFFFFFF): the boot ROM and Slot
-	// Manager probe pseudo-slots (LC PDS = slot $E at $FE000000) in 32-bit
-	// mode behind a temporary BERR handler ($A4BEBx: _SwapMMUMode + probe of
-	// $FE000010/$1C). A real cardless LC BUS-ERRORS there; truncating to 24
-	// bits instead aliased the probe onto RAM ($000010 = the exception
-	// vectors), the probe "succeeded", the ROM recorded a phantom PDS card,
-	// and System 7's slot init later jumped through garbage descriptors →
-	// the varying boot-phase Sad Macs. Window deliberately EXCLUDES:
-	//   $50 (32-bit I/O alias, served via 24-bit truncation), $40-$4F (ROM),
-	//   $20-$E0 (24-bit Memory Manager flag bytes on handles — must keep
-	//   aliasing to RAM exactly as a V8 ignoring A31-A24 would), and $FF.
-	// docs/plan_040526.md step 2 tried a BLANKET high-bit BERR and regressed
-	// boot — this is the targeted version.
-	wire        slot_space = (cpuAddrFullHi >= 8'hF1) && (cpuAddrFullHi <= 8'hFE);
+	// VASP 32-bit regions (decoder-driven — see rtl/addrDecoder.v):
+	//   io_space  = the $50xxxxxx VASP I/O block -> 6800-style VPA/E-clock
+	//               cycles (except SCSI pseudo-DMA, which is DREQ-gated DTACK)
+	//   slot_space = NuBus slot + super-slot space ($C/$D/$E). Until the NuBus
+	//               arbiter is wired: ACK with open-bus $FFFF (the lbmactwo
+	//               empty-slot convention; TG68 BERR frames are not
+	//               handler-recoverable for normal cycles, hardware-validated
+	//               on the Mac II core). The mdc824 integration replaces this.
+	wire        io_space   = (cpuAddrFullHi == 8'h50);
+	wire        slot_space = selectSuperSlot || selectSlot;
 	// SCSI pseudo-DMA ($F06000/$F12000) must use ASYNC DTACK gated by the NCR5380's
 	// DREQ — NOT the 6800-style VPA path the rest of the $F0xxxx I/O region uses.
 	// A VPA cycle completes on the E-clock regardless of whether the SCSI chip has
@@ -735,11 +724,11 @@ module emu
 		end
 	end
 
-	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space) ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
+	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space) ? 1'b1 : ~(!_cpuAS && io_space && !selectSCSIDMA));
 	assign      _cpuDTACK = fc7_berr ? 1'b1 :
 	                        (slot_space && !_cpuAS) ? 1'b0 :
 	                        selectSCSIDMA ? ~scsiDREQ :
-	                        (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
+	                        (~(!_cpuAS && !io_space) | !dtack_en);
 
 	// ─────────────────────────────────────────────────────────────────────────
 	// SCSI / peripheral read-path fit-stabilization (structural fix; ported from
@@ -771,7 +760,7 @@ module emu
 	// CONSUMED during VPA reads, when its combinational input is held stable by
 	// the CPU. Mirrored in verilator/sim.v.
 	wire vpa_periph_read = !fc7_iack && !fc7_berr && !slot_space && !_cpuAS &&
-	                       (cpuAddr[23:21] == 3'b111) && !selectVRAM && !selectSCSIDMA;
+	                       io_space && !selectSCSIDMA;
 	reg [15:0] periph_din_reg;
 	always @(posedge clk_sys) periph_din_reg <= dataControllerDataOut;
 	wire [15:0] cpu_din_muxed = slot_space      ? 16'hFFFF :
@@ -950,14 +939,8 @@ module emu
 		._cpuLDS(_cpuLDS),
 		._cpuRW(_cpuRW),
 		._cpuAS(_cpuAS),
-		.cpuFC(cpuFC),
-		.ram_config(pvia_ram_config_out),
-		.ram_config_phys(configRAMSize),   // PHYSICAL SIMM size — was unconnected (=0),
-		                                   // so the 10MB SIMM was invisible and the Mac
-		                                   // only ever saw the 2MB board. Mirrors sim.v.
-		.ram_configured(pvia_ram_configured),
+		.ram_size_bytes(ram_size_bytes),
 		.memoryAddr(memoryAddr),
-		.mb_hi(mb_hi),
 		.memoryLatch(memoryLatch),
 		._memoryUDS(_memoryUDS),
 		._memoryLDS(_memoryLDS),
@@ -979,9 +962,13 @@ module emu
 		.selectASC(selectASC),
 		.selectRAM(selectRAM),
 		.selectROM(selectROM),
-		.selectAriel(selectAriel),
+		.selectVDAC(selectVDAC),
 		.selectPseudoVIA(selectPseudoVIA),
 		.selectVRAM(selectVRAM),
+		.selectBoxID(selectBoxID),
+		.selectSuperSlot(selectSuperSlot),
+		.selectSlot(selectSlot),
+		.slotNum(slotNum),
 		.selectUnmapped(selectUnmapped),
 		.words_per_line(v8_words_per_line),
 		.vram_waddr(vram_bram_waddr),
@@ -1018,6 +1005,8 @@ module emu
 	wire [3:0] v8_monitor_id = status[10] ? 4'h2 :  // 512x384 12" RGB
 	                                         4'h6;   // 640x480 VGA (default)
 
+	// VASP-internal CLUT/DAC — same register interface as the LC's discrete
+	// Ariel RAMDAC (MAME vasp.cpp dac_r/dac_w), so the module carries over.
 	ariel_ramdac ariel(
 		.clk_sys(clk_sys),
 		.clk_pix(clk_vid),   // video lookup port in the scanout clock domain
@@ -1027,8 +1016,8 @@ module emu
 		.lds_n(_cpuLDS),
 		.data_in(cpuDataOut[7:0]),
 		.data_out(ariel_reg_dout),
-		.we(selectAriel && !_cpuRW && cpuBusControl),
-		.req(selectAriel && cpuBusControl),
+		.we(selectVDAC && !_cpuRW && cpuBusControl),
+		.req(selectVDAC && cpuBusControl),
 		.mem_latch(memoryLatch),
 		.cpu_as_n(_cpuAS),
 
@@ -1052,37 +1041,21 @@ module emu
 		.we(selectPseudoVIA && !_cpuRW && cpuBusControl),
 		.req(selectPseudoVIA && cpuBusControl),
 		.vblank_irq(v8_vblank_s),   // 2FF-synced from the clk_vid scanout domain
-		.slot_irq(pds_slot_irq),
+		// NuBus slot IRQs $C/$D/$E — wired by the NuBus/mdc824 integration
+		.slot_irq_c(1'b0),
+		.slot_irq_d(1'b0),
+		.slot_irq_e(1'b0),
 		.asc_irq(asc_irq),
-		// SCSI flags RE-TIED-OFF (2026-06-12 evening). History of reversals:
-		// - 06-11 (1f6c8d5): tied off — wiring them gave "System 7.x crash+
-		//   restart ~1s after Happy Mac, deterministic, dack_beats=14592";
-		//   System 6 survives (IER masks). MAME maclc.cpp does NOT connect
-		//   the 5380 irq_handler and boots LC System 7 — LC ground truth.
-		// - 06-12 morning: re-wired, on the theory the phantom PDS card
-		//   explained ALL the 06-11 evidence. WRONG CONFLATION: the phantom
-		//   card explained the Sad Macs (slot-init illegals — fixed,
-		//   validated); the crash-restart at dack=14592 was a SEPARATE
-		//   mechanism, and it returned tonight on every build carrying this
-		//   wiring (7.1 + 7.5.5, post-Happy-Mac, 6.0.8 immune — IER masks).
-		//   Likely a race: the NCR phase-mismatch irq_latch fires at a fresh
-		//   READ(10) command boundary (dack=14592 = first longword of one)
-		//   into IPL2 while System 7 is mid-install of its dispatch vectors
-		//   — probabilistic, which is why two afternoon runs threaded it.
-		// - The 06-12-morning re-wire rationale (async driver sleeps without
-		//   the IRQ) was WRONG too: MAME proves the LC boot path completes
-		//   with zero SCSI interrupts; the real sleep was the LocalTalk LAP
-		//   defer (SCC RR0 hunt bit — fixed in scc.v, the sccv2 change).
-		// Do NOT re-wire without MAME-grade evidence the LC V8 delivers
-		// these flags on real hardware.
+		// SCSI flags tied off — LC II lineage decision (System 7 crash-restart
+		// tracked to this wiring there; MAME maclc boots with the 5380
+		// irq_handler unconnected). Revisit for the IIvi against MAME maciivx
+		// (which DOES route 5380 DRQ/IRQ into the pseudoVIA via the scsihelp)
+		// during disk bring-up — see docs/VASP_RETARGET.md.
 		.scsi_irq(1'b0),
 		.scsi_drq(1'b0),
 		.irq_out(pseudovia_irq),
-		.ram_config(configRAMSize),
 		.monitor_id(v8_monitor_id),
-		.video_config(pvia_video_config),
-		.ram_config_out(pvia_ram_config_out),
-		.ram_configured(pvia_ram_configured)
+		.video_config(pvia_video_config)
 	);
 
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
@@ -1290,7 +1263,7 @@ module emu
 		.selectVIA(selectVIA),
 		.selectPseudoVIA(selectPseudoVIA),
 		.selectASC(selectASC),
-		.selectAriel(selectAriel),
+		.selectAriel(selectVDAC),   // probe port keeps the LC-era name
 		.selectIWM(selectIWM),
 		.selectSCC(selectSCC),
 		.scsiDREQ(scsiDREQ),
@@ -1330,9 +1303,9 @@ module emu
 		.cpu_pmmu_wdd(cpu_pmmu_wdd),
 		.cpu_pmmu_st(cpu_pmmu_st),
 		.cpu_dout(tg68_dout),
-		.cpu_memaddr(memoryAddr),
+		.cpu_memaddr(memoryAddr[22:0]),  // probe deck is 23-bit (LC-era forensics)
 		.cpu_ramwe_n(_ramWE),
-		.mb_hi_i(mb_hi),
+		.mb_hi_i(memoryAddr[23]),        // mb_hi retired; bit23 of the linear address
 		.walk_cycle(cpu_walk_cycle),
 		.ramOE_n(_ramOE),
 		.selectUnmapped(selectUnmapped),
@@ -1516,10 +1489,11 @@ module emu
 		.memoryDataOut(memoryDataOut),
 		.memoryDataIn(sdram_do),
 		.memoryLatch(memoryLatch),
-		.selectAriel(selectAriel),
-		.ariel_data_in(ariel_reg_dout),
+		.selectVDAC(selectVDAC),
+		.vdac_data_in(ariel_reg_dout),
 		.selectPseudoVIA(selectPseudoVIA),
 		.pseudovia_data_in(pseudovia_dout),
+		.selectBoxID(selectBoxID),
 		.selectUnmapped(selectUnmapped),
 		
 		// peripherals
@@ -1666,11 +1640,11 @@ module emu
 		end
 	end
 
-	// Download addresses (SDRAM word addresses):
-	//   ROM:      $500000 + offset
-	//   Floppy 1: $600000 + offset
-	//   Floppy 2: $700000 + offset
-	reg [22:0] dio_a;
+	// Download addresses (SDRAM word addresses, VASP layout):
+	//   ROM (1MB): $000000 + offset
+	//   Floppy 1:  $180000 + offset
+	//   Floppy 2:  $280000 + offset
+	reg [24:0] dio_a;
 	reg [15:0] dio_data;
 	reg        dio_write;
 
@@ -1692,9 +1666,9 @@ module emu
 			end
 			dio_data <= {ioctl_data[7:0], ioctl_data[15:8]};
 			case (dio_index[1:0])
-				2'b01:   dio_a <= 23'h600000 + {3'b0, dio_flp_a};  // Floppy 1
-				2'b10:   dio_a <= 23'h700000 + {3'b0, dio_flp_a};  // Floppy 2
-				default: dio_a <= {5'b10100, dio_addr[17:0]};      // ROM at $500000 (must match addrController rom_sdram_word)
+				2'b01:   dio_a <= 25'h0180000 + {5'b0, dio_flp_a};  // Floppy 1
+				2'b10:   dio_a <= 25'h0280000 + {5'b0, dio_flp_a};  // Floppy 2
+				default: dio_a <= {6'b0, dio_addr[18:0]};           // ROM (1MB) at $000000 (must match addrController rom_sdram_word)
 			endcase
 			ioctl_wait <= 1;
 		end
@@ -1716,14 +1690,12 @@ module emu
 
 	////////////////////////// SDRAM /////////////////////////////////
 
-	// SDRAM Address mapping for Mac LC (V8-style):
-	// memoryAddr[22:0] is already the SDRAM word address from addrController.
-	// bit23 = mb_hi: relocates the motherboard bank into the upper 16MB of the
-	// 32MB SDRAM (the lower-16MB region it used to use loses writes and corrupts
-	// the PMMU page table; build #8 2026-06-24). All other users keep bit23=0.
-	// Download path uses dio_a[22:0] directly (lower 16MB).
-	wire [24:0] sdram_addr = download_cycle ? {2'b00, dio_a[22:0]} :
-	                                          {1'b0, mb_hi, memoryAddr[22:0]};
+	// SDRAM Address mapping (VASP layout — docs/VASP_RETARGET.md):
+	// memoryAddr[24:0] is already the SDRAM word address from addrController
+	// (ROM $000000, VRAM $080000, floppies $180000/$280000, RAM $380000+).
+	// The 36MB RAM config reaches above the 32MB module boundary and needs a
+	// 64MB SDRAM module (sdram.v drives column A9 from addr[24]).
+	wire [24:0] sdram_addr = download_cycle ? dio_a : memoryAddr;
 	wire [15:0] sdram_din  = download_cycle ? dio_data :
 	                                          memoryDataOut;
 	wire  [1:0] sdram_ds   = download_cycle ? 2'b11 :
@@ -1734,7 +1706,7 @@ module emu
 	                                          (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
 	wire [15:0] sdram_do   = download_cycle ? 16'hffff :
 	                         (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux :
-	                                                            sdram_out_patched;
+	                                                            sdram_out;
 	// during rom/disk download ffff is returned so the screen is black during download
 	// "extra rom" is used to hold the disk image. It's expected to be byte wide and
 	// we thus need to properly demultiplex the word returned from sdram in that case
@@ -1755,19 +1727,9 @@ module emu
 							 {sdram_out[7:0],sdram_out[7:0]}:{sdram_out[15:8],sdram_out[15:8]};
 	wire [15:0] sdram_out;
 
-	// --- Force cold-boot path (warm-reset hang workaround) -----------------------
-	// The boot ROM chooses warm-vs-cold start with a `bne.w` at ROM byte $4655E
-	// (SDRAM word $52322F): d3 != 'WLSC' takes the FULL RAM march (cold path). On a
-	// warm reset RAM stays refreshed, so d3 == 'WLSC' and the core hangs on the warm
-	// path (only a full reconfig, which decays RAM, recovers). Force that one branch
-	// UNCONDITIONAL as it is fetched (`bne.w` 0x6600 -> `bra.w` 0x6000) so EVERY boot
-	// runs the cold march. No-op on a cold boot (the branch is taken anyway, d3 !=
-	// 'WLSC'). Guarded on the address AND the live opcode, so a different ROM is left
-	// untouched; catches both overlay and direct-ROM fetches (both selectROM->$52322F).
-	// Replaces the reverted sdram.init warm-reset hacks (d88c098 / 50d0c32), which
-	// broke cold boot. Keep in sync with verilator/sim.v.
-	wire [15:0] sdram_out_patched =
-		(!_romOE && memoryAddr == 23'h52322F && sdram_out == 16'h6600) ? 16'h6000 : sdram_out;
+	// (The LC II core patched its ROM's warm-vs-cold `bne.w` here — an LC-II-ROM
+	// workaround, retired for the IIvi ROM; re-derive if a warm-reset hang shows
+	// up during bring-up. See docs/VASP_RETARGET.md "LC-II-isms".)
 
 	assign SDRAM_CKE = 1;
 

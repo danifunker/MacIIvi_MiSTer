@@ -39,7 +39,7 @@ module sdram
 
 	input [15:0]        din,        // data input from chipset/cpu
 	output reg [15:0]   dout,       // data output to chipset/cpu
-	input [23:0]        addr,       // 24 bit word address
+	input [24:0]        addr,       // 25 bit word address (bit 24 = col A9, 64MB modules only)
 	input [1:0]         ds,         // upper/lower data strobe
 	input               oe,         // cpu/chipset requests read
 	input               we,         // cpu/chipset requests write
@@ -142,7 +142,7 @@ reg oe_latch, we_latch;
 // and byte strobes stay LIVE (valid only at the CAS phase). This replaces the
 // 2026-06-24 pending-service latch, whose late re-service path corrupted normal
 // SDRAM accesses (gray-stall, builds #13/#14/#16).
-reg [23:0] addr_latch;
+reg [24:0] addr_latch;
 
 // Read-data-valid handshake (2026-06-25): a RAM/VRAM READ's DTACK (in MacIIvi.sv)
 // must wait for the SDRAM to ACTUALLY finish the read, not fire at slot-start. The
@@ -151,7 +151,7 @@ reg [23:0] addr_latch;
 // Mac). That the re-read retry boots PROVES the data is in SDRAM and the single read
 // was merely mis-timed. dout_addr/dout_valid record which address `dout` currently
 // holds; any write invalidates it, so a read can never return pre-write data.
-reg [23:0] dout_addr;
+reg [24:0] dout_addr;
 reg        dout_valid;
 assign ram_ready = dout_valid && (dout_addr == addr);
 
@@ -213,7 +213,10 @@ always @(posedge clk_64) begin
 			if (we_latch) sd_data <= din;
 			// always return both bytes in a read. The cpu may not
 			// need it, but the caches need to be able to store everything
-			sd_addr <= { we_latch ? ~ds : 2'b00, 2'b10,
+			// Column: A10=1 (auto precharge), A9=addr[24] (the 10th column
+			// bit on 64MB MT48LC32M16 modules; always 0 for accesses below
+			// 32MB, so 32MB MT48LC16M16 modules are unaffected).
+			sd_addr <= { we_latch ? ~ds : 2'b00, 1'b1, addr_latch[24],
 			             addr_latch[22], addr_latch[7:0] };  // auto precharge
 		end
 
