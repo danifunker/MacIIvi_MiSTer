@@ -8,21 +8,25 @@ deploy is one command when it does).*
 ## Where things stand (one paragraph)
 
 The core boots the IIvi ROM end-to-end in Verilator, discovers the mdc824
-byte-exact, and the post-discovery sad Mac is root-caused for the THIRD and
-final time: the IIvi ROM (unlike the Mac II ROM, which boots this card at
-plain 384KB — lbmactwo) hard-fails the card when PrimaryInit's VRAM sizing
-probe (write $AAAAAAAA @ byte $F4B00 ~979KB, read back) misses — the Slot
-Manager drops the video sResources, the boot-display hunt dies smRecNotFnd,
-sad Mac $0F/$33. Fix = task #9 as a HYBRID per the project owner: the card
-presents 1MB — the 384KB hot framebuffer stays in BRAM (scanout untouched),
-the cold tail rides the reserved SDRAM window at word $100000 through the
-existing cpu-slot port (sdram.v unchanged; commit e7bce31, bench PINIT
-PASS). Along the way the MAME oracle was found silently wedged since 16:43
-by POISONED PERSISTENT CFG (montype set_value saved to
-~/.mame/cfg/maciivi.cfg — the real story behind "write taps broke all
-taps"); cleaned, MAME+card boots clean and the complete 19,551-read
-slot-walk golden is committed. The hybrid 7.5.5 disk-boot sim and the
-hybrid Quartus build were IN FLIGHT at session end.
+byte-exact (17,845 consecutive reads MATCH the MAME golden — walk_diff),
+and the post-discovery sad Mac $0F/$33 (smRecNotFnd) SURVIVED the VRAM-size
+fix: the task-#9 hybrid (card presents 1MB = 384KB hot BRAM + SDRAM cold
+tail, commit e7bce31, bench PINIT PASS, RBF built/timed clean) sad-Macced
+identically at F700 — size was NEVER the trigger (the "1MB control passed"
+belief was an artifact: that run was killed at F628, before the F650-690
+verdict window). Root-cause candidate #4, from the walk_diff fork at read
+#17846 (MAME loops back to re-read a record list = its record hunt
+SUCCEEDS; ours streams past = hunt FAILS): **stale PRAM** — the committed
+egret.pram was the LC-II-era file, and with a card present the ROM restores
+the remembered slot-$E display mode from PRAM; stale bytes = failed record
+lookup = smRecNotFnd (the pre-A0 7.5.5 boot triumph is consistent: card
+invisible → no mode restore → stale PRAM harmless). egret.pram is now
+seeded from MAME's PROVEN clean maciivi+mdc824 boot NVRAM (3ab9916, loaded
+at runtime — no rebuild needed) and the clean-PRAM 7.5.5 disk run was IN
+FLIGHT at session end. Also fixed this session: the MAME oracle had been
+silently wedged since 16:43 by POISONED PERSISTENT CFG
+(~/.mame/cfg/maciivi.cfg — the real "write taps broke all taps" story);
+cleaned, MAME+card boots clean, complete 19,551-read golden committed.
 
 ## Commit trail (newest first, all on main)
 
@@ -64,33 +68,29 @@ hybrid Quartus build were IN FLIGHT at session end.
 
 ## In-flight at session end — HARVEST THESE FIRST
 
-1. **Hybrid 7.5.5 disk-boot sim** (`simdiskrun/`, running `./Vemu_hybrid`
-   — a DEDICATED binary copy, see gotchas — with a fresh
-   `boot755_copy.hd`, `--stop-at-frame 4000`, screenshots
-   450/700/1200/2000/2800/3600/4000):
-   a. F450 = card-as-boot-display gray pattern expected (the 1MB-BRAM
-      control run had it: `run_1mb_bram_20260711/screenshot_frame_0450.png`).
-   b. F700 screenshot = the sad-Mac verdict on the SHIPPING config
-      (expect none: the control run passed F628 healthy; sad Mac used to
-      show by F690).
-   c. F2000/F2800 = "Mac OS starting up" + extension parade (yesterday's
-      pre-A0 run reached mid-parade at F3000:
-      `run_prea0_20260710/` screenshots); F4000 = hopefully Finder.
-   d. `walk_diff.py` the run's [NUBUS] stream vs the golden:
-      `python3 verilator/mame/walk_diff.py docs/mame_maciivi_slot_walk_golden.txt simdiskrun/run_stdout.log`
-      — first divergence (if any) = remaining card-model bug. Note the
-      golden is MAME's no-disk boot; the walk portion (F400-F418) is
-      disk-independent so the diff is valid until the OS starts touching
-      the card (driver CLUT/VRAM writes — reads-only diff still holds).
-2. **Hybrid Quartus build** (`simdiskrun/quartus_build_hybrid.log`,
-   launched from git-bash `scripts/build.sh`): verify fit (expect ≈90%
-   ALM as before — BRAM unchanged, ext port is a few hundred ALMs) and
-   timing (core clocks must close; the known HDMI-scaler -1.3ns caveat
-   stands). Output → `output_files/MacIIvi.rbf`; stage as
-   `releases/MacIIvi_Unstable_<date>.rbf` when BOTH gates pass.
+1. **Clean-PRAM 7.5.5 disk-boot sim** (`simdiskrun/`, `./Vemu_hybrid`
+   binary copy, fresh `boot755_copy.hd`, MAME-derived `egret.pram`,
+   `--stop-at-frame 4000`, screenshots 450/700/1200/2000/2800/3600/4000;
+   launched detached ~23:05):
+   a. **F700 screenshot = the PRAM-theory verdict.** No sad Mac → root
+      cause #4 CONFIRMED → continue to OS boot + Finder; then the RBF in
+      `output_files/` (hybrid, built 22:35) is the deploy candidate —
+      stage as `releases/`. Sad Mac again → PRAM theory dead; next
+      suspects: diff OUR fork-point behavior instruction-level
+      (`--trace-frames 400,430` around the SM record hunt) vs MAME, and
+      compare the sim's montype/onboard-display sense vs MAME's.
+   b. Earlier failed-run artifacts: `simdiskrun/hybrid_lciipram_run/`
+      (F700 sad Mac WITH 1MB hybrid + LC-II PRAM — the size-theory
+      falsifier), `run_1mb_bram_20260711/` (control, killed F628),
+      `run_prea0_20260710/` (the card-invisible 7.5.5 triumph).
+2. **Hybrid Quartus build: DONE, harvested** — fit 90% ALM, M10K 553/553
+   (unchanged by design), core clocks +2.17/+2.60ns, HDMI-scaler -1.55ns
+   (standing scaler-only caveat). `output_files/MacIIvi.rbf` @ 22:35. It
+   contains the hybrid card + old-PRAM default; PRAM overridable at boot
+   via `releases/MacIIvi.nvr` (no rebuild needed) but a rebuild bakes the
+   clean default — rebuild before staging if the PRAM fix confirms.
 3. The pre-hybrid `releases/MacIIvi_Unstable_20260711.rbf` is
-   **superseded and KNOWN-BROKEN for card display** (384KB-only card →
-   sad Mac on the IIvi ROM). Do not deploy it.
+   **superseded** (384KB-only card + stale-PRAM default). Do not deploy.
 
 ## Next actions (in order)
 
@@ -130,6 +130,16 @@ hybrid Quartus build were IN FLIGHT at session end.
   18:14 "golden" of 2026-07-11 was a wedge artifact. After any
   montype-forcing run: `rm ~/.mame/cfg/maciivi.cfg
   ~/.mame/nvram/maciivi/egret` before trusting a capture.
+- **PRAM provenance matters once a card exists**: `rtl/egret/egret.pram`
+  was the LC-II-era file through the whole bring-up. Harmless while the
+  card was invisible — but with a discovered card the IIvi ROM restores
+  the remembered slot-$E display mode from PRAM, and stale bytes make the
+  Slot Manager's record hunt fail: an smRecNotFnd sad Mac that LOOKS like
+  a card-data bug (it survived three card-side "fixes"). Seed PRAM from a
+  MAME clean boot of the same machine+card (`xxd -p -c1
+  ~/.mame/nvram/maciivi/egret`). The sim loads it at runtime
+  ($readmemh — no rebuild); the FPGA bakes it at build time and can
+  override from `releases/MacIIvi.nvr`.
 - **Rebuilding Vemu KILLS live sims** (DrvFS): `make` in verilator/
   replaces `obj_dir/Vemu` in place and any running sim executing that
   file dies mid-run (lost the 1MB-BRAM control run at F628). Long runs
