@@ -139,6 +139,16 @@ bool screenshot_mode = false;
 int stop_at_frame = -1;
 bool stop_at_frame_enabled = false;
 
+// Synthetic ADB mouse stimulus (headless repro of the hardware ADB-init hang)
+// ---------------------------------------------------------------------------
+// --mouse-from N [--mouse-to M]: from frame N (through M), put a nonzero motion
+// delta in every ps2_mouse packet, mimicking the MiSTer HPS forwarding a real
+// USB mouse the user is moving. Without this, headless runs strobe ps2_mouse[24]
+// with all-zero deltas, so adb_device never raises mouse_evt — the Talk-R0-data
+// and SRQ paths (the ones live hardware exercises) go untested.
+int mouse_inject_from = -1;
+int mouse_inject_to   = 0x7FFFFFFF;
+
 // Warm-reset test: pulse the top-level reset at a given frame WITHOUT reloading
 // the ROM (it persists in the SDRAM model) — a faithful proxy for the FPGA's R0
 // soft reset / OS restart, to test whether the machine warm-boots.
@@ -1185,6 +1195,8 @@ void show_help() {
 	printf("  --rom <path>                  Boot ROM (default ../releases/boot0.rom)\n");
 	printf("                                e.g. --rom ../releases/boot0-nomemcheck.rom\n");
 	printf("  --heartbeat                   Print the 68k PC once per frame (progress on long runs)\n");
+	printf("  --mouse-from <frame>          Inject synthetic ADB mouse motion from this frame on\n");
+	printf("  --mouse-to <frame>            Stop the synthetic mouse motion after this frame\n");
 	printf("  -v, --verbose                 Enable verbose bring-up diagnostics\n");
 	printf("                                (overlay/FC/march/RAMCFG/bus/CPU-trace spam)\n");
 	printf("\n");
@@ -1319,6 +1331,12 @@ int main(int argc, char** argv, char** env) {
 			rom_file_override = argv[++i];    // boot ROM path (default ../releases/boot0.rom)
 		} else if (strcmp(argv[i], "--heartbeat") == 0) {
 			pc_heartbeat = true;              // once-per-frame 68k PC print
+		} else if (strcmp(argv[i], "--mouse-from") == 0 && i + 1 < argc) {
+			mouse_inject_from = std::stoi(argv[++i]);
+			printf("Synthetic ADB mouse motion from frame %d\n", mouse_inject_from);
+		} else if (strcmp(argv[i], "--mouse-to") == 0 && i + 1 < argc) {
+			mouse_inject_to = std::stoi(argv[++i]);
+			printf("Synthetic ADB mouse motion stops after frame %d\n", mouse_inject_to);
 		}
 	}
 
@@ -1690,6 +1708,13 @@ int main(int argc, char** argv, char** env) {
 			dx =  sdl_mouse_dx;
 			dy = -sdl_mouse_dy;
 			if (sdl_mouse_btn) btn |= 0x01;
+		} else if (mouse_inject_from >= 0 && (int)video.count_frame >= mouse_inject_from
+		           && (int)video.count_frame <= mouse_inject_to) {
+			// Synthetic wiggle: rotate through +x/+y/-x/-y so every packet carries
+			// a nonzero delta (mouse_evt fires each frame) with no net drift.
+			static const int wig[4][2] = { {2,0}, {0,2}, {-2,0}, {0,-2} };
+			dx = wig[video.count_frame & 3][0];
+			dy = wig[video.count_frame & 3][1];
 		} else {
 			// Fallback: arrow keys / A,B buttons when the mouse isn't captured.
 			if (input.inputs[input_left])  dx = -2;
