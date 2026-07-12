@@ -435,7 +435,19 @@ module nubus_video_mdc824 #(
                 16'h000D: stride_reg[23:16] <= v;
                 16'h000E: stride_reg[15:8]  <= v;
                 16'h000F: stride_reg[7:0]   <= v;
-                16'h013C: vblank_enable <= ~v[1];        // CRTC: enable when bit1==0
+                // CRTC VBL control: the REGISTER is the 32-bit long at $13C,
+                // but its meaningful low byte arrives on byte lane 3 = byte
+                // address $13F (MAME crtc_w: `data &= 0xffff`, bit1 = VBL
+                // disable). Decoding byte $13C caught the long's byte 0
+                // (always $00) instead: PrimaryInit's DISABLE write ($06,
+                // bit1=1) decoded as v=$00 -> ~v[1] ENABLED the VBL, the
+                // card interrupted every frame with no handler installed,
+                // pseudoVIA reg2 stuck at $5F (slot $E pending), and the
+                // POST identity check's reg2 fingerprint sad-Macced $0F/$33
+                // (root cause #8, 2026-07-12 — the REAL "unserviceable slot
+                // interrupt" the minor code $33 = SysError 51 named all
+                // along).
+                16'h013F: vblank_enable <= ~v[1];        // enable when bit1==0
                 16'h0148: irq_clear <= 1'b1;             // IRQ clear
                 16'h0200: palette_addr[31:24] <= v;
                 16'h0201: palette_addr[23:16] <= v;

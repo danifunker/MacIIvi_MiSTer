@@ -57,8 +57,9 @@ module mdc_bench;
         .overlay_en(1'b0), .monochrome(1'b0), .monitor_512(1'b0),
         .ce_pixel(),
         .dbg_video_en(), .dbg_vram_wr_cnt(), .dbg_vram_fetch_cnt(),
-        .dbg_irq_cnt(), .dbg_ack_cnt(), .dbg_vblank_enable()
+        .dbg_irq_cnt(), .dbg_ack_cnt(), .dbg_vblank_enable(dbg_vbl_en)
     );
+    wire dbg_vbl_en;
 
     // Cold-tail model: SDRAM-ish latency (several cycles to ready), word
     // index = vram_addr[19:0] per the module's ext contract. In-system this
@@ -290,6 +291,29 @@ module mdc_bench;
             //     beyond the 1MB card).
             bus_read_q(32'hFE1FFFFC, 2'b11);
             expect16(32'hFE1FFFFC, 16'hFFFF, "vram-beyond");
+
+            // (5b) PrimaryInit's VBL-DISABLE write: the CRTC long at $13C
+            //      carries its data in byte $13F (two word cycles:
+            //      $0000 @ $13C, $0006 @ $13E). Bit1 SET = disable. The
+            //      old byte-$13C decode saw the long's $00 byte 0 and
+            //      ENABLED the VBL instead — stuck slot-$E IRQ, POST
+            //      reg2 fingerprint fail, sad Mac $0F/$33 (root cause #8).
+            bus_write_q(32'hFE20013C, 16'h0000, 2'b11);
+            bus_write_q(32'hFE20013E, 16'h0006, 2'b11);
+            if (dbg_vbl_en !== 1'b0) begin
+                $display("PINIT FAIL vbl-disable: enable=%b after $13C<-$06 long", dbg_vbl_en);
+                errors = errors + 1;
+            end
+            // ...and an ENABLE write (bit1 clear) must turn it on.
+            bus_write_q(32'hFE20013C, 16'h0000, 2'b11);
+            bus_write_q(32'hFE20013E, 16'h0004, 2'b11);
+            if (dbg_vbl_en !== 1'b1) begin
+                $display("PINIT FAIL vbl-enable: enable=%b after $13C<-$04 long", dbg_vbl_en);
+                errors = errors + 1;
+            end
+            // restore disabled (boot state)
+            bus_write_q(32'hFE20013C, 16'h0000, 2'b11);
+            bus_write_q(32'hFE20013E, 16'h0006, 2'b11);
 
             // (6) CRTC beam-position: two reads of $2001C2 must differ
             //     (toggles 4 <-> 0 so the driver sees a moving beam).
