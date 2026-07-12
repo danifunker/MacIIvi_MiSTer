@@ -265,3 +265,75 @@ the mdc824 the desktop lives on.
    healthy cursor context targets, pseudoVIA reg2 bits).
 3. Fix, re-run mouse marathon to Welcome, THEN rebuild RBF — hardware
    redeploy only on the user's go.
+
+---
+
+# DEEP DIVE 2 — the endless fill decoded to the ROM level (same session, later)
+
+## Corrections to "Findings" above (trace-informed)
+
+- The marathon's F800+ "park in the cursor blit" was **HB aliasing**: the
+  per-frame PC sample lands in the VBL-synced cursor task; the other ~99%
+  of each frame is ONE gigantic QuickDraw fill (the F1B2 loop below). The
+  cursor hide/restore blit itself is a bit-player (224 tiny runs/11 frames).
+- Interrupt load is modest (7-10 rte/frame) — no IRQ storm. ~16-21
+  SwapMMUMode round-trips/frame (pmove srp/crp inside the Egret/ADB
+  delivery path) — expensive but not the hang.
+- The fill is well-formed mechanically: strictly monotonic longword writes,
+  ~616 bytes/row at the correct VASP $800 stride, ~14 rows/frame — but it
+  runs to row ~32767 ($7FFF) instead of 480. One fill invocation spans
+  hundreds of frames, marching through the mirrored 1MB VRAM window.
+
+## The instruction-level chain (all from simtracerun/cpu_trace.log F738-748)
+
+1. F741: ADB dance ends; first mouse packet delivered; cursor first-draw
+   (315 blit insns).
+2. F742: boot code at **$40800530** runs the boot-UI screen paint routine
+   (ROM offset $530): InitGraf → OpenCPort → SetCursor(arrow) → copy
+   screenBits.bounds→$9FA (cursor pin!) → InsetRect(-3,-3) → PenSize(3,3)
+   → **_FrameRoundRect ($A8B0, corners 22,22)** → PenNormal →
+   FillRoundRect(16,16) — i.e. the rounded-corner desktop/border paint.
+3. _FrameRoundRect dispatches (trap table $1E00) → verb glue $40834630 →
+   thePort->grafProcs (default: low-mem $10BC) → **StdRRect painter at
+   $40834680** (LINK A6,#-$1C4).
+4. Painter: `jsr ([$1A08])` extracts the port PixMap into the frame
+   (baseAddr at -$F4, rowBytes -$F0 — masked #$7FFF at $40834A56 —
+   dest ptr -$12C computed at $40834A62-A7A: base + top*rowBytes + left/8).
+5. Painter intersects: rect arg ∩ visRgn->bbox ∩ clipRgn->bbox ∩ one more
+   (4-rect intersect via `jsr ([$1A84])` at $40834740; empty → skip-all
+   branch at $34746).
+6. **$4083496A: `move.w #$7FFF,(-$164,A6)`** presets the row bound to the
+   region sentinel; only a valid rect/region walk narrows it. Ours never
+   narrows: row loop (`cmp.w (-$164,A6),D7 / blt` at $40834BD4) runs to
+   32767. The per-invocation region walker stub that returns the $7FFF
+   sentinel is at $4083B0D4.
+7. Net: **the port's visRgn (and/or the rect from screenBits.bounds) must
+   be wide-open garbage** — clipRgn after OpenCPort is wide-open BY DESIGN,
+   visRgn should be screenBits.bounds (480x640). screenBits is rebuilt by
+   InitGraf (F742) from the low-mem video globals / MainDevice GDevice
+   PixMap — structures the cursor engine (armed F741 by the first-ever
+   early mouse delivery) also manipulates (CrsrPin $834 neighborhood,
+   GDevice cursor fields). Control run (no mouse): same routine, bounded,
+   exits in ~30 frames. MAME + wiggle: cursor stabilizes ~50 frames BEFORE
+   this paint → healthy. Ours: cursor first-draw and InitGraf land in
+   ADJACENT FRAMES (F741/F742) — the race window.
+
+## In flight: the value capture
+
+`simwatchrun/` re-run with the new `+ramwatch_*` plusarg RAM-write watch
+(sim.v; logs addr/data/PC for writes in a range+frame window — the
+instruction trace has no data values). Window F739-745, range $0-$21FFFF.
+Read out: (a) the writes into the A6 frame slots (-$164/-$74/-$F4/-$12C
+relative to the painter's A6 ≈ $20FExx) — the actual bounds values;
+(b) any cursor-path PC writing into the GDevice/PixMap/low-mem video
+globals before InitGraf reads them (the corruption, if that theory holds).
+
+## MAME oracle status
+
+- maciivi + mdc824 + continuous wiggle (ioport lua injection, delivery
+  verified via RawMouse $82C movement): boots healthy, CrsrVis=1 from
+  ~F650-700, scan-wait $4080786x reached. Kit: verilator/mame/
+  cursor_ctx.lua (+ paint_bounds.lua / cursor_blit_bp.dbg / paint_dump.dbg
+  — NOTE: debugger breakpoints DO NOT FIRE under `-debugger none` in this
+  0.264 build; printf/consolelog and dump actions are all inert. Value
+  capture must go through lua memory reads or our sim's ramwatch.)

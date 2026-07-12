@@ -1,0 +1,14 @@
+; cursor_blit_bp.dbg — golden register capture at the cursor hide/restore
+; blit for the 2026-07-12 cursor-engine hang. Breakpoints on the routine
+; entry ($4082E9E2: loads ctx from ([$D62])) and the blit core ($4082EA18),
+; printing the exact registers our stuck sim loads (D2/D3/D4/A1/A2) plus the
+; caller's return address off the stack. Non-stopping (each bp action ends
+; in `g`). Combine with the mouse wiggle so the cursor engine is active:
+;   rm -f ~/.mame/cfg/maciivi.cfg ~/.mame/nvram/maciivi/egret
+;   verilator/mame/run_mame_maciivi.sh -nbe mdc824 \
+;     -autoboot_script verilator/mame/cursor_ctx.lua \
+;     -debug -debugger none -debugscript verilator/mame/cursor_blit_bp.dbg \
+;     -seconds_to_run 40 -video none
+bp 4082E9E2,1,{printf "HIDE-ENTRY ret=%08X D62ptr=%08X",d@(a7),d@0D62; g}
+bp 4082EA08,1,{printf "BLIT-PARAMS D2=%08X D3=%08X D4=%08X A1=%08X A2=%08X",d2,d3,d4,a1,a2; g}
+g

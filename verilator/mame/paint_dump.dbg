@@ -1,0 +1,9 @@
+; paint_dump.dbg — value capture via file side-effects (printf/consolelog is
+; inert under -debugger none; the kit's trace-to-file flow works, so use
+; dump-to-file the same way).
+;  bp1: scan-wait PC every boot reaches — proves the dump pipeline works.
+;  bp2: QuickDraw paint setup (our sim's endless-fill path) — dumps the A6
+;       frame slots (rect bounds, dest, baseAddr, rowBytes live in a6-200..a6).
+bp 40807870,1,{dump /tmp/mame_scanwait.dmp,(a7-40),80; bpdis 0; g}
+bp 40834B16,1,{dump /tmp/mame_paintframe.dmp,(a6-200),210; bpdis 1; g}
+g

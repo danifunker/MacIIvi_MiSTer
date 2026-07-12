@@ -1258,6 +1258,28 @@ module emu
 			end
 		end
 	end
+
+	// Runtime RAM-write watch: value-level visibility the instruction trace
+	// lacks (it logs PCs + addresses but never data). Gated entirely by
+	// plusargs so the build is reusable:
+	//   ./Vemu ... +ramwatch_lo=<hex> +ramwatch_hi=<hex> +ramwatch_f0=<frame> +ramwatch_f1=<frame>
+	// Added for the 2026-07-12 cursor-engine hang hunt (read the QuickDraw
+	// frame slots / low-mem globals the endless fill consumes).
+	reg [31:0] rw_lo = 32'h0, rw_hi = 32'h0;
+	integer rw_f0 = 0, rw_f1 = 0;
+	initial begin
+		if ($value$plusargs("ramwatch_lo=%h", rw_lo)) ;
+		if ($value$plusargs("ramwatch_hi=%h", rw_hi)) ;
+		if ($value$plusargs("ramwatch_f0=%d", rw_f0)) ;
+		if ($value$plusargs("ramwatch_f1=%d", rw_f1)) ;
+	end
+	always @(posedge clk_sys) begin
+		if (rw_hi != 32'h0 && !_ramWE && cpuBusControl &&
+		    cpuAddr >= rw_lo && cpuAddr <= rw_hi &&
+		    sim_frame_count >= rw_f0 && sim_frame_count <= rw_f1)
+			$display("[F%0d] RAMWATCH_WR: addr=%h data=%h PC=%h",
+				sim_frame_count, cpuAddr, cpuDataOut, last_fetch_pc);
+	end
 `endif
 	assign debug_cpuAddr = cpuAddr;
 	assign debug_cpuDataIn = cpuDataOut;  // CPU writes this to peripherals
