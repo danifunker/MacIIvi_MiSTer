@@ -32,9 +32,19 @@ taps broke all taps" story).
 
 ## Commit trail (newest first, all on main)
 
-- `f4e3d5f` **THE FIX**: via6522 ORA/ORB DDR-merge reads + pseudoVIA
+- `4da816f` mdc824 VBL control decode: byte $13F (the LONG's data byte),
+  not $13C — PrimaryInit's DISABLE was ENABLING the card VBL → stuck
+  slot-$E IRQ (pseudoVIA reg2 $5F, caught by the [PROBE] logger) →
+  minor code $33 = SysError 51 'unserviceable slot interrupt',
+  LITERALLY (root cause #8)
+- `dd85c78` VIA1 Port B inputs = TREQ only (MAME vasp via_in_b:
+  read_pb3()<<3) — killed the LC-era DEBUG leftovers (hblank on PB7,
+  montype sense on PB2-0) that poisoned the POST's DDRB=$00 raw-pin
+  fingerprint (root cause #7); + the window-gated [PROBE] logger
+- `f4e3d5f` via6522 ORA/ORB DDR-merge reads + pseudoVIA
   regs $00/$01 stored ($4F/$06 init per MAME 0.264 BINARY — local tree
-  disagrees) — the ROM's POST identity check now passes (F700 clean)
+  disagrees) — the first POST identity-check pass (root cause #6;
+  moved the death from F663 to F769)
 - `1eee6b3` mdc824 ctrl resets $0002 (VRAM config straps — real fix,
   wasn't the trigger); bench asserts the exact $0C02 first read
 - `3ab9916` egret.pram seeded from MAME clean-boot NVRAM (LC-II-era file
@@ -143,10 +153,23 @@ taps broke all taps" story).
   it writes DDR/OR patterns into VIA1 and the pseudoVIA, reads them
   back, and sad-Macs $0F/$33 on signature mismatch (trace: dispatcher
   $40802F58, probes $408032xx/$40803944, verdict btst #$c,D0 at
-  $408499DA, chime $40845CE2). ANY chipset register that answers with a
+  $408499DA, chime $40845CE2). It runs MULTIPLE passes: pass k+1 drops
+  DDR to $00 and fingerprints the RAW PINS pass k never exposed, and a
+  later pass polls pseudoVIA reg2 — a stuck slot IRQ reads as $5F
+  instead of $7F and fails it. ANY chipset register that answers with a
   constant instead of round-tripping stored bits is a candidate POST
-  killer. Sad-Mac minor $33 = SysError 51 — NOT Slot Manager -351; the
-  smRecNotFnd reading was wrong and cost four theories.
+  killer — root causes #6 (VIA DDR-merge + pseudoVIA regs), #7 (PB
+  raw pins carried LC-era hblank/sense debug bits) and #8 (mdc824 VBL
+  decode enabling instead of disabling) all died on this one check.
+  Sad-Mac minor $33 = SysError 51 (unserviceable slot interrupt — #8
+  made it literal); the smRecNotFnd -351 reading was wrong and cost
+  four theories.
+- **Long-register byte lanes on the 16-bit bus**: MAME 32-bit card/chip
+  registers take `data &= 0xffff` — the meaningful byte of a long write
+  to reg $X arrives at BYTE address $X+3. Decode $X+3 (or the $X+2
+  word), NEVER byte $X: the $13C/$13F confusion enabled-instead-of-
+  disabled the card VBL (root cause #8). Audit any future wr_reg_byte
+  cases against the MAME rw-tap, value by value.
 - **The local ../mame tree is NOT the oracle — the packaged 0.264
   binary is**: pseudovia.cpp in the tree has regs $00/$01 unconnected
   (read 0); the running binary stores them ($4F/$06 init, tap-proven).
