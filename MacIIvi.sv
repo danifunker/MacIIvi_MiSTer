@@ -1125,6 +1125,16 @@ module emu
 	// default mdc824-only shape the onboard BRAM is gone, so the card gets
 	// the full 384KB (8bpp @ 640x480). Under ONBOARD_DISPLAY the card drops
 	// to its 128KB boot configuration (1/2bpp) instead.
+	//
+	// KNOWN-BROKEN ON HARDWARE (2026-07-11): the real MDC 8/24's PrimaryInit
+	// sizes its VRAM by writing $AAAAAAAA at byte offset $F4B00 (~979KB) and
+	// reading it back — no legal config is smaller than 512KB, so BOTH sizes
+	// below fail the probe, PrimaryInit errors out, the Slot Manager drops
+	// the video sResources, and the ROM sad-Macs $0F/$33 (smRecNotFnd)
+	// hunting for a boot display. verilator/sim.v DIVERGES: it instantiates
+	// the card with 1MB (the real default config) and boots. The hardware
+	// fix is SDRAM-backed card VRAM (VASP_RETARGET task #9) — until then do
+	// not ship a card-only-display RBF.
 `ifdef ONBOARD_DISPLAY
 	localparam MDC_VRAM_WORDS = 65536;    // 128KB boot config
 `else

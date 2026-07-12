@@ -29,7 +29,10 @@ module mdc_bench;
     wire [15:0] vram_dout, vram_din, vram_scan_data;
     wire        vram_rd, vram_wr, vram_ready, vram_scan_rd;
 
-    nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(65536)) card (
+    // 524288 words = 1MB: the real MDC 8/24 default VRAM config, and what
+    // PrimaryInit's sizing probe (write $AAAAAAAA @ byte $F4B00, read back)
+    // requires. Matches verilator/sim.v. See the PrimaryInit section below.
+    nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(524288)) card (
         .clk(clk), .reset(reset),
         .addr(addr), .data_in(data_in), .uds_lds(uds_lds),
         .cpu_longword(1'b0), .rw_n(rw_n), .cpu_as_n(cpu_as_n),
@@ -48,7 +51,7 @@ module mdc_bench;
         .dbg_irq_cnt(), .dbg_ack_cnt(), .dbg_vblank_enable()
     );
 
-    vram_ram #(.WORDS(65536)) vram (
+    vram_ram #(.WORDS(524288)) vram (
         .clk(clk),
         .addr(vram_addr), .din(vram_dout), .dout(vram_din),
         .rd(vram_rd), .wr(vram_wr), .ready(vram_ready),
@@ -77,6 +80,33 @@ module mdc_bench;
             @(negedge clk);
             cpu_as_n = 1; select = 0; uds_lds = 2'b00;
             repeat (2) @(negedge clk);
+        end
+    endtask
+
+    // Quiet write (PrimaryInit smoke: registers + VRAM sizing probe)
+    task bus_write_q(input [31:0] a, input [15:0] v, input [1:0] strobes);
+        begin
+            @(negedge clk);
+            addr = a; data_in = v; rw_n = 0; select = 1; cpu_as_n = 0;
+            uds_lds = strobes;
+            timeout = 0;
+            @(negedge clk);
+            while (ack_n !== 1'b0 && timeout < 60) begin
+                @(negedge clk); timeout = timeout + 1;
+            end
+            @(negedge clk);
+            cpu_as_n = 1; select = 0; uds_lds = 2'b00; rw_n = 1;
+            repeat (2) @(negedge clk);
+        end
+    endtask
+
+    task expect16(input [31:0] a, input [15:0] want, input [127:0] tag);
+        begin
+            if (rd_val !== want) begin
+                $display("PINIT FAIL %0s: addr=%08x got=%04x want=%04x",
+                         tag, a, rd_val, want);
+                errors = errors + 1;
+            end
         end
     endtask
 
@@ -157,6 +187,84 @@ module mdc_bench;
             end
             if (errors == 0) $display("SWEEP PASS: all 32768 lane-3 bytes correct (word+byte access)");
             else $display("SWEEP: %0d ERRORS", errors);
+        end
+
+        // ---- PrimaryInit smoke — the exact hardware conversation the card's
+        // declaration-ROM init code has with the card, captured from MAME
+        // (tap.lua rw over $FE000000-$FE3FFFFF, 2026-07-11; the smRecNotFnd
+        // sad-Mac root cause #3). 32-bit CPU ops arrive as two 16-bit word
+        // cycles, high half (A1==0) first. ----
+        begin : pinit
+            integer pinit_errors_at_start;
+            pinit_errors_at_start = errors;
+
+            // (1) ctrl long read: monitor sense must show code 6 (13" 640x480,
+            //     no sense gates driven after reset) in bits [11:9] -> high
+            //     byte of the low word = $0C. MAME reads $00000C02; our ctrl
+            //     low byte resets to $00 (untested by PrimaryInit: it only
+            //     needs the sense field before it rewrites ctrl itself).
+            bus_read_q(32'hFE200000, 2'b11);
+            expect16(32'hFE200000, 16'h0000, "ctrl-hi");
+            bus_read_q(32'hFE200002, 2'b11);
+            if (rd_val[15:8] !== 8'h0C) begin
+                $display("PINIT FAIL ctrl-sense: got=%04x want=0Cxx", rd_val);
+                errors = errors + 1;
+            end
+
+            // (2) register $300: PrimaryInit writes $55 and expects to read 0
+            //     back (MAME: WR $55 -> RD $00000000).
+            bus_write_q(32'hFE200300, 16'h0000, 2'b11);
+            bus_write_q(32'hFE200302, 16'h0055, 2'b11);
+            bus_read_q(32'hFE200300, 2'b11);
+            expect16(32'hFE200300, 16'h0000, "reg300-hi");
+            bus_read_q(32'hFE200302, 2'b11);
+            expect16(32'hFE200302, 16'h0000, "reg300-lo");
+
+            // (3) THE VRAM SIZING PROBE: write $AAAAAAAA at byte offset
+            //     $F4B00 (~979KB) and read it back — PrimaryInit's 1MB
+            //     presence test. We model the card's default 1MB config, so
+            //     this must succeed. With the old 384KB VRAM_WORDS the
+            //     readback returned $FFFF, PrimaryInit failed, the Slot
+            //     Manager dropped the video sResources and the ROM
+            //     sad-Macced $0F/$33 (smRecNotFnd) hunting a boot display.
+            bus_write_q(32'hFE0F4B00, 16'hAAAA, 2'b11);
+            bus_write_q(32'hFE0F4B02, 16'hAAAA, 2'b11);
+            bus_read_q(32'hFE0F4B00, 2'b11);
+            expect16(32'hFE0F4B00, 16'hAAAA, "vram-size-probe-hi");
+            bus_read_q(32'hFE0F4B02, 2'b11);
+            expect16(32'hFE0F4B02, 16'hAAAA, "vram-size-probe-lo");
+
+            // (4) VRAM low-address readback (framebuffer clear region)
+            bus_write_q(32'hFE000000, 16'h5678, 2'b11);
+            bus_write_q(32'hFE000002, 16'h9ABC, 2'b11);
+            bus_read_q(32'hFE000000, 2'b11);
+            expect16(32'hFE000000, 16'h5678, "vram-low-hi");
+            bus_read_q(32'hFE000002, 2'b11);
+            expect16(32'hFE000002, 16'h9ABC, "vram-low-lo");
+
+            // (5) beyond-VRAM reads stay open-bus ($FFFF): the sizing probe
+            //     must FAIL cleanly past the installed size (here: at 2MB-1,
+            //     beyond the 1MB card).
+            bus_read_q(32'hFE1FFFFC, 2'b11);
+            expect16(32'hFE1FFFFC, 16'hFFFF, "vram-beyond");
+
+            // (6) CRTC beam-position: two reads of $2001C2 must differ
+            //     (toggles 4 <-> 0 so the driver sees a moving beam).
+            begin
+                reg [15:0] beam_first;
+                bus_read_q(32'hFE2001C2, 2'b11);
+                beam_first = rd_val;
+                bus_read_q(32'hFE2001C2, 2'b11);
+                if (rd_val === beam_first) begin
+                    $display("PINIT FAIL beam-toggle: stuck at %04x", rd_val);
+                    errors = errors + 1;
+                end
+            end
+
+            if (errors == pinit_errors_at_start)
+                $display("PINIT PASS: sense, reg $300, 1MB sizing probe, VRAM rw, beam toggle");
+            else
+                $display("PINIT: %0d ERRORS", errors - pinit_errors_at_start);
         end
 
         $display("DONE");

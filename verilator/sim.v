@@ -682,7 +682,16 @@ module emu
 	wire [15:0] mdc_vram_dout, mdc_vram_din, mdc_vram_scan_data;
 	wire        mdc_vram_rd, mdc_vram_wr, mdc_vram_ready, mdc_vram_scan_rd;
 
-	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(196608)) nubus_card (
+	// VRAM_WORDS: 524288 = 1MB, the real MDC 8/24's default VRAM config.
+	// PrimaryInit (decl-ROM code) sizes VRAM by writing $AAAAAAAA to byte
+	// offset $F4B00 (~979KB) and reading it back (MAME rw-tap capture
+	// 2026-07-11, /tmp/mame_pinit_rw.txt); with the old 384KB the readback
+	// returned $FFFF, PrimaryInit failed, the Slot Manager dropped the video
+	// sResources, and the boot display hunt died with smRecNotFnd = sad Mac
+	// $0F/$33. DIVERGES from MacIIvi.sv (still 384KB): 1MB does not fit the
+	// DE10-Nano's M10K budget (553/553 used) — hardware needs the
+	// SDRAM-backed card VRAM (VASP_RETARGET task #9) to run the card.
+	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(524288)) nubus_card (
 		.clk(clk_sys),
 		.reset(!_cpuReset),
 		// Real A0 required (decl ROM = byte lane 3); see MacIIvi.sv note.
@@ -718,7 +727,7 @@ module emu
 		.dbg_irq_cnt(), .dbg_ack_cnt(), .dbg_vblank_enable()
 	);
 
-	vram_ram #(.WORDS(196608)) mdc_vram (
+	vram_ram #(.WORDS(524288)) mdc_vram (   // 1MB — must match VRAM_WORDS above
 		.clk(clk_sys),
 		.addr(mdc_vram_addr),
 		.din(mdc_vram_dout),
@@ -766,13 +775,17 @@ module emu
 		end
 		if (!nb_as_d && _cpuAS && nb_cyc_slot) begin  // cycle ended
 			nb_cyc_slot <= 1'b0;
+			// Caps sized for the FULL Slot Manager declaration-ROM walk
+			// (smRecNotFnd hunt 2026-07-11): the whole read stream, not a
+			// first-contact teaser, so it can be diffed byte-by-byte against
+			// the MAME slot-tap golden.
 			if (nb_cyc_open) begin
-				if (nb_open_cnt < 20) begin
+				if (nb_open_cnt < 100) begin
 					$display("[NUBUS] OPEN  addr=%h rw=%b -> FFFF", nb_cyc_addr, nb_cyc_rw);
 					nb_open_cnt <= nb_open_cnt + 1;
 				end
 			end else begin
-				if (nb_ack_cnt < 60) begin
+				if (nb_ack_cnt < 30000) begin
 					$display("[NUBUS] CARD  addr=%h rw=%b data=%h", nb_cyc_addr, nb_cyc_rw, nb_cyc_data);
 					nb_ack_cnt <= nb_ack_cnt + 1;
 				end

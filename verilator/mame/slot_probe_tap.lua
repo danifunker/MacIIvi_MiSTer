@@ -12,6 +12,18 @@
 --
 -- Gotchas per tap.lua: install taps in the first register_frame_done (not
 -- machine_reset), keep tap handles referenced, write to a file (headless).
+--
+-- POISONED-CFG GOTCHA (2026-07-11, cost half a day): any ioport value set
+-- via set_value() (force_montype here, set_montype.lua, or the CONFIG-field
+-- "Run B trap") is SAVED to ~/.mame/cfg/maciivi.cfg on MAME exit and then
+-- silently applied to EVERY later run. maciivi with a stale MONTYPE boots
+-- into the chime-code wedge ($40845Exx, then the $40849Axx/$4084A1xx loop
+-- forever) and never touches slot space — zero tap hits, which looks
+-- exactly like "the taps broke" (the 18:14 "golden" of 2026-07-11 was this,
+-- NOT broken write taps). After ANY montype-forcing run:
+--   rm ~/.mame/cfg/maciivi.cfg ~/.mame/nvram/maciivi/egret
+-- before trusting a capture. Healthy F300 heartbeat = pc $40847xxx;
+-- wedged = pc $40845Fxx.
 
 local function envnum(n, d) local v=os.getenv(n); return v and (tonumber(v) or d) or d end
 local OUT      = os.getenv("TAP_OUT") or "/tmp/mame_slot_tap.txt"
