@@ -870,6 +870,21 @@ module adb_device(
 
 `ifdef SIMULATION
 	always @(posedge clk)
+		if (!reset && mouse_edge && (mX_s2 != 9'd0 || mY_s2 != 9'd0 || mBtn_s2 != mouseButton))
+			$display("ADBDEV[%0t]: mouse event dx=%0d dy=%0d btn=%b (evt pending)",
+			         $time, $signed({mX_s2[8], mX_s2[7:0]}), $signed({mY_s2[8], mY_s2[7:0]}), mBtn_s2);
+	// SRQ visibility: fires exactly when the FSM's S_TSTOP arms assert a Service
+	// Request (Talk arm + default arm check srq_want; the SendReset and
+	// Listen-R3-to-our-address arms never SRQ, so exclude them).
+	wire dbg_srq_fired = srq_want &&
+	     !(cmd_type == 2'b00 && cmd_reg == 2'b00) &&
+	     !(cmd_type == 2'b10 && cmd_reg == 2'b11 &&
+	       (cmd_addr == kbd_addr || cmd_addr == mouse_addr));
+	always @(posedge clk)
+		if (!reset && st == S_TSTOP && rise && dbg_srq_fired)
+			$display("ADBDEV[%0t]: SRQ asserted after cmd=%02x (mouse_evt=%b kbd_pend=%b)",
+			         $time, command, mouse_evt, !kbdFifoEmpty);
+	always @(posedge clk)
 		if (!reset && st == S_TSTOP && rise)
 			$display("ADBDEV[%0t]: cmd=%02x (addr=%0d type=%0d reg=%0d) resp_len=%0d",
 			         $time, command, command[7:4], command[3:2], command[1:0], resp_len);

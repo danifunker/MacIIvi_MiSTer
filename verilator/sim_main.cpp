@@ -1511,6 +1511,28 @@ int main(int argc, char** argv, char** env) {
 				       took_ss ? " after taking screenshot" : "");
 				break;
 			}
+			// Synthetic ADB mouse motion (--mouse-from): one ps2 packet per frame.
+			// The GUI path below rebuilds ps2_mouse every UI frame, but this fast
+			// path never touched it — the input sat frozen at zero, so adb_device
+			// never saw a single event in any headless run.
+			if (mouse_inject_from >= 0) {
+				static int last_inject_frame = -1;
+				int f = video.count_frame;
+				if (f != last_inject_frame && f >= mouse_inject_from && f <= mouse_inject_to) {
+					last_inject_frame = f;
+					static const int wig[4][2] = { {2,0}, {0,2}, {-2,0}, {0,-2} };
+					int dx = wig[f & 3][0], dy = wig[f & 3][1];
+					unsigned char status_byte = 0x08;
+					if (dx < 0) status_byte |= 0x10;   // X sign -> ps2_mouse[4]
+					if (dy < 0) status_byte |= 0x20;   // Y sign -> ps2_mouse[5]
+					unsigned long mouse_temp = status_byte;
+					mouse_temp |= ((unsigned char)dx << 8);
+					mouse_temp |= ((unsigned char)dy << 16);
+					if (mouse_clock) { mouse_temp |= (1UL << 24); }
+					mouse_clock = !mouse_clock;
+					VERTOPINTERN->ps2_mouse = mouse_temp;
+				}
+			}
 			if (run_enable) { for (int step = 0; step < batchSize; step++) { verilate(); } }
 			continue;
 		}
