@@ -89,27 +89,29 @@ taps broke all taps" story).
 
 ## In-flight at session end — HARVEST THESE FIRST
 
-1. **VIA-fix 7.5.5 disk-boot sim** (`simdiskrun/`, `./Vemu_via` binary
-   copy, fresh image, all fixes: f4e3d5f + 1eee6b3 + 3ab9916 + e7bce31):
-   **F700 PASSED — no sad Mac, gray desktop on the card, healthy PCs.**
-   Harvest F1200/F2000 (Mac OS startup screen) / F2800 (extension
-   parade) / F4000 (Finder?). Then next-actions #3/#4 (Monitors, PRAM
-   capture). Failed-run archaeology lives in `simdiskrun/`:
-   `hybrid_lciipram_run/` (size-theory falsifier), `hybrid_cleanpram_run/`
-   (PRAM-theory falsifier), `strap_run/` (strap-theory falsifier),
-   `run_1mb_bram_20260711/` (killed F628 — the run whose over-reading
-   cost a day), `run_prea0_20260710/` (card-invisible 7.5.5 triumph).
-   The F663 instruction trace that cracked it: `simproberun/cpu_trace.log`
-   (132MB, gitignored, regenerate via `--trace-frames 620,700`).
-2. **Quartus rebuild with the full fix set** (launched at session end,
-   `simdiskrun/quartus_build_viafix.log`): harvest fit/timing; expect
-   ~90% ALM / cores closed / scaler -1.5ns as before (RTL deltas are
-   tiny). Output `output_files/MacIIvi.rbf` → stage as
-   `releases/MacIIvi_Unstable_<date>.rbf` = THE deploy candidate once
-   the sim run confirms the OS boots.
-3. All earlier RBFs (incl. `MacIIvi_Unstable_20260711.rbf` and the 22:35
-   hybrid build) are **superseded** — they predate the VIA/pseudoVIA
-   identity-check fixes and sad-Mac on real hardware. Do not deploy.
+1. **THE BOOT RUN** (`simdiskrun/`, `./Vemu_vbl` binary copy, all eight
+   fixes): **F1200 = "Welcome to Macintosh" ON THE CARD** — System
+   7.5.5 loading from RAM (pc $C982, a7 $2F9F9C = the MAME 7.5.5 stack
+   signature), POST fully passed, card = boot display. Harvest
+   F2000/F2800 (extension parade) / F4000 (Finder?), then next-actions
+   #3/#4 (Monitors depth check, PRAM capture → refresh
+   releases/MacIIvi.nvr). Failed-run archaeology in `simdiskrun/`:
+   `hybrid_lciipram_run/`, `hybrid_cleanpram_run/`, `strap_run/`,
+   `viafix_run/` (root-cause #7's falsifier set), `pbfix_run/` (#8's,
+   incl. the [PROBE] reg2=$5F evidence), `run_1mb_bram_20260711/`,
+   `run_prea0_20260710/`.
+2. **Quartus full-fix compile** running since 07:33 (`--flow compile
+   MacIIvi`, all eight fixes in source): harvest fit/timing (~90% ALM /
+   cores closed / scaler ≈-1.2ns expected), then stage
+   `releases/MacIIvi_Unstable_20260712.rbf` AND scp to BOTH MiSTers
+   (192.168.99.143 + .189, file-drop only). Both already have
+   `boot0.rom` + the clean-PRAM `MacIIvi.nvr` in
+   `/media/fat/games/MacIIvi/` (md5-verified). Activation = user's
+   trigger: `bash scripts/deploy_screenshot.sh` (host from
+   scripts/local.env — parameterize for .189 if that's the free box).
+3. All earlier RBFs (20260711, the 22:35 and 03:21 builds) are
+   **superseded** — each predates at least one sad-Mac-fatal fix. Do
+   not deploy them.
 
 ## Next actions (in order)
 
