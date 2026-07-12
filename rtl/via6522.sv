@@ -418,10 +418,17 @@ module via6522 (
         data_out <= 8'h00;
         case (addr)
             4'h0: begin // ORB
-                // Port B ALWAYS reads the actual pin level for ALL bits, unlike
-                // Port A which reads output latch for outputs. Per 6522 datasheet,
-                // ORB reads perform a read-modify-write on the actual pin state.
-                data_out <= irb;
+                // Per the 6522 datasheet (and MAME's R65NC22): bits set as
+                // OUTPUTS in DDRB read back the OUTPUT REGISTER; input bits
+                // read the (latched) pin. The old pins-only read broke the
+                // IIvi ROM's POST identity check (pc $4080321A), which
+                // writes DDR/OR patterns and reads them back to fingerprint
+                // the machine — the input constants came back instead, the
+                // signature match failed, and POST died sad Mac $0F/$33
+                // (root cause #6, 2026-07-12; trace F663). The LC II ROM
+                // never runs this dance, which is why the LCII-inherited
+                // model got away with it.
+                data_out <= (pio_i_prb & pio_i_ddrb) | (irb & ~pio_i_ddrb);
                 if (tmr_a_output_en == 1'b1) begin
                     data_out[7] <= timer_a_out;
                 end
@@ -434,7 +441,9 @@ module via6522 (
 `endif
             end
             4'h1: begin // ORA
-                data_out <= ira;
+                // Output bits read the output register (the driven pin),
+                // input bits the latched pin — same merge as ORB above.
+                data_out <= (pio_i_pra & pio_i_ddra) | (ira & ~pio_i_ddra);
             end
             4'h2: begin // DDRB
                 data_out <= pio_i_ddrb;
@@ -481,8 +490,8 @@ module via6522 (
             4'hE: begin // IER
                 data_out <= {1'b1, irq_mask};
             end
-            4'hF: begin // ORA
-                data_out <= ira;
+            4'hF: begin // ORA no handshake
+                data_out <= (pio_i_pra & pio_i_ddra) | (ira & ~pio_i_ddra);
             end
             default: begin
             end

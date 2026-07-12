@@ -75,6 +75,8 @@ module pseudovia(
 // ---------------------------------------------------------------------
 reg [7:0] slot_ier;
 reg [7:0] ier;
+reg [7:0] reg_b;        // reg $00 (Port B) — stored; init $4F per MAME 0.264
+reg [7:0] reg_config;   // reg $01 (config) — stored; init $06 per MAME 0.264
 reg       vbl_pending_n;   // reg2 bit 6 (active low, latched)
 reg       ifr_asc;         // reg3 bit 4 (edge-set, W1C)
 reg       ifr_b2, ifr_b5, ifr_b6; // stored-only bits: no VASP source ever
@@ -117,6 +119,18 @@ always @(posedge clk_sys) begin
         asc_irq_d <= 1'b0;
         vblank_irq_d <= 1'b0;
         data_out <= 8'h00;
+        // Reg $00/$01 initial values from the RUNNING MAME 0.264 oracle
+        // (tap capture /tmp/mame_pvia_rw.txt, 2026-07-12): reg0 reads $4F
+        // before any write, reg1 (config) reads $06. The local ../mame
+        // source tree has both unconnected-read-0 — the packaged binary
+        // predates that rework; we align to the binary the goldens come
+        // from. The IIvi ROM's POST fingerprints the machine partly by
+        // writing these regs and reading patterns back (pc $40802Fxx at
+        // F15, the $4084AB78 BCLR, F149 config probe) — hardwired zeros
+        // corrupt the signature word the F663 identity check verifies
+        // (sad Mac $0F/$33).
+        reg_b <= 8'h4F;
+        reg_config <= 8'h06;
     end else begin
         asc_irq_d <= asc_irq;
         vblank_irq_d <= vblank_irq;
@@ -139,8 +153,8 @@ always @(posedge clk_sys) begin
         if (req) begin
             if (we) begin
                 case (reg_sel)
-                    3'b000: ;  // $00: Port B — out_b unconnected on VASP
-                    3'b001: ;  // $01: config — out_config unconnected on VASP
+                    3'b000: reg_b      <= data_in;  // $00: Port B (stored — see reset note)
+                    3'b001: reg_config <= data_in;  // $01: config (stored — see reset note)
 
                     3'b010: begin  // $02: slot status — writing 1 to bit 6
                                    // ACKS (deactivates) the VBL flag; slot
@@ -200,8 +214,8 @@ always @(posedge clk_sys) begin
                 endcase
             end else begin
                 case (reg_sel)
-                    3'b000: data_out <= 8'h00;          // Port B: in_b unconnected
-                    3'b001: data_out <= 8'h00;          // config: in_config unconnected
+                    3'b000: data_out <= reg_b;          // Port B (stored — see reset note)
+                    3'b001: data_out <= reg_config;     // config (stored — see reset note)
                     3'b010: data_out <= slot_pending;   // slot status (active low)
                     3'b011: data_out <= ifr_read;       // IFR (recalc'd view)
                     // $10: stored config with bits [5:3] replaced by the
