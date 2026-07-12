@@ -137,8 +137,11 @@ MAME-verified System 7.5.5 disk image is staged for the OS-boot campaign.
   tuning (aggressive routability, duplication OFF, SEED pinned — their
   seed-3 note says it broke clk_sys THERE). M10K = 553/553: no BRAM
   headroom left; next BRAM need = do task #9 first.
-- **The old `output_files/MacIIvi.rbf` predates the lane fix** — always
-  rebuild before deploying.
+- `output_files/MacIIvi.rbf` (20:04, = releases/MacIIvi_Unstable_20260711
+  .rbf) IS the current deploy candidate: seed 2 + lane fix + all of
+  today's RTL. Fit 90% ALM, core clocks +1.4/+3.5ns, HDMI-scaler domain
+  -1.5ns (known caveat, scaler-only). Rebuild only after further RTL
+  changes.
 - The `sdram_out_patched` LC-II warm-boot ROM patch was retired; if a
   warm-reset hang appears on the IIvi ROM, re-derive (VASP_RETARGET
   "LC-II-isms").
