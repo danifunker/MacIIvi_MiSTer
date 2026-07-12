@@ -43,29 +43,52 @@ SUCCEEDS and does not wedge. The "montype-7 is a dead end" note from
    is STATIC (pseudovia reg $10 bits 5:3 = `monitor_id`, identical to MAME's
    `montype<<3`; neither models a sense-line DRIVE). New `+montype=<n>`
    plusarg in `verilator/sim.v` overrides `v8_monitor_id`. Results:
-   - `+montype=7` boots cleanly through the early checksum ($846BE6) and
-     reaches the no-disk **boot-device wait ($807A5x, the "?" state) by
-     F538** — video init SUCCEEDED, no wedge. (Slower by ~19 frames through
-     early init; harmless.)
-   - So static sense=7 appears SUFFICIENT — the ROM handled "no onboard
-     monitor" and reached the boot scan. The earlier MAME "montype-7 wedge"
-     was likely MAME-specific and is NOT evidence about our core.
+   - `+montype=7` boots cleanly through the early checksum ($846BE6), the
+     full RAM test ($846xxx, F38-458), into **video init (stack climbs to
+     $0020FExx by F507)**, and reaches the **ADB driver loop $814908 by
+     F608** — the SAME code the montype-6 control runs during ADB
+     enumeration. i.e. POST + video init + Slot Manager all COMPLETED with
+     the onboard monitor "unplugged". No wedge. (Evidence: `simscrnbase/`
+     run_stderr.log heartbeats.)
+   - So static sense=7 is SUFFICIENT to get the ROM through video init — it
+     handled "no onboard monitor" and kept booting. The earlier MAME
+     "montype-7 wedge" was MAME-specific and is NOT evidence about our core.
+   - **CORRECTIONS to earlier claims (I twice over-read the data — verify,
+     don't trust summaries):** (a) `$807A5x` is a TIMING DELAY loop
+     (`mulu #$1F4 / dbf`), NOT the boot-device wait — "reached the boot
+     wait" was wrong; the real evidence is the ADB loop $814908 above.
+     (b) The first `+montype=7 +mdc824` screenshot run
+     (`simsense_confirm/screenshot_frame_0{300,450,550,650}`) showed a BLANK
+     light-gray card — but those frames were all DURING the RAM test (that
+     run was slow, still in $846xxx at F650), i.e. BEFORE any display setup.
+     Screenshotting the card pre-video-init proves nothing.
+   - **OPEN puzzle:** the two `+montype=7` runs diverged in timing — the
+     `simscrnbase` run reached video init by F507, but the
+     `simsense_confirm` run (same montype, + `+mdc824` + screenshots) was
+     still RAM-testing at F650 (a2 sweeping up through onboard VRAM
+     $60B8xxxx — testing it as free RAM, consistent with card-as-display).
+     `+mdc824` only feeds output muxes (sim.v:176-188), so it should NOT
+     change CPU timing — unexplained. Re-verify determinism if it matters.
 
 ## THE decisive check still open (in flight at session end)
 
 **Does the ROM's boot screen (gray desktop / flashing "?") actually appear
-on the CARD with sense=7?** Reaching the boot-device wait proves video init
-didn't wedge, but not WHICH display got the boot screen. Two facts to nail:
+on the CARD with sense=7?** montype-7 completing video init + ADB proves the
+ROM didn't wedge, but NOT which display got the boot screen.
 
-- `simsense_confirm/` — a `+montype=7 +mdc824` run screenshotting the CARD
-  at F300/450/550/650 is RUNNING (task was backgrounded at session end;
-  harvest `simsense_confirm/screenshot_frame_0*.png`). **If the card shows a
-  gray desktop / "?" instead of the static PrimaryInit pattern → CONFIRMED,
-  the card-as-boot-display works with sense=7 and Story A is essentially
-  solved in RTL.** (ScrnBase $824 is the WRONG global to watch for this — it
-  only gets its real value once the System loads, impossible with no disk;
-  the ROM-era boot screen uses a different base. Use the screenshot, or find
-  the ROM boot-screen base by tracing the "?" draw.)
+- `simsense_confirm/run2_*` — a `+montype=7 +mdc824` run screenshotting the
+  CARD at **F800/1000/1200/1400** (AFTER video init this time — the first
+  attempt's F300-650 shots were pre-video-init and blank; superseded) is
+  RUNNING at session end. Harvest `simsense_confirm/screenshot_frame_0*.png`.
+  **If the card shows a gray desktop / flashing "?" instead of the static
+  PrimaryInit pattern → CONFIRMED: card-as-boot-display works with sense=7
+  and Story A is essentially solved in RTL.** If still blank/PrimaryInit →
+  the ROM completed video init but kept the boot screen on onboard (then
+  need the card's own monitor sense, or model the 3-line extended sense).
+- (ScrnBase $824 is the WRONG global to watch — it only gets its real value
+  once the System loads, impossible with no disk; the ROM-era boot screen
+  uses a different base. Use the screenshot, or trace the "?"/happy-Mac draw
+  to find which VRAM it targets: onboard $60xxxxxx vs card slot-$E space.)
 - If the card still shows only PrimaryInit gray → the ROM reached the boot
   wait but kept the boot screen on onboard; then either the ROM needs a real
   monitor-sense on the card side, or model the 3-line extended sense
