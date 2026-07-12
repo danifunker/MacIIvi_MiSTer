@@ -228,18 +228,15 @@ module mdc_bench;
             integer pinit_errors_at_start;
             pinit_errors_at_start = errors;
 
-            // (1) ctrl long read: monitor sense must show code 6 (13" 640x480,
-            //     no sense gates driven after reset) in bits [11:9] -> high
-            //     byte of the low word = $0C. MAME reads $00000C02; our ctrl
-            //     low byte resets to $00 (untested by PrimaryInit: it only
-            //     needs the sense field before it rewrites ctrl itself).
+            // (1) ctrl long read — MUST be $00000C02 exactly (the MAME
+            //     golden's first PrimaryInit read): sense code 6 (13"
+            //     640x480) in bits [11:9] AND the reset straps in the low
+            //     byte (bit1 SET, bit0 clear = the VRAM config straps
+            //     PrimaryInit branches on — root cause #5).
             bus_read_q(32'hFE200000, 2'b11);
             expect16(32'hFE200000, 16'h0000, "ctrl-hi");
             bus_read_q(32'hFE200002, 2'b11);
-            if (rd_val[15:8] !== 8'h0C) begin
-                $display("PINIT FAIL ctrl-sense: got=%04x want=0Cxx", rd_val);
-                errors = errors + 1;
-            end
+            expect16(32'hFE200002, 16'h0C02, "ctrl-sense-straps");
 
             // (2) register $300: PrimaryInit writes $55 and expects to read 0
             //     back (MAME: WR $55 -> RD $00000000).

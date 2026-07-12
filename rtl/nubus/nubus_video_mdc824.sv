@@ -483,7 +483,18 @@ module nubus_video_mdc824 #(
             ack_uds_lds <= 2'b00;
             ack_rw_n <= 1'b1;
             data_out <= 16'd0;
-            ctrl <= 16'd0;
+            // ctrl RESET VALUE $0002 — NOT zero. The low ctrl bits are the
+            // card's VRAM configuration STRAPS (bit0 = RAM chip density
+            // 128k/256k, bit1 = undocumented strap, SET on the real card:
+            // MAME jmfb device_reset m_control=0x0002). PrimaryInit's first
+            // action is a ctrl read (MAME golden: $0C02) and it BRANCHES on
+            // these straps to pick the VRAM layout and prune the video mode
+            // sResources; answering $0C00 sent it down the wrong path and
+            // the Slot Manager's later mode-record hunt died smRecNotFnd =
+            // sad Mac $0F/$33 (root cause #5, 2026-07-12 — survived the A0,
+            // lane, VRAM-size and PRAM fixes because the strap, not the
+            // probed size, selects the config).
+            ctrl <= 16'h0002;
             base_reg <= 32'd0;
             stride_reg <= 32'd0;
             ramdac_ctrl <= 8'd0;
