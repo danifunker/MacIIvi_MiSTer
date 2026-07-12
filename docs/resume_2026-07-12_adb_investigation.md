@@ -161,3 +161,107 @@ all "a register/handshake answered with the wrong value/timing." The ADB
 hang is very likely the ninth of the same family: the Egret/ADB handshake
 answering wrong when a real mouse device is present. **Reproduce it in sim
 by giving the sim a mouse, then diff the handshake against MAME.**
+
+---
+
+# FINDINGS — session of 2026-07-12 afternoon (hang REPRODUCED in sim)
+
+## Verdict: reproduced, and it is NOT an ADB-protocol bug
+
+**The gray hang reproduces in Verilator with one variable: synthetic mouse
+motion.** `--mouse-from 300` (one ps2 packet/frame, alternating ±2 deltas,
+new flags in `sim_main.cpp`, commits `f52dd67`+`e62cafe`) against the exact
+control-run conditions. Control (simdiskrun marathon) reaches Welcome at
+F1200; the mouse run parks at **F742 in a 4-PC blit loop at $4082EA18-1E
+and never leaves** (still there at F1000+; screenshot: dithered desktop,
+arrow cursor at top-left, NO Welcome, NO "?"). That is the .189 symptom.
+
+## Why every previous sim was blind (two layers)
+
+1. `sim_main.cpp`'s **headless fast path never touched ps2_mouse at all**
+   (the packet build lived only in the GUI path). Every headless run ever
+   made had a frozen all-zero mouse input — strobe never toggled.
+   First injection attempt (GUI-path edit) was a dud for exactly this
+   reason: it reproduced the control run timestamp-for-timestamp (bonus:
+   proves the sim is bit-exact deterministic; archived
+   `simmouserun/dud_noinject/`).
+2. With zero deltas, `adb_device.sv` never raised `mouse_evt`, so the
+   Talk-R0-with-data and S_SRQ paths had never executed in any sim.
+
+## What the ADB layer did when finally exercised — IT IS HEALTHY
+
+Timeline (all in `simmouserun/`, time scale ≈845,472 sim-units/frame):
+- F624: Egret bus enumeration begins (identical instant to control —
+  lockstep held from F0 to F623 with data pending since F300).
+- F624-741: the ROM's ADBReInit address dance runs its exact 50 cycles
+  (same count as control) but ~2× slower — every non-dance command draws
+  an `SRQ asserted (mouse_evt=1)` from the device (new probe lines).
+- F741: dance done. Egret autopolls mouse Talk R0 ~8×/frame; device
+  answers `resp_len=2` once per injected event (correct ADB: silent when
+  no data). Egret→host deliveries: exactly 1.02/frame (no amplification;
+  975 TREQ-ACTIVE handshakes, all accepted by the ROM). The pseudoVIA
+  ack traffic (`50f26002 data=8282`) is ~110/frame vs control's ~125 —
+  i.e. NORMAL for this machine, not an interrupt storm.
+- **F742: the ROM enters the cursor engine and never returns to the
+  boot mainline.** Egret/device keep running fine underneath forever.
+
+## The stuck code, disassembled (ROM offset $2EA18 = CPU $4082EA18)
+
+`$2E9E2`: TST.B $0D62 / BMI skip; MOVEA.L ([$0D62]),A0 (low-mem vector →
+cursor context struct); MOVEA.L $12(A0),A1; JSR ([$644]);
+**MOVEM.L $3C(A0)+,D2-D4/A2** ← blit params (rows, longs, stride, dest)
+come from the struct; JSR ([$574]); then the blit:
+```
+$2EA18: 24D9        MOVE.L (A1)+,(A2)+     ; row copy
+$2EA1A: 51CB FFFC   DBF D3,$2EA18
+$2EA1E: 2608        MOVE.L A0,D3           ; reload inner count
+$2EA20: D4C4        ADDA.L D4,A2           ; add row stride
+$2EA22: 51CA FFF4   DBF D2,$2EA18
+$2EA26: JSR ([$574]); CLR.B $08CC (CrsrVis=0!); MOVEM/RTS
+```
+= the **cursor hide/restore rect blit**. Live values: A2 walks
+$60B0B818↔$60B0C818 (a $1000 window, forever), stride D4=$1000. The
+$60xxxxxx range decodes to **onboard VASP VRAM** (`addrDecoder.v`
+$60000000-$6FFFFFFF → selectVRAM; SDRAM-backed in BOTH tops, so the
+cycles complete — no DTACK hang — the CPU just never escapes the
+cursor engine). Stride $1000 matches neither the card ($400/$800) nor
+onboard 8bpp ($800): the cursor screen context looks WRONG/stale, and
+the cursor "home screen" pointer aims at the onboard framebuffer, not
+the mdc824 the desktop lives on.
+
+## Puzzle pieces still open (the in-flight trace answers these)
+
+- WHO calls the hide-blit per frame and HOW OFTEN (per-VBL cursor task?
+  per ADB packet? re-entry storm?), and per-call duration — i.e. is it
+  huge-counts-per-call or saturating call rate.
+- The struct at ([$D62]): dump D2/D3/D4/A1/A2 at entry; identify
+  ([$574])/([$644]) vector targets.
+- Why sim F1000 SHOWS an arrow on the card while the user reported no
+  cursor on .189 (draw path landed once in sim — different engage timing
+  on hardware, or hardware drew to un-scanned memory?).
+- **In-flight**: `simtracerun/` re-run with `--trace-frames 738,748`
+  (full instruction trace across the park onset), --stop-at-frame 750.
+  Analyze cpu_trace.log: entry registers, return addresses, calls/frame.
+
+## Corrected earlier beliefs (do not relearn)
+
+- "No cursor" does NOT discriminate ADB-hang vs later hangs: the pointer
+  only appears at the Welcome transition on these ROMs.
+- The SCSI pseudo-DMA timeout glue is IDENTICAL in MacIIvi.sv and sim.v
+  (sdma_berr → cpu_berr both) — audited, not a divergence.
+- The no-disk scan theory is now SECONDARY (cursor hang explains gray
+  w/ or w/o disk); `simnodiskrun/` is staged if ever needed.
+- EGRET debug lines log in the HC05 tick domain (≈$time/8) — don't read
+  them as $time.
+
+## Next actions
+
+1. Harvest `simtracerun/` cpu_trace.log → name the caller/rate → then the
+   RTL-vs-MAME question becomes concrete (likely candidates: onboard
+   video's VBL/slot-$E interplay feeding the cursor task, or the screen
+   record the ROM builds for the onboard display when the card is main).
+2. MAME oracle with mouse motion during boot (lua ioport deltas) if the
+   trace points at ROM-visible state we can diff (which screen the
+   healthy cursor context targets, pseudoVIA reg2 bits).
+3. Fix, re-run mouse marathon to Welcome, THEN rebuild RBF — hardware
+   redeploy only on the user's go.
