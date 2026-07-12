@@ -87,6 +87,44 @@ taps broke all taps" story).
 - `059b8d7` MacLCII imported VERBATIM @ a254a02 (CPU sync rule: rtl/tg68k
   byte-identical to that pin; CPU fixes land in MacLCII first)
 
+## HARDWARE FIRST LIGHT (2026-07-12, MiSTer .189) — POST PASSES ON SILICON
+
+Deployed `MacIIvi_Unstable_20260712.rbf` to .189 and activated
+(`coreRunning='MacIIvi'`). **The card displays over HDMI and POST passes
+on real hardware** — plain gray desktop pattern on the mdc824, NO sad
+Mac. All eight fixes hold on silicon, not just in Verilator. Screenshots:
+`simdiskrun/hw_189_*.png` (via `scripts/grab.sh` against
+:8182/api/screenshots — that API does NOT capture the OSD).
+
+**OPEN — full 7.5.5 desktop not yet on hardware.** Sim reaches "Welcome
+to Macintosh" at F1200 with the same RBF source; hardware sits at plain
+gray: no Welcome, no flashing "?" disk, and `boot755.hd` mtime is
+UNCHANGED since the scp → the System is not booting from SCSI-0. Prime
+suspect: SC0 did not auto-mount on core-load. On hardware the disk mounts
+via the framework `.s0` mount-memory file (CONF_STR `SC0,IMGVHDHDA` =
+slot 0, verified; `.s2` = NVR/PRAM); the sim instead got `--scsi0
+boot755_copy.hd` at launch, mounted from frame 0. Staged on .189:
+`/media/fat/games/MacIIvi/boot755.hd` (md5 13cbbaad…, = MacLCII
+scratch/MacLC_7-5-5.hda) + `/media/fat/config/MacIIvi.s0` (1024B,
+NUL-padded `games/MacIIvi/boot755.hd`). The MiSTer JSON API only serves
+the SPA shell (no mount-status endpoint found) — mount state must be read
+from the OSD, not curl.
+
+**NEXT (a decision point — the user steers):**
+1. Cheapest: explicit OSD "Mount SCSI-0" on the live core (or confirm the
+   framework auto-mounts SC0 from `.s0` on load — if it does NOT, the
+   `.s0` seeding approach is wrong for disks and only save-slots persist).
+   Re-grab after; if the Welcome screen appears, hardware = sim.
+2. If it boots to Finder: drag the menu bar to the 8*24 in Monitors so
+   PRAM persists the card as main display, then capture that PRAM →
+   refresh `releases/MacIIvi.nvr`. MAME oracle for the display-PRAM bytes
+   is ready: `/tmp/mame755_scratch.hd` boots 7.5.5 in MAME and WRITES
+   nvram/maciivi/egret (diff vs `/tmp/pram_A0_nodisk` is non-empty —
+   bytes 2,19,20,88 changed; snapshots in `/tmp/mamesnap_iivi/maciivi/`).
+3. Open design question still unretired: does the card need a persisted
+   PRAM main-display setting to show the OS at all, or does the ROM adopt
+   it live? (montype 7 is a dead end — MAME-proven ROM wedge.)
+
 ## In-flight at session end — HARVEST THESE FIRST
 
 1. **THE BOOT RUN** (`simdiskrun/`, `./Vemu_vbl` binary copy, all eight
