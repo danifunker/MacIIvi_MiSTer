@@ -7,29 +7,40 @@ deploy is one command when it does).*
 
 ## Where things stand (one paragraph)
 
-The core boots the IIvi ROM end-to-end in Verilator, discovers the mdc824
-byte-exact (17,845 consecutive reads MATCH the MAME golden — walk_diff),
-and the post-discovery sad Mac $0F/$33 (smRecNotFnd) SURVIVED the VRAM-size
-fix: the task-#9 hybrid (card presents 1MB = 384KB hot BRAM + SDRAM cold
-tail, commit e7bce31, bench PINIT PASS, RBF built/timed clean) sad-Macced
-identically at F700 — size was NEVER the trigger (the "1MB control passed"
-belief was an artifact: that run was killed at F628, before the F650-690
-verdict window). Root-cause candidate #4, from the walk_diff fork at read
-#17846 (MAME loops back to re-read a record list = its record hunt
-SUCCEEDS; ours streams past = hunt FAILS): **stale PRAM** — the committed
-egret.pram was the LC-II-era file, and with a card present the ROM restores
-the remembered slot-$E display mode from PRAM; stale bytes = failed record
-lookup = smRecNotFnd (the pre-A0 7.5.5 boot triumph is consistent: card
-invisible → no mode restore → stale PRAM harmless). egret.pram is now
-seeded from MAME's PROVEN clean maciivi+mdc824 boot NVRAM (3ab9916, loaded
-at runtime — no rebuild needed) and the clean-PRAM 7.5.5 disk run was IN
-FLIGHT at session end. Also fixed this session: the MAME oracle had been
-silently wedged since 16:43 by POISONED PERSISTENT CFG
-(~/.mame/cfg/maciivi.cfg — the real "write taps broke all taps" story);
-cleaned, MAME+card boots clean, complete 19,551-read golden committed.
+**The sad Mac $0F/$33 is DEAD — root cause #6, trace-proven and
+F700-verified**: it was never the card, the VRAM size (#3, falsified), or
+PRAM (#4) or the ctrl straps (#5, both real fixes but not the trigger) —
+it was the IIvi ROM's **POST machine-identity check** (instruction trace
+F663: table-driven probes at $40802Fxx-$40803Axx write DDR/OR patterns
+into VIA1 + the pseudoVIA, read them back, fingerprint the machine, and
+sad-Mac on signature mismatch; error $33 = SysError 51 class, NOT
+smRecNotFnd — last session's decode was wrong). Three registers answered
+with constants instead of round-tripping: via6522 ORA/ORB reads ignored
+DDR/output-latch (now `(out&ddr)|(in&~ddr)` per datasheet/MAME R65NC22),
+and pseudoVIA regs $00/$01 were hardwired $00 (now stored, init $4F/$06
+per the RUNNING MAME 0.264 binary — NOTE: the local ../mame tree
+disagrees there; the BINARY is the oracle of record). Fix f4e3d5f passed
+the F650-690 kill window on the first try — 7.5.5 disk boot was IN
+FLIGHT at session end (F700 healthy, heading for the Finder), Quartus
+rebuild with the full fix set also in flight. All the collateral fixes
+along the way are real and stay: real-A0 (#1), lane-3 word reads (#2),
+1MB hybrid card VRAM (e7bce31 — PrimaryInit's $F4B00 probe is real),
+MAME-clean PRAM (3ab9916), ctrl straps $0002 (1eee6b3), the
+walk-validated card model (17,845 reads byte-exact vs the golden), and
+the de-poisoned MAME oracle (~/.mame/cfg/maciivi.cfg — the real "write
+taps broke all taps" story).
 
 ## Commit trail (newest first, all on main)
 
+- `f4e3d5f` **THE FIX**: via6522 ORA/ORB DDR-merge reads + pseudoVIA
+  regs $00/$01 stored ($4F/$06 init per MAME 0.264 BINARY — local tree
+  disagrees) — the ROM's POST identity check now passes (F700 clean)
+- `1eee6b3` mdc824 ctrl resets $0002 (VRAM config straps — real fix,
+  wasn't the trigger); bench asserts the exact $0C02 first read
+- `3ab9916` egret.pram seeded from MAME clean-boot NVRAM (LC-II-era file
+  preserved as egret_lcii.pram; runtime $readmemh, no rebuild)
+- `8f73524` walk_diff lane-correct compare (17,845-read byte-exact match)
+- `2b97945`/`8696836` resume-doc updates mid-hunt
 - `e7bce31` task #9 HYBRID: card presents 1MB = 384KB hot BRAM + SDRAM
   cold tail (word $100000 window via the cpu-slot port, no sdram.v
   changes); NuBus no-card timeout 4→32 clk; bench boundary + ext-RMW PASS
@@ -68,29 +79,27 @@ cleaned, MAME+card boots clean, complete 19,551-read golden committed.
 
 ## In-flight at session end — HARVEST THESE FIRST
 
-1. **Clean-PRAM 7.5.5 disk-boot sim** (`simdiskrun/`, `./Vemu_hybrid`
-   binary copy, fresh `boot755_copy.hd`, MAME-derived `egret.pram`,
-   `--stop-at-frame 4000`, screenshots 450/700/1200/2000/2800/3600/4000;
-   launched detached ~23:05):
-   a. **F700 screenshot = the PRAM-theory verdict.** No sad Mac → root
-      cause #4 CONFIRMED → continue to OS boot + Finder; then the RBF in
-      `output_files/` (hybrid, built 22:35) is the deploy candidate —
-      stage as `releases/`. Sad Mac again → PRAM theory dead; next
-      suspects: diff OUR fork-point behavior instruction-level
-      (`--trace-frames 400,430` around the SM record hunt) vs MAME, and
-      compare the sim's montype/onboard-display sense vs MAME's.
-   b. Earlier failed-run artifacts: `simdiskrun/hybrid_lciipram_run/`
-      (F700 sad Mac WITH 1MB hybrid + LC-II PRAM — the size-theory
-      falsifier), `run_1mb_bram_20260711/` (control, killed F628),
-      `run_prea0_20260710/` (the card-invisible 7.5.5 triumph).
-2. **Hybrid Quartus build: DONE, harvested** — fit 90% ALM, M10K 553/553
-   (unchanged by design), core clocks +2.17/+2.60ns, HDMI-scaler -1.55ns
-   (standing scaler-only caveat). `output_files/MacIIvi.rbf` @ 22:35. It
-   contains the hybrid card + old-PRAM default; PRAM overridable at boot
-   via `releases/MacIIvi.nvr` (no rebuild needed) but a rebuild bakes the
-   clean default — rebuild before staging if the PRAM fix confirms.
-3. The pre-hybrid `releases/MacIIvi_Unstable_20260711.rbf` is
-   **superseded** (384KB-only card + stale-PRAM default). Do not deploy.
+1. **VIA-fix 7.5.5 disk-boot sim** (`simdiskrun/`, `./Vemu_via` binary
+   copy, fresh image, all fixes: f4e3d5f + 1eee6b3 + 3ab9916 + e7bce31):
+   **F700 PASSED — no sad Mac, gray desktop on the card, healthy PCs.**
+   Harvest F1200/F2000 (Mac OS startup screen) / F2800 (extension
+   parade) / F4000 (Finder?). Then next-actions #3/#4 (Monitors, PRAM
+   capture). Failed-run archaeology lives in `simdiskrun/`:
+   `hybrid_lciipram_run/` (size-theory falsifier), `hybrid_cleanpram_run/`
+   (PRAM-theory falsifier), `strap_run/` (strap-theory falsifier),
+   `run_1mb_bram_20260711/` (killed F628 — the run whose over-reading
+   cost a day), `run_prea0_20260710/` (card-invisible 7.5.5 triumph).
+   The F663 instruction trace that cracked it: `simproberun/cpu_trace.log`
+   (132MB, gitignored, regenerate via `--trace-frames 620,700`).
+2. **Quartus rebuild with the full fix set** (launched at session end,
+   `simdiskrun/quartus_build_viafix.log`): harvest fit/timing; expect
+   ~90% ALM / cores closed / scaler -1.5ns as before (RTL deltas are
+   tiny). Output `output_files/MacIIvi.rbf` → stage as
+   `releases/MacIIvi_Unstable_<date>.rbf` = THE deploy candidate once
+   the sim run confirms the OS boots.
+3. All earlier RBFs (incl. `MacIIvi_Unstable_20260711.rbf` and the 22:35
+   hybrid build) are **superseded** — they predate the VIA/pseudoVIA
+   identity-check fixes and sad-Mac on real hardware. Do not deploy.
 
 ## Next actions (in order)
 
@@ -130,6 +139,18 @@ cleaned, MAME+card boots clean, complete 19,551-read golden committed.
   18:14 "golden" of 2026-07-11 was a wedge artifact. After any
   montype-forcing run: `rm ~/.mame/cfg/maciivi.cfg
   ~/.mame/nvram/maciivi/egret` before trusting a capture.
+- **The IIvi ROM's POST fingerprints the machine** (unlike the LC II's):
+  it writes DDR/OR patterns into VIA1 and the pseudoVIA, reads them
+  back, and sad-Macs $0F/$33 on signature mismatch (trace: dispatcher
+  $40802F58, probes $408032xx/$40803944, verdict btst #$c,D0 at
+  $408499DA, chime $40845CE2). ANY chipset register that answers with a
+  constant instead of round-tripping stored bits is a candidate POST
+  killer. Sad-Mac minor $33 = SysError 51 — NOT Slot Manager -351; the
+  smRecNotFnd reading was wrong and cost four theories.
+- **The local ../mame tree is NOT the oracle — the packaged 0.264
+  binary is**: pseudovia.cpp in the tree has regs $00/$01 unconnected
+  (read 0); the running binary stores them ($4F/$06 init, tap-proven).
+  When tree and tap disagree, TRUST THE TAP.
 - **PRAM provenance matters once a card exists**: `rtl/egret/egret.pram`
   was the LC-II-era file through the whole bring-up. Harmless while the
   card was invisible — but with a discovered card the IIvi ROM restores
