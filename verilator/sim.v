@@ -765,6 +765,34 @@ module emu
 	assign nubusAck_n   = nubus_no_card ? 1'b0    : nubusAck_card;
 
 `ifdef SIMULATION
+	// [PROBE] peripheral read logger for the POST identity-check hunt
+	// (2026-07-12): logs every VIA/VDAC/pseudoVIA/unmapped I/O READ with
+	// the value the CPU received, frame-gated to keep the log sane. Same
+	// latch-at-AS-low / report-at-AS-rise discipline as the NUBUS logger
+	// below (selects are dead at AS-rise).
+	reg        pr_as_d;
+	reg        pr_cyc;
+	reg [31:0] pr_addr;
+	reg [15:0] pr_data;
+	reg [3:0]  pr_kind;
+	always @(posedge clk_sys) begin
+		pr_as_d <= _cpuAS;
+		if (!_cpuAS && _cpuRW &&
+		    (selectVIA || selectVDAC || selectPseudoVIA || selectUnmapped) &&
+		    sim_frame_count >= 32'd740 && sim_frame_count <= 32'd800) begin
+			pr_cyc  <= 1'b1;
+			pr_addr <= cpuAddr;
+			pr_data <= dataControllerDataOut;
+			pr_kind <= {selectUnmapped, selectPseudoVIA, selectVDAC, selectVIA};
+		end
+		if (!pr_as_d && _cpuAS && pr_cyc) begin
+			pr_cyc <= 1'b0;
+			$display("[PROBE] F%0d %s addr=%h data=%h", sim_frame_count,
+			         pr_kind[0] ? "VIA " : pr_kind[1] ? "VDAC" :
+			         pr_kind[2] ? "PVIA" : "UNMP", pr_addr, pr_data);
+		end
+	end
+
 	// [NUBUS] access logger. The decoder's selects are combinational on
 	// !_cpuAS, so they are ALREADY DEASSERTED at the AS-rise instant — the
 	// original logger sampled slot_space there and could never fire (bug

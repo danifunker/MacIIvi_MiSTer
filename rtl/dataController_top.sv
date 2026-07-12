@@ -442,8 +442,19 @@ module dataController_top(
 	//
 	// TREQ polarity: cuda_treq=1 means CUDA is asserting TREQ (pin LOW = has data)
 	// So we invert cuda_treq when building the external value
-	// DEBUG: Connect _hblank to PB7, and force Sense=6 (110) on PB2-0
-	wire [7:0] via_pb_external = {_hblank, 1'b1, 2'b11, ~cuda_treq, 3'b110};
+	//
+	// MAME vasp.cpp via_in_b(): `return read_pb3() << 3` — ONLY TREQ (PB3)
+	// is an input on the VASP's VIA1 Port B; every other bit reads 0. The
+	// previous value ({_hblank, 1'b1, 2'b11, ~cuda_treq, 3'b110}) carried
+	// LC/V8-era DEBUG leftovers (hblank on PB7, montype sense 6 on PB2-0 —
+	// the VASP's sense lives in pseudoVIA reg $10 instead) that poisoned
+	// the ROM POST's DDRB=$00 raw-pin fingerprint: MAME reads $08 there,
+	// we read $FE/$7E (hblank-dependent!), machine-signature mismatch, sad
+	// Mac $0F/$33 (root cause #7, 2026-07-12 — pass k+1 of the identity
+	// check; pass k survived because DDRB=$F7 masks all but TREQ). Bit 3
+	// here is a placeholder — pb_pin_level replaces it with the open-drain
+	// TREQ resolution below.
+	wire [7:0] via_pb_external = 8'h00;
 	// Combine VIA outputs with CUDA inputs
 	// Standard MUX for most bits: VIA output when OE, external when input
 	wire [7:0] pb_pin_level_mux = (via_pb_oe & via_pb_o) | (~via_pb_oe & via_pb_external);
