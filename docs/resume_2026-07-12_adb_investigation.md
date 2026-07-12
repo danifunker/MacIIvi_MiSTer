@@ -337,3 +337,47 @@ globals before InitGraf reads them (the corruption, if that theory holds).
   — NOTE: debugger breakpoints DO NOT FIRE under `-debugger none` in this
   0.264 build; printf/consolelog and dump actions are all inert. Value
   capture must go through lua memory reads or our sim's ramwatch.)
+
+---
+
+# REFRAME (governing insight, late 2026-07-12) — TWO overlapping stories, not one
+
+**MAME golden: ScrnBase ($824) = $60B00000 — the IIvi's boot screen with an
+mdc824 present and clean PRAM is STILL THE ONBOARD VASP DISPLAY.** And
+`sim.v` defaults its scanout to the onboard video (`+mdc824` plusarg
+switches to the card — sim.v:167-188). Therefore:
+
+## Story A — why the USER sees gray forever (very likely THE user-visible bug)
+
+Every sim screenshot ever taken (including "Welcome at F1200") showed the
+ONBOARD framebuffer. The FPGA default shape REMOVED onboard scanout
+(mdc824-only display). So on hardware the ROM boots normally, painting
+desktop/"?"-icon/Welcome into onboard VRAM (SDRAM-backed, invisible), while
+the visible mdc824 shows only the static gray PrimaryInit pattern. Gray
+forever, no Welcome, no "?", no cursor — all four symptoms, NO hang
+required. "Sim=Welcome vs hw=gray" was a SCANOUT difference, not machine
+divergence. **Fix direction (already the 07-11 doc's next-action #4): make
+the ROM adopt the mdc824 as startup screen via PRAM main-display bytes**
+(capture from a MAME 7.5.5 Monitors drag → seed releases/MacIIvi.nvr +
+rtl/egret/egret.pram), or ship an onboard-scanout shape.
+Verification queued: no-mouse sim, `+mdc824`, screenshot F1200 → expect
+card still gray while onboard (default scanout) got Welcome.
+
+## Story B — the mouse-motion wedge (REAL secondary bug, found en route)
+
+With mouse motion from F300, the boot genuinely wedges at F742 in an
+unbounded StdRRect fill (deep-dive above). Real users wiggle mice during
+boot; MAME survives the same stimulus. Still worth fixing after Story A —
+but it is NOT required to explain the .189 symptom. Value capture for it:
+simwatchrun (+ramwatch, F739-745) — harvest regardless.
+
+## Immediate next steps (reordered)
+
+1. Harvest simwatchrun (bug B values: painter A6 slots + any pre-InitGraf
+   corruption of GDevice/screenBits).
+2. Keystone run: `+mdc824` no-mouse marathon to F1210 with screenshots —
+   prove the card shows only PrimaryInit gray at Welcome-time in OUR core.
+3. MAME Monitors-drag automation (lua mouse injection, snap-verified) on
+   /tmp/mame755_scratch.hd → PRAM diff → the main-display byte encoding →
+   seed egret.pram → sim marathon → expect WELCOME ON THE CARD (+mdc824).
+4. Only then: RBF + hardware, on the user's go.
