@@ -29,10 +29,17 @@ module mdc_bench;
     wire [15:0] vram_dout, vram_din, vram_scan_data;
     wire        vram_rd, vram_wr, vram_ready, vram_scan_rd;
 
-    // 524288 words = 1MB: the real MDC 8/24 default VRAM config, and what
-    // PrimaryInit's sizing probe (write $AAAAAAAA @ byte $F4B00, read back)
-    // requires. Matches verilator/sim.v. See the PrimaryInit section below.
-    nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(524288)) card (
+    // The FPGA hybrid shape (2026-07-11): 384KB hot framebuffer in BRAM +
+    // cold tail to 1MB on the ext_* port (SDRAM window in-system; a latency
+    // model here). PrimaryInit's sizing probe (write $AAAAAAAA @ byte
+    // $F4B00 = word $7A580, read back) lands in the TAIL — the IIvi ROM
+    // sad-Macs if it misses. See the PrimaryInit section below.
+    wire        ext_rd, ext_wr;
+    wire [15:0] ext_din;
+    wire        ext_ready;
+
+    nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(196608),
+                         .TOTAL_WORDS(524288)) card (
         .clk(clk), .reset(reset),
         .addr(addr), .data_in(data_in), .uds_lds(uds_lds),
         .cpu_longword(1'b0), .rw_n(rw_n), .cpu_as_n(cpu_as_n),
@@ -41,6 +48,8 @@ module mdc_bench;
         .vga_clk(),
         .vram_addr(vram_addr), .vram_dout(vram_dout), .vram_din(vram_din),
         .vram_rd(vram_rd), .vram_wr(vram_wr), .vram_ready(vram_ready),
+        .ext_rd(ext_rd), .ext_wr(ext_wr), .ext_din(ext_din),
+        .ext_ready(ext_ready),
         .vram_scan_addr(vram_scan_addr), .vram_scan_rd(vram_scan_rd),
         .vram_scan_data(vram_scan_data),
         .ioctl_wr(1'b0), .ioctl_addr(25'd0), .ioctl_data(16'd0),
@@ -51,7 +60,28 @@ module mdc_bench;
         .dbg_irq_cnt(), .dbg_ack_cnt(), .dbg_vblank_enable()
     );
 
-    vram_ram #(.WORDS(524288)) vram (
+    // Cold-tail model: SDRAM-ish latency (several cycles to ready), word
+    // index = vram_addr[19:0] per the module's ext contract. In-system this
+    // is the cpu-slot SDRAM port at word $100000 + index.
+    reg [15:0] ext_mem [0:524287];
+    reg [2:0]  ext_lat = 0;
+    reg        ext_ready_r = 0;
+    always @(posedge clk) begin
+        ext_ready_r <= 1'b0;
+        if ((ext_rd | ext_wr) && !ext_ready_r) begin
+            if (ext_lat == 3'd6) begin
+                if (ext_wr) ext_mem[vram_addr[19:0]] <= vram_dout;
+                ext_ready_r <= 1'b1;
+                ext_lat <= 3'd0;
+            end else
+                ext_lat <= ext_lat + 3'd1;
+        end else
+            ext_lat <= 3'd0;
+    end
+    assign ext_din   = ext_mem[vram_addr[19:0]];
+    assign ext_ready = ext_ready_r;
+
+    vram_ram #(.WORDS(196608)) vram (
         .clk(clk),
         .addr(vram_addr), .din(vram_dout), .dout(vram_din),
         .rd(vram_rd), .wr(vram_wr), .ready(vram_ready),
@@ -100,7 +130,7 @@ module mdc_bench;
         end
     endtask
 
-    task expect16(input [31:0] a, input [15:0] want, input [127:0] tag);
+    task expect16(input [31:0] a, input [15:0] want, input [175:0] tag);
         begin
             if (rd_val !== want) begin
                 $display("PINIT FAIL %0s: addr=%08x got=%04x want=%04x",
@@ -242,6 +272,22 @@ module mdc_bench;
             bus_read_q(32'hFE000002, 2'b11);
             expect16(32'hFE000002, 16'h9ABC, "vram-low-lo");
 
+            // (4b) BRAM/tail boundary straddle: word 196607 (byte $5FFFE) is
+            //      the last BRAM word, word 196608 (byte $60000) the first
+            //      tail word — both must hold values independently.
+            bus_write_q(32'hFE05FFFE, 16'h1122, 2'b11);
+            bus_write_q(32'hFE060000, 16'h3344, 2'b11);
+            bus_read_q(32'hFE05FFFE, 2'b11);
+            expect16(32'hFE05FFFE, 16'h1122, "boundary-bram");
+            bus_read_q(32'hFE060000, 2'b11);
+            expect16(32'hFE060000, 16'h3344, "boundary-ext");
+
+            // (4c) RMW byte write INTO the tail (odd byte -> LDS strobe):
+            //      merges over the ext port's read-modify-write path.
+            bus_write_q(32'hFE060001, 16'h0055, 2'b01);
+            bus_read_q(32'hFE060000, 2'b11);
+            expect16(32'hFE060000, 16'h3355, "ext-rmw-byte");
+
             // (5) beyond-VRAM reads stay open-bus ($FFFF): the sizing probe
             //     must FAIL cleanly past the installed size (here: at 2MB-1,
             //     beyond the 1MB card).
@@ -262,7 +308,7 @@ module mdc_bench;
             end
 
             if (errors == pinit_errors_at_start)
-                $display("PINIT PASS: sense, reg $300, 1MB sizing probe, VRAM rw, beam toggle");
+                $display("PINIT PASS: sense, reg $300, 1MB sizing probe (tail), BRAM/tail boundary, ext RMW, beam toggle");
             else
                 $display("PINIT: %0d ERRORS", errors - pinit_errors_at_start);
         end

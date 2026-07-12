@@ -1119,6 +1119,9 @@ module emu
 	wire [24:0] mdc_vram_addr, mdc_vram_scan_addr;
 	wire [15:0] mdc_vram_dout, mdc_vram_din, mdc_vram_scan_data;
 	wire        mdc_vram_rd, mdc_vram_wr, mdc_vram_ready, mdc_vram_scan_rd;
+	wire        card_ext_rd, card_ext_wr;
+	wire [15:0] card_ext_din;
+	wire        card_ext_ready;
 
 	// FPGA BRAM budget: the onboard framebuffer (384KB vram_bram) and a 384KB
 	// card VRAM cannot coexist (~614 M10K of the Cyclone V's 553). In the
@@ -1126,21 +1129,25 @@ module emu
 	// the full 384KB (8bpp @ 640x480). Under ONBOARD_DISPLAY the card drops
 	// to its 128KB boot configuration (1/2bpp) instead.
 	//
-	// KNOWN-BROKEN ON HARDWARE (2026-07-11): the real MDC 8/24's PrimaryInit
-	// sizes its VRAM by writing $AAAAAAAA at byte offset $F4B00 (~979KB) and
-	// reading it back — no legal config is smaller than 512KB, so BOTH sizes
-	// below fail the probe, PrimaryInit errors out, the Slot Manager drops
-	// the video sResources, and the ROM sad-Macs $0F/$33 (smRecNotFnd)
-	// hunting for a boot display. verilator/sim.v DIVERGES: it instantiates
-	// the card with 1MB (the real default config) and boots. The hardware
-	// fix is SDRAM-backed card VRAM (VASP_RETARGET task #9) — until then do
-	// not ship a card-only-display RBF.
+	// Hybrid card VRAM (task #9, 2026-07-11): the BRAM above is only the HOT
+	// (scanned-out) portion; the card PRESENTS TOTAL_WORDS = 1MB, with the
+	// cold tail [MDC_VRAM_WORDS, 1MB) living in the SDRAM window at word
+	// $100000 via the ext_* port below. The IIvi ROM requires this: its Slot
+	// Manager (unlike the Mac II's, which boots this card at plain 384KB —
+	// lbmactwo) hard-fails the card when PrimaryInit's VRAM sizing probe
+	// (write $AAAAAAAA @ byte $F4B00 ~979KB, read back) misses: sResources
+	// dropped -> boot-display hunt dies smRecNotFnd -> sad Mac $0F/$33.
+	// Nothing is ever scanned out from the tail (8bpp @ 640x480 = 300KB fits
+	// the BRAM). Caveat: a 1MB-sized card offers 24bpp in Monitors; selecting
+	// it would display garbage — documented bring-up limitation.
+	// Keep in sync with verilator/sim.v.
 `ifdef ONBOARD_DISPLAY
 	localparam MDC_VRAM_WORDS = 65536;    // 128KB boot config
 `else
 	localparam MDC_VRAM_WORDS = 196608;   // 384KB, 8bpp @ 640x480
 `endif
-	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(MDC_VRAM_WORDS)) nubus_card (
+	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(MDC_VRAM_WORDS),
+	                     .TOTAL_WORDS(524288)) nubus_card (
 		.clk(clk_sys),
 		.reset(!_cpuReset),
 		// Real A0 required: the declaration ROM lives on byte lane 3
@@ -1167,6 +1174,10 @@ module emu
 		.vram_rd(mdc_vram_rd),
 		.vram_wr(mdc_vram_wr),
 		.vram_ready(mdc_vram_ready),
+		.ext_rd(card_ext_rd),
+		.ext_wr(card_ext_wr),
+		.ext_din(card_ext_din),
+		.ext_ready(card_ext_ready),
 		.vram_scan_addr(mdc_vram_scan_addr),
 		.vram_scan_rd(mdc_vram_scan_rd),
 		.vram_scan_data(mdc_vram_scan_data),
@@ -1195,17 +1206,19 @@ module emu
 	);
 
 	// Empty-slot open bus: slots $C/$D (and any slot cycle the card doesn't
-	// claim) — after 4 clk_sys with no card ack, answer $FFFF with DTACK. The
+	// claim) — after 32 clk_sys with no card ack, answer $FFFF with DTACK. The
 	// Slot Manager reads the $FF "format byte" as slot-empty and moves on
 	// (lbmactwo-validated; TG68 BERR frames are not handler-recoverable, so
-	// no arbiter-timeout BERR here).
-	reg [2:0] nubus_timeout;
+	// no arbiter-timeout BERR here). Was 4 clk: the card's cold-tail ext
+	// accesses ride the SDRAM cpu-slot and ack in ~10-20 clk, which the old
+	// horizon would have eaten. Real NuBus allows 25.6us; 32 clk ~= 1us.
+	reg [5:0] nubus_timeout;
 	always @(posedge clk_sys) begin
-		if (_cpuAS) nubus_timeout <= 3'd0;
-		else if (slot_space && nubusAck_card && !nubus_timeout[2])
-			nubus_timeout <= nubus_timeout + 3'd1;
+		if (_cpuAS) nubus_timeout <= 6'd0;
+		else if (slot_space && nubusAck_card && !nubus_timeout[5])
+			nubus_timeout <= nubus_timeout + 6'd1;
 	end
-	wire nubus_no_card = slot_space && nubusAck_card && nubus_timeout[2];
+	wire nubus_no_card = slot_space && nubusAck_card && nubus_timeout[5];
 	assign nubusDataOut = nubus_no_card ? 16'hFFFF : nubusDataOut_card;
 	assign nubusAck_n   = nubus_no_card ? 1'b0    : nubusAck_card;
 
@@ -1864,15 +1877,44 @@ module emu
 	// (ROM $000000, VRAM $080000, floppies $180000/$280000, RAM $380000+).
 	// The 36MB RAM config reaches above the 32MB module boundary and needs a
 	// 64MB SDRAM module (sdram.v drives column A9 from addr[24]).
-	wire [24:0] sdram_addr = download_cycle ? dio_a : memoryAddr;
+
+	// Card cold-tail (ext) SDRAM access — twin of verilator/sim.v (long note
+	// there). Card words [MDC_VRAM_WORDS, 1MB) map to SDRAM word $100000 +
+	// word inside the reserved mdc824 window. An ext access coincides with a
+	// CPU bus cycle TO the card, so the RAM/ROM arms are idle by
+	// construction; only floppy staging can collide, and then the ext op
+	// waits (its progress gates on card_ext_slot). READS complete on the
+	// controller's read-data-valid handshake for the ext address; WRITES are
+	// declared done after 14 presented clk_sys (~3.5 chipset windows —
+	// >=2 clean command windows by margin, each an idempotent rewrite).
+	// Priority: download > floppy staging > card ext > cpu.
+	wire [24:0] card_ext_addr = 25'h0100000 + {5'd0, mdc_vram_addr[19:0]};
+	wire        card_ext_req  = card_ext_rd || card_ext_wr;
+	wire        card_ext_slot = card_ext_req && !download_cycle
+	                            && !dskReadAckInt && !dskReadAckExt;
+	reg  [3:0]  card_ext_wcnt = 4'd0;
+	always @(posedge clk_sys) begin
+		if (!card_ext_req)
+			card_ext_wcnt <= 4'd0;
+		else if (card_ext_slot && card_ext_wcnt != 4'd14)
+			card_ext_wcnt <= card_ext_wcnt + 4'd1;
+	end
+	assign card_ext_ready = card_ext_rd
+	                      ? (sdram_ram_ready && sdram_addr == card_ext_addr)
+	                      : (card_ext_wcnt == 4'd14);
+	assign card_ext_din   = sdram_out;
+
+	wire [24:0] sdram_addr = download_cycle ? dio_a :
+	                         card_ext_slot  ? card_ext_addr : memoryAddr;
 	wire [15:0] sdram_din  = download_cycle ? dio_data :
-	                                          memoryDataOut;
+	                         card_ext_slot  ? mdc_vram_dout : memoryDataOut;
 	wire  [1:0] sdram_ds   = download_cycle ? 2'b11 :
-	                                          { !_memoryUDS, !_memoryLDS };
+	                         card_ext_slot  ? 2'b11 : { !_memoryUDS, !_memoryLDS };
 	wire        sdram_we   = download_cycle ? dio_write :
-	                                          !_ramWE;
+	                         card_ext_slot  ? card_ext_wr : !_ramWE;
 	wire        sdram_oe   = download_cycle ? 1'b0 :
-	                                          (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
+	                         card_ext_slot  ? card_ext_rd :
+	                         (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
 	wire [15:0] sdram_do   = download_cycle ? 16'hffff :
 	                         (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux :
 	                                                            sdram_out;

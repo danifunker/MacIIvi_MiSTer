@@ -27,7 +27,15 @@
 module nubus_video_mdc824 #(
     parameter SLOT_ID = 4'hE,
     parameter DEFAULT_MONOCHROME = 1'b0,
-    parameter integer VRAM_WORDS = 196608   // 16-bit words of card VRAM (384 KB)
+    parameter integer VRAM_WORDS = 196608,  // 16-bit words of card VRAM in BRAM (384 KB)
+    // Total card size PRESENTED to the machine. The IIvi ROM's Slot Manager
+    // (unlike the Mac II's) hard-fails the card when PrimaryInit's VRAM
+    // sizing probe (write $AAAAAAAA @ byte $F4B00, read back) misses — the
+    // 2026-07-11 sad Mac $0F/$33 (smRecNotFnd). Words [VRAM_WORDS,
+    // TOTAL_WORDS) are the COLD TAIL: CPU-accessible via the ext_* port
+    // (SDRAM window at word $100000), never scanned out. The visible
+    // framebuffer (8bpp @ 640x480 = 300KB) always fits the BRAM portion.
+    parameter integer TOTAL_WORDS = 524288  // 1MB — the real card's default config
 ) (
     input clk,
     input reset,
@@ -53,13 +61,22 @@ module nubus_video_mdc824 #(
     output vga_blank,
     output vga_clk,
 
-    // VRAM Port A — CPU read/write (via FSM)
+    // VRAM Port A — CPU read/write (via FSM), BRAM portion (word < VRAM_WORDS)
     output reg [24:0] vram_addr,
     output reg [15:0] vram_dout,
     input [15:0] vram_din,
-    output reg vram_rd,
-    output reg vram_wr,
+    output vram_rd,
+    output vram_wr,
     input vram_ready,
+
+    // Cold-tail port — CPU read/write of words [VRAM_WORDS, TOTAL_WORDS).
+    // Same handshake as the BRAM port; the top maps ext_word into the SDRAM
+    // window at word $100000 and answers with ext_din/ext_ready. Shares
+    // vram_dout for write data. ext_word = vram_addr[19:0] (card word).
+    output ext_rd,
+    output ext_wr,
+    input [15:0] ext_din,
+    input ext_ready,
 
     // VRAM Port B — dedicated scanout read (no cache, never misses)
     output     [24:0] vram_scan_addr,
@@ -352,6 +369,19 @@ module nubus_video_mdc824 #(
 
     wire [19:0] cpu_vram_word = local_addr[20:1];  // byte addr -> word addr (2MB)
 
+    // BRAM/cold-tail steer: one FSM, two targets. ext_sel_r is latched at
+    // cycle accept; the FSM's generic rd/wr/ready plumbing fans out to
+    // whichever port owns the word. RMW partial writes work identically
+    // over both (read-merge-write through the same mux).
+    reg  ext_sel_r;
+    reg  port_rd_r, port_wr_r;
+    assign vram_rd = port_rd_r & ~ext_sel_r;
+    assign vram_wr = port_wr_r & ~ext_sel_r;
+    assign ext_rd  = port_rd_r &  ext_sel_r;
+    assign ext_wr  = port_wr_r &  ext_sel_r;
+    wire        port_ready = ext_sel_r ? ext_ready : vram_ready;
+    wire [15:0] port_din   = ext_sel_r ? ext_din   : vram_din;
+
     // NuBus ack timing
     reg [2:0] ack_delay;
     reg rom_read_pending;
@@ -437,8 +467,9 @@ module nubus_video_mdc824 #(
 
         if (reset) begin
             state <= S_IDLE;
-            vram_rd <= 1'b0;
-            vram_wr <= 1'b0;
+            port_rd_r <= 1'b0;
+            port_wr_r <= 1'b0;
+            ext_sel_r <= 1'b0;
             vram_addr <= 25'd0;
             vram_dout <= 16'd0;
             cpu_write_data <= 16'd0;
@@ -469,8 +500,8 @@ module nubus_video_mdc824 #(
 
             case (state)
                 S_IDLE: begin
-                    vram_rd <= 1'b0;
-                    vram_wr <= 1'b0;
+                    port_rd_r <= 1'b0;
+                    port_wr_r <= 1'b0;
 
                     if (cpu_as_n && !ack_n) begin
                         ack_n <= 1'b1;
@@ -486,8 +517,11 @@ module nubus_video_mdc824 #(
                         ack_rw_n <= rw_n;
 
                         // ---- VRAM write (raw, no inversion) ----
+                        // word < VRAM_WORDS -> BRAM; < TOTAL_WORDS -> cold
+                        // tail (ext port); beyond -> ack-and-drop as before.
                         if (!rw_n && addr_is_vram) begin
-                            if (cpu_vram_word < VRAM_WORDS) begin
+                            if (cpu_vram_word < TOTAL_WORDS) begin
+                                ext_sel_r <= (cpu_vram_word >= VRAM_WORDS);
                                 vram_addr <= VRAM_BASE + {5'd0, cpu_vram_word};
                                 cpu_write_data <= data_in;
                                 cpu_write_strobes <= uds_lds;
@@ -506,7 +540,8 @@ module nubus_video_mdc824 #(
                         end
                         // ---- VRAM read (raw) ----
                         else if (rw_n && addr_is_vram) begin
-                            if (cpu_vram_word < VRAM_WORDS) begin
+                            if (cpu_vram_word < TOTAL_WORDS) begin
+                                ext_sel_r <= (cpu_vram_word >= VRAM_WORDS);
                                 vram_addr <= VRAM_BASE + {5'd0, cpu_vram_word};
                                 state <= S_CPU_READ;
                             end else begin
@@ -550,43 +585,43 @@ module nubus_video_mdc824 #(
                 end
 
                 S_CPU_WRITE: begin
-                    vram_wr <= 1'b1;
+                    port_wr_r <= 1'b1;
                     state <= S_CPU_WRITE_WAIT;
                 end
 
                 S_CPU_WRITE_WAIT: begin
-                    if (vram_ready) begin
-                        vram_wr <= 1'b0;
+                    if (port_ready) begin
+                        port_wr_r <= 1'b0;
                         ack_delay <= 3'd2;
                         state <= S_IDLE;
                     end
                 end
 
                 S_CPU_READ: begin
-                    vram_rd <= 1'b1;
+                    port_rd_r <= 1'b1;
                     state <= S_CPU_READ_WAIT;
                 end
 
                 S_CPU_READ_WAIT: begin
-                    if (vram_ready) begin
-                        data_out <= vram_din;   // raw, no inversion
-                        vram_rd <= 1'b0;
+                    if (port_ready) begin
+                        data_out <= port_din;   // raw, no inversion
+                        port_rd_r <= 1'b0;
                         ack_delay <= 3'd2;
                         state <= S_IDLE;
                     end
                 end
 
                 S_CPU_RMW_READ: begin
-                    vram_rd <= 1'b1;
+                    port_rd_r <= 1'b1;
                     state <= S_CPU_RMW_READ_WAIT;
                 end
 
                 S_CPU_RMW_READ_WAIT: begin
-                    if (vram_ready) begin
-                        vram_rd <= 1'b0;
+                    if (port_ready) begin
+                        port_rd_r <= 1'b0;
                         cpu_write_merged <= {
-                            cpu_write_strobes[1] ? cpu_write_data[15:8] : vram_din[15:8],
-                            cpu_write_strobes[0] ? cpu_write_data[7:0]  : vram_din[7:0]
+                            cpu_write_strobes[1] ? cpu_write_data[15:8] : port_din[15:8],
+                            cpu_write_strobes[0] ? cpu_write_data[7:0]  : port_din[7:0]
                         };
                         state <= S_CPU_RMW_WRITE;
                     end
@@ -594,7 +629,7 @@ module nubus_video_mdc824 #(
 
                 S_CPU_RMW_WRITE: begin
                     vram_dout <= cpu_write_merged;
-                    vram_wr <= 1'b1;
+                    port_wr_r <= 1'b1;
                     state <= S_CPU_WRITE_WAIT;
                 end
 

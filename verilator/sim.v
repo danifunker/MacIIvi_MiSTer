@@ -681,17 +681,23 @@ module emu
 	wire [24:0] mdc_vram_addr, mdc_vram_scan_addr;
 	wire [15:0] mdc_vram_dout, mdc_vram_din, mdc_vram_scan_data;
 	wire        mdc_vram_rd, mdc_vram_wr, mdc_vram_ready, mdc_vram_scan_rd;
+	wire        card_ext_rd, card_ext_wr;
+	wire [15:0] card_ext_din;
+	wire        card_ext_ready;
 
-	// VRAM_WORDS: 524288 = 1MB, the real MDC 8/24's default VRAM config.
-	// PrimaryInit (decl-ROM code) sizes VRAM by writing $AAAAAAAA to byte
-	// offset $F4B00 (~979KB) and reading it back (MAME rw-tap capture
-	// 2026-07-11, /tmp/mame_pinit_rw.txt); with the old 384KB the readback
-	// returned $FFFF, PrimaryInit failed, the Slot Manager dropped the video
-	// sResources, and the boot display hunt died with smRecNotFnd = sad Mac
-	// $0F/$33. DIVERGES from MacIIvi.sv (still 384KB): 1MB does not fit the
-	// DE10-Nano's M10K budget (553/553 used) — hardware needs the
-	// SDRAM-backed card VRAM (VASP_RETARGET task #9) to run the card.
-	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(524288)) nubus_card (
+	// Hybrid card VRAM (task #9, 2026-07-11): 384KB hot framebuffer in
+	// BRAM (unchanged scanout) + cold tail to TOTAL_WORDS=1MB through the
+	// ext_* port into the SDRAM window at word $100000. PrimaryInit
+	// (decl-ROM code) sizes VRAM by writing $AAAAAAAA to byte offset
+	// $F4B00 (~979KB) and reading it back (MAME rw-tap capture,
+	// /tmp/mame_pinit_rw.txt); the IIvi ROM's Slot Manager — unlike the
+	// Mac II's, which tolerates the miss (lbmactwo boots this card at
+	// plain 384KB) — hard-fails the card on a miss: sResources dropped,
+	// boot-display hunt dies smRecNotFnd, sad Mac $0F/$33. The tail
+	// answers the probe; nothing is ever scanned out from it (8bpp @
+	// 640x480 = 300KB fits BRAM). Matches MacIIvi.sv (keep in sync).
+	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(196608),
+	                     .TOTAL_WORDS(524288)) nubus_card (
 		.clk(clk_sys),
 		.reset(!_cpuReset),
 		// Real A0 required (decl ROM = byte lane 3); see MacIIvi.sv note.
@@ -714,6 +720,10 @@ module emu
 		.vram_rd(mdc_vram_rd),
 		.vram_wr(mdc_vram_wr),
 		.vram_ready(mdc_vram_ready),
+		.ext_rd(card_ext_rd),
+		.ext_wr(card_ext_wr),
+		.ext_din(card_ext_din),
+		.ext_ready(card_ext_ready),
 		.vram_scan_addr(mdc_vram_scan_addr),
 		.vram_scan_rd(mdc_vram_scan_rd),
 		.vram_scan_data(mdc_vram_scan_data),
@@ -727,7 +737,7 @@ module emu
 		.dbg_irq_cnt(), .dbg_ack_cnt(), .dbg_vblank_enable()
 	);
 
-	vram_ram #(.WORDS(524288)) mdc_vram (   // 1MB — must match VRAM_WORDS above
+	vram_ram #(.WORDS(196608)) mdc_vram (   // 384KB BRAM — must match VRAM_WORDS above
 		.clk(clk_sys),
 		.addr(mdc_vram_addr),
 		.din(mdc_vram_dout),
@@ -740,14 +750,17 @@ module emu
 		.dout_b(mdc_vram_scan_data)
 	);
 
-	// Empty-slot open bus (slots $C/$D): 4 clk with no card ack -> $FFFF+DTACK
-	reg [2:0] nubus_timeout;
+	// Empty-slot open bus (slots $C/$D): 32 clk with no card ack -> $FFFF+DTACK.
+	// (Was 4 clk — the card's cold-tail ext accesses ride the SDRAM cpu-slot
+	// and ack in ~10-20 clk, which the old horizon would have eaten. Real
+	// NuBus allows 25.6us; 32 clk ~= 1us keeps empty-slot probes snappy.)
+	reg [5:0] nubus_timeout;
 	always @(posedge clk_sys) begin
-		if (_cpuAS) nubus_timeout <= 3'd0;
-		else if (slot_space && nubusAck_card && !nubus_timeout[2])
-			nubus_timeout <= nubus_timeout + 3'd1;
+		if (_cpuAS) nubus_timeout <= 6'd0;
+		else if (slot_space && nubusAck_card && !nubus_timeout[5])
+			nubus_timeout <= nubus_timeout + 6'd1;
 	end
-	wire nubus_no_card = slot_space && nubusAck_card && nubus_timeout[2];
+	wire nubus_no_card = slot_space && nubusAck_card && nubus_timeout[5];
 	assign nubusDataOut = nubus_no_card ? 16'hFFFF : nubusDataOut_card;
 	assign nubusAck_n   = nubus_no_card ? 1'b0    : nubusAck_card;
 
@@ -1110,16 +1123,41 @@ module emu
 	                    (ioctl_index[1:0] == 2'b10) ? 25'h0280000 + {5'b0, ioctl_addr[20:1]} :  // Floppy 2
 	                    {6'b0, ioctl_addr[19:1]};                                                 // ROM (1MB) at $000000 (must match addrController rom_sdram_word)
 
-	wire [24:0] ram_addr = download_cycle ? dio_a_comb : memoryAddr;
+	// Card cold-tail (ext) SDRAM access — twin of MacIIvi.sv. The card's ext
+	// port owns card words [196608, 524288) at SDRAM word $100000 + word
+	// (= $130000..$17FFFF inside the reserved mdc824 window). An ext access
+	// coincides with a CPU bus cycle TO the card, so the cpu RAM/ROM arms
+	// are idle by construction; only floppy staging can collide, and then
+	// the ext op just waits (the ready counter only advances on presented
+	// cycles). Priority: download > floppy staging > card ext > cpu.
+	wire [24:0] card_ext_addr = 25'h0100000 + {5'd0, mdc_vram_addr[19:0]};
+	wire        card_ext_req  = card_ext_rd || card_ext_wr;
+	wire        card_ext_slot = card_ext_req && !download_cycle
+	                            && !dskReadAckInt && !dskReadAckExt;
+	reg  [1:0]  card_ext_cnt = 2'd0;
+	always @(posedge clk_sys) begin
+		if (!card_ext_req)
+			card_ext_cnt <= 2'd0;
+		else if (card_ext_slot && card_ext_cnt != 2'd3)
+			card_ext_cnt <= card_ext_cnt + 2'd1;
+	end
+	assign card_ext_ready = (card_ext_cnt == 2'd3);
+	assign card_ext_din   = ram_do_raw;
 
-
+	wire [24:0] ram_addr = download_cycle ? dio_a_comb :
+	                       card_ext_slot  ? card_ext_addr : memoryAddr;
 
 	// Use ioctl_dout directly for download (bypass registered dio_data)
-	wire [15:0] ram_din  = download_cycle ? ioctl_dout            : memoryDataOut;
-	wire  [1:0] ram_ds   = download_cycle ? 2'b11                 : { !_memoryUDS, !_memoryLDS };
+	wire [15:0] ram_din  = download_cycle ? ioctl_dout :
+	                       card_ext_slot  ? mdc_vram_dout : memoryDataOut;
+	wire  [1:0] ram_ds   = download_cycle ? 2'b11 :
+	                       card_ext_slot  ? 2'b11 : { !_memoryUDS, !_memoryLDS };
 	// Use ioctl_wr directly as write enable during download (bypass registered dio_write)
-	wire        ram_we   = download_cycle ? 1'b1                  : !_ramWE;
-	wire        ram_oe   = download_cycle ? 1'b0                  : (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
+	wire        ram_we   = download_cycle ? 1'b1 :
+	                       card_ext_slot  ? card_ext_wr : !_ramWE;
+	wire        ram_oe   = download_cycle ? 1'b0 :
+	                       card_ext_slot  ? card_ext_rd :
+	                       (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
 	wire [15:0] ram_do_raw;
 	// (LC II warm-vs-cold ROM patch retired — see MacIIvi.sv note / VASP_RETARGET.md.)
 	wire [15:0] ram_do   = download_cycle ? 16'hffff : (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux : ram_do_raw;
