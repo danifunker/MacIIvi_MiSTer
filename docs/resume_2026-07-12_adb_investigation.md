@@ -371,6 +371,28 @@ boot; MAME survives the same stimulus. Still worth fixing after Story A —
 but it is NOT required to explain the .189 symptom. Value capture for it:
 simwatchrun (+ramwatch, F739-745) — harvest regardless.
 
+## MAME VISUAL PROOF (the clincher for Story A)
+
+`verilator/mame/monitors_drag.lua` (probe mode) booted 7.5.5 on maciivi
++mdc824, clean PRAM, and snapshotted at F3200: the snapshot is **1285×480 =
+two 640×480 monitors composited side by side**. LEFT (onboard VASP) = the
+full working desktop: menu bar (File/Edit/Apple), the "computer wasn't shut
+down properly" dialog, arrow cursor. RIGHT (mdc824) = **plain gray**, a
+blank secondary desktop. So on real IIvi silicon the OS lives on the onboard
+display and the card is a gray extension — and our FPGA scans out ONLY the
+card. Snapshot copied to `simwatchrun/boot_scr1_F3200.png`. Story A is no
+longer a theory.
+
+## In-flight verification (both launched, harvest on next wake)
+
+- `simcardrun/` — OUR core, disk boot, **`+mdc824` scanout, NO mouse**,
+  screenshot F450+F1200. Expect: card shows only PrimaryInit gray at
+  Welcome-time (onboard, which we DON'T scan out, is where Welcome lives).
+  This proves Story A in our own RTL, not just MAME.
+- `simwatchrun/` — Story B value capture (+ramwatch F739-745). Harvest the
+  painter A6 frame-slot writes + any pre-InitGraf GDevice/screenBits
+  corruption.
+
 ## Immediate next steps (reordered)
 
 1. Harvest simwatchrun (bug B values: painter A6 slots + any pre-InitGraf
