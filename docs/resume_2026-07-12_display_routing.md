@@ -70,40 +70,66 @@ SUCCEEDS and does not wedge. The "montype-7 is a dead end" note from
      `+mdc824` only feeds output muxes (sim.v:176-188), so it should NOT
      change CPU timing — unexplained. Re-verify determinism if it matters.
 
-## THE decisive check still open (in flight at session end)
+## THE decisive check — RAN, result is MIXED + CONFOUNDED (untangle next session)
 
-**Does the ROM's boot screen (gray desktop / flashing "?") actually appear
-on the CARD with sense=7?** montype-7 completing video init + ADB proves the
-ROM didn't wedge, but NOT which display got the boot screen.
+**Does sense=7 route the boot display to the card AND still boot to Welcome?**
+Ran `+montype=7 +mdc824 --scsi0 <disk>` (`simsense_confirm/run3_*`,
+screenshots F1200-1800). Results — read carefully, DON'T over-claim:
 
-- `simsense_confirm/run2_*` — a `+montype=7 +mdc824` run screenshotting the
-  CARD at **F800/1000/1200/1400** (AFTER video init this time — the first
-  attempt's F300-650 shots were pre-video-init and blank; superseded) is
-  RUNNING at session end. Harvest `simsense_confirm/screenshot_frame_0*.png`.
-  **If the card shows a gray desktop / flashing "?" instead of the static
-  PrimaryInit pattern → CONFIRMED: card-as-boot-display works with sense=7
-  and Story A is essentially solved in RTL.** If still blank/PrimaryInit →
-  the ROM completed video init but kept the boot screen on onboard (then
-  need the card's own monitor sense, or model the 3-line extended sense).
-- (ScrnBase $824 is the WRONG global to watch — it only gets its real value
-  once the System loads, impossible with no disk; the ROM-era boot screen
-  uses a different base. Use the screenshot, or trace the "?"/happy-Mac draw
-  to find which VRAM it targets: onboard $60xxxxxx vs card slot-$E space.)
-- If the card still shows only PrimaryInit gray → the ROM reached the boot
-  wait but kept the boot screen on onboard; then either the ROM needs a real
-  monitor-sense on the card side, or model the 3-line extended sense
-  (modest: open-drain sense lines where a driven-low line reads back low).
+- **The disk boot WEDGED at $803F2C** (SwapMMUMode's `move (A7)+,SR / rts`
+  tail): last 200 heartbeats ALL in $803F2A-30, constant a7=$20FB94, from
+  F1259 to F1636+. It reached ADB ($814842, F1079) then stalled — did NOT
+  reach Welcome. So sense=7 alone does NOT cleanly boot to Welcome; it hits a
+  later wedge/tight-loop in the MMU-swap region.
+- **The card image is AMBIGUOUS**: montype-7 card F1400/1600 = gray desktop
+  dither ($EE/$22 50/50) + an arrow cursor top-left — BUT the montype-6 card
+  (simcardrun) shows the SAME cursor + dither. So "cursor on card" does NOT
+  distinguish main-vs-secondary; it appears in both.
+- **BIG CONFOUND — `+mdc824` changes CPU timing.** The montype-6 CONTROL
+  (simdiskrun, NO +mdc824, onboard scanout) reached the System ($00CA74,
+  a7=$2F9F64 = the 7.5.5 stack signature) by F1200. The montype-6 KEYSTONE
+  (simcardrun, +mdc824) was STILL in the boot ADB loop ($81490x, low stack
+  $20FExx) at F1210 — same montype, same ROM, only +mdc824 differs. Yet
+  +mdc824 only feeds output muxes (sim.v:176-188) and the VBL sources
+  (v8_vblank→pseudovia line 663, card VBL→slot_irq_e line 667) are
+  NOT +mdc824-dependent. So the timing shift is UNEXPLAINED and it confounds
+  EVERY montype-6-vs-7 comparison this session. Possible real causes to check:
+  the two runs used different disk-image copies (sim WRITES the image — prior
+  state could differ); or +mdc824 has a subtle CPU-visible effect I missed;
+  or a nondeterminism. RESOLVE THIS FIRST — a clean controlled A/B
+  (montype 6 vs 7, +mdc824 BOTH, fresh identical disk copies, run to F2200+)
+  is the only trustworthy comparison, and none of tonight's runs were clean.
+
+**Net:** sense=7 is NOT a dead end (boots through video init + ADB — the
+07-11 note was wrong, user was right), but it is NOT a proven turnkey fix
+either — the disk boot wedged at $803F2x and the display evidence is
+confounded. The next step is careful controlled experiments, not more
+one-off runs. (ScrnBase $824 was the WRONG global — RAM-test noise + only
+set once the System loads. Better discriminator: trace the happy-Mac/"?"
+draw to see which VRAM it targets — onboard $60xxxxxx vs card slot-$E.)
 
 ## Next actions (in priority order)
 
-1. **Harvest `simsense_confirm/` screenshots** → the confirm/deny above.
-2. If confirmed: wire montype=7 into the FPGA path. Currently `MacIIvi.sv`
-   `v8_monitor_id = status[10] ? 4'h2 : 4'h6` — add an OSD option (or make
-   it default) to report sense 7 = "no onboard monitor" so the ROM boots the
-   whole machine (happy Mac → Welcome → Finder) onto the card. Then the
-   user's HDMI shows everything. Verify in sim WITH a disk (`--scsi0`,
-   `+mdc824`, +montype=7) → expect Welcome/Finder ON THE CARD.
-3. If a disk boots to Finder on the card: refresh `releases/MacIIvi.nvr`
+1. **Untangle the `+mdc824` timing confound FIRST** (see the MIXED-result
+   section). Clean A/B: montype 6 vs 7, `+mdc824` on BOTH, fresh identical
+   `MacLC_7-5-5.hda` copies, `--heartbeat --no-cpu-trace`, run to F2200+.
+   Compare where each ends up. If montype-6+mdc824 reaches the System/Finder
+   while montype-7+mdc824 wedges at $803F2x → the wedge is montype-7-specific
+   and real. If BOTH wedge at $803F2x → +mdc824 (or the disk copy) is the
+   culprit, not montype-7. Also settle whether +mdc824 truly changes CPU
+   timing (run montype-6 with vs without +mdc824, same fresh disk, diff the
+   heartbeat trajectories frame-by-frame).
+2. **Discriminate which display is main WITHOUT relying on the ambiguous
+   card image**: trace the boot-screen / happy-Mac draw (or the "?" draw) and
+   see which VRAM base it writes — onboard $60xxxxxx vs card slot-$E space.
+   That is the unambiguous "is the card the boot display" answer.
+3. Only if montype-7 proves to cleanly boot to Welcome-on-card: wire it into
+   the FPGA path. `MacIIvi.sv` `v8_monitor_id = status[10] ? 4'h2 : 4'h6` —
+   add an OSD option (or default) to report sense 7 = "no onboard monitor".
+   Verify in sim (disk, +mdc824, +montype=7) → Welcome/Finder ON THE CARD.
+   If montype-7 does NOT cleanly work, fall back to Path A (scan onboard —
+   ONBOARD_DISPLAY shape) or Path B (PRAM main-display→card).
+4. If a disk boots to Finder on the card: refresh `releases/MacIIvi.nvr`
    from a MAME 7.5.5 run if any PRAM display bytes matter.
 4. THEN, and only on the user's go: rebuild RBF + redeploy to .189.
 5. Later / deferred: Story B (mouse-boot QuickDraw fill) — root-cause the
