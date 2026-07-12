@@ -616,10 +616,16 @@ module emu
 	// Use actual video mode from pseudovia (ROM configures this via register 0x10)
 	wire [2:0] v8_video_mode = pvia_video_config[2:0];
 
-	// Monitor ID Selection - 640x480 VGA (default, matches MacIIvi.sv and
-	// MAME's VASP screen). Always a VALID sense — see the +mdc824 note above
-	// (sense 7 wedges the ROM; MAME-proven).
-	wire [3:0] v8_monitor_id = 4'h6;
+	// Monitor ID Selection - 640x480 VGA default (matches MacIIvi.sv and MAME's
+	// VASP screen). Override with +montype=<n> to probe the sense-line behavior
+	// — e.g. +montype=7 = "no onboard monitor connected" (standard Apple sense
+	// code 7). NOTE: this is a STATIC sense, like MAME's montype<<3 and
+	// pseudovia reg $10; it does NOT model the extended sense-line drive/read
+	// dialogue the ROM performs when it sees sense 7. Investigating 2026-07-12
+	// whether the ROM boots onto the NuBus card when onboard reports no monitor.
+	reg [3:0] montype_ovr = 4'h6;
+	initial if (!$value$plusargs("montype=%d", montype_ovr)) montype_ovr = 4'h6;
+	wire [3:0] v8_monitor_id = montype_ovr;
 
 	ariel_ramdac ariel(
 		.clk_sys(clk_sys),

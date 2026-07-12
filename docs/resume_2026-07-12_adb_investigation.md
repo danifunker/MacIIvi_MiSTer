@@ -468,3 +468,43 @@ Recommendation: B is the intended, card-preserving fix and matches the prior
 plan — but VERIFY its open sub-question first (does the boot screen follow
 the PRAM main-display?) before committing. A is the guaranteed fallback. C
 only if true "no onboard monitor" behavior is wanted.
+
+---
+
+# CORRECTION (user challenged "onboard can't be disabled") — montype-7 does NOT early-wedge
+
+The user rightly doubted the "card can't be the boot display / montype-7 wedges"
+claim. Re-examined; it was an inherited over-conclusion (07-11 doc's "MAME-
+proven ROM wedge"), repeated without checking WHY. Findings:
+
+- **The design intent was ALWAYS this**: `docs/VASP_RETARGET.md:174` —
+  "montype can also report 'no monitor' to push the ROM to the NuBus card."
+  The 07-11 "dead end" note contradicts the retarget plan.
+- **Our sense is static** (pseudovia reg $10 bits 5:3 = monitor_id, exactly
+  MAME's `montype<<3`; neither models a sense-line DRIVE). So IF the ROM does
+  the 3-line extended-sense read (drive each line low, expect read-back low),
+  a static register fails its self-check → both MAME and our core would wedge
+  REGARDLESS of whether the ROM can boot onto the card. That makes the MAME
+  wedge uninformative about real ROM behavior.
+- **Our core does NOT early-wedge at sense 7.** New `+montype=<n>` plusarg in
+  sim.v (v8_monitor_id override). `+montype=7` run: boots cleanly through the
+  $846BE6 checksum and reaches $885EFE by F56-80 (same code the montype-6
+  control hits at F51) — only ~19 frames slower through early init. No hang at
+  the checksum. The video-sense read is LATER (no $x26010 access by F80).
+
+## OPEN — the decisive measurement in flight
+
+`simscrnbase/` — `+montype=7` headless run with `+ramwatch_lo=820 hi=828`
+watching ScrnBase ($824), the boot-display base, to F700. Verdict:
+- ScrnBase → a NuBus/slot address ($Exxxxxxx super-slot / $FExxxxxx slot $E)
+  = **the ROM routed the boot display to the card** → static sense-7 SUFFICES,
+  the card-as-boot-display works today by reporting no onboard monitor.
+- ScrnBase → $60xxxxxx (onboard) = ROM ignored the sense.
+- ScrnBase never written + HB stuck = wedged in video init → the 3-line
+  extended-sense drive/read must be modeled in the pseudoVIA (a MODEST RTL
+  change: open-drain sense lines where a driven-low line reads back low, the
+  non-driven lines stay high for "no monitor"). This is the real fix if
+  needed, and it is NOT the big project earlier framed.
+
+Either way the montype-7 path is viable, contrary to the "dead end" note; the
+only question is whether it needs the extended-sense model or works as static.
