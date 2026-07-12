@@ -403,3 +403,68 @@ longer a theory.
    /tmp/mame755_scratch.hd → PRAM diff → the main-display byte encoding →
    seed egret.pram → sim marathon → expect WELCOME ON THE CARD (+mdc824).
 4. Only then: RBF + hardware, on the user's go.
+
+---
+
+# STORY A INVESTIGATION (per user: "investigate before deciding") — CONCLUSIVE
+
+MAME GDevice/ScrnBase probes (verilator/mame/display_probe.lua; walks
+ScrnBase $824 / MainDevice $8A4 / DeviceList $8A8 / GrayRgn $9EE on booted
+7.5.5 + mdc824). All runs: onboard ($60B00000) is MAIN, card is a gray
+secondary to the RIGHT (GrayRgn desktop bbox = 0,0,480,1280 = two 640-wide
+screens side by side).
+
+## Q1 — is onboard-main a PRAM setting or a hardwired default? DEFAULT.
+
+Existing PRAM, PRAM DELETED (MAME regenerates), and PRAM ZEROED (256 bytes
+of 0x00) ALL boot with ScrnBase=$60B00000, onboard main, card gray. **Blank
+PRAM does NOT make the card the boot display.** So the "blank-PRAM picks the
+card" hypothesis is FALSIFIED — onboard-as-main is the ROM/System default
+whenever onboard has a valid monitor sense.
+
+## Q2 — is there a static montype that makes the card primary? NO.
+
+Forced :vasp:MONTYPE (lua ioport; rm cfg after — poison rule):
+- MONTYPE=0 → boots fine, onboard still main (MAME treats non-1/2/6 as
+  640x480, ROM accepts it as a valid onboard monitor).
+- MONTYPE=3 and =7 → **ROM WEDGES**: ScrnBase/MainDevice/GrayRgn all read
+  $9D9D…/$FF9D9D9D (the $9D gray-fill byte — display globals NEVER
+  initialized), stuck in ROM at pc=$4084A0F6 by F1500.
+
+This is the "montype 7 is a PROVEN ROM wedge" (07-11 doc), now MAME-
+confirmed. The "no onboard monitor" senses (3/7) that WOULD push the ROM
+onto the card instead wedge it — because they require the extended
+sense-line dialogue (Sense0-2 pulse/read protocol) that NEITHER MAME's
+static montype NOR our static v8_monitor_id models. That missing dialogue
+is the true blocker for "onboard absent → card becomes boot display."
+
+## Bottom line: the card CANNOT be made the boot/main display statically.
+
+The card IS a fully functional SECONDARY (desktop spans onto it) — the
+System can drive it — but onboard is the hardwired main/boot screen, and
+the only sense value that would relocate the boot screen to the card wedges
+the ROM for lack of the extended-sense handshake.
+
+## The three real fix paths (sharpened; USER DECISION — heads to gated HW)
+
+- **A) Scan out the ONBOARD display on HDMI** (ONBOARD_DISPLAY shape, or add
+  a second scanout). Onboard already holds the ENTIRE OS (boot screen +
+  Finder), so this is guaranteed-correct and simplest. Cost: BRAM/fitter
+  (07-11 fit was tight); the mdc824 stops being the panel you look at (but
+  nothing user-visible happens on it under default PRAM anyway).
+- **B) PRAM main-display → card** (Monitors "drag menu bar to the card",
+  capture bytes, seed egret.pram + MacIIvi.nvr). Classic Mac OS ties BOTH
+  the menu bar AND the startup screen to the main-display PRAM setting, so
+  this SHOULD move the whole experience to the card — but that "boot screen
+  follows PRAM main-display" claim is UNVERIFIED for this ROM and is the one
+  open sub-question (needs a card-main PRAM produced + an early-boot-screen
+  check). Matches the 07-11 plan's next-action #4; keeps the card primary.
+- **C) Implement the extended monitor-sense dialogue** so onboard can report
+  "no monitor" and the ROM boots onto the card the way real hardware does
+  (monitor on the card, nothing on onboard). Hardware-accurate and the
+  "root" fix, but a real RTL project — it is exactly the montype-7 wedge.
+
+Recommendation: B is the intended, card-preserving fix and matches the prior
+plan — but VERIFY its open sub-question first (does the boot screen follow
+the PRAM main-display?) before committing. A is the guaranteed fallback. C
+only if true "no onboard monitor" behavior is wanted.
