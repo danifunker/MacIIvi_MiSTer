@@ -56,9 +56,15 @@ def parse_golden(path):
 
 
 def parse_sim(path):
-    """-> (odd_reads [(seq, addr, lobyte)], even_reads [(addr, data16)],
-           writes [(addr, data16)])"""
-    odd_reads, even_reads, writes = [], [], []
+    """-> (read_cycles [(seq, addr16, data16)], writes [(addr, data16)])
+
+    The sim's [NUBUS] logger latches cpuAddr, whose bit 0 is forced 0 on
+    the 16-bit bus (only the CARD gets real A0), so every cycle logs at
+    an even address. A lane-3 byte read of byte B therefore appears as a
+    cycle at B&~1 with the byte in data[7:0] (data[15:8] = $FF lane
+    fill), e.g. the ByteLanes read of $FEFFFFFF logs as
+    "addr=fefffffe data=ff78"."""
+    read_cycles, writes = [], []
     pat = re.compile(
         r"\[NUBUS\] CARD\s+addr=([0-9a-f]+) rw=([01]) data=([0-9a-f]+)", re.I)
     for line in open(path, errors="replace"):
@@ -68,11 +74,9 @@ def parse_sim(path):
         addr, rw, data = int(m.group(1), 16), m.group(2), int(m.group(3), 16)
         if rw == "0":
             writes.append((addr, data))
-        elif addr & 1:
-            odd_reads.append((len(odd_reads), addr, data & 0xFF))
         else:
-            even_reads.append((addr, data))
-    return odd_reads, even_reads, writes
+            read_cycles.append((len(read_cycles), addr, data))
+    return read_cycles, writes
 
 
 def region_summary(events, addr_ix, n=8):
@@ -87,68 +91,69 @@ def main():
         sys.exit(__doc__)
     ctx = int(sys.argv[sys.argv.index("--context") + 1]) if "--context" in sys.argv else 8
     g_bytes, g_longs = parse_golden(sys.argv[1])
-    s_odd, s_even, s_writes = parse_sim(sys.argv[2])
+    s_reads, s_writes = parse_sim(sys.argv[2])
 
     print(f"golden: {len(g_bytes)} byte reads, {len(g_longs)} long reads")
-    print(f"sim:    {len(s_odd)} odd-addr (byte) reads, {len(s_even)} even-addr "
-          f"cycles, {len(s_writes)} writes")
-    print(f"golden byte-read pages: {region_summary(g_bytes, 3)}")
-    print(f"sim    byte-read pages: {region_summary(s_odd, 1)}")
+    print(f"sim:    {len(s_reads)} read cycles, {len(s_writes)} writes"
+          f" (16-bit cycles; logger caps apply)")
     print()
 
-    # Lockstep diff of the byte-read streams.
-    n = min(len(g_bytes), len(s_odd))
+    # Lockstep: golden byte read #i <-> sim 16-bit read cycle #i. A golden
+    # byte read of byte B must appear as a sim cycle at B&~1 with the byte
+    # in the lane B&1 selects (odd -> data[7:0], even -> data[15:8]).
+    n = min(len(g_bytes), len(s_reads))
     div = None
     for i in range(n):
         _, gf, gpc, ga, gv = g_bytes[i]
-        _, sa, sv = s_odd[i]
-        if ga != sa or gv != sv:
+        _, sa, sd = s_reads[i]
+        sv = (sd & 0xFF) if (ga & 1) else (sd >> 8) & 0xFF
+        if (ga & ~1) != sa or gv != sv:
             div = i
             break
     if div is None:
-        if len(g_bytes) == len(s_odd):
-            print(f"BYTE STREAMS IDENTICAL ({n} reads)")
+        if len(g_bytes) <= len(s_reads):
+            print(f"WALK MATCHES: all {n} golden byte reads reproduced"
+                  f" byte-exact by the sim stream")
+            extra = len(s_reads) - len(g_bytes)
+            if extra:
+                print(f"  sim continues with {extra} further read cycles"
+                      f" (PrimaryInit longs + post-walk driver traffic)")
         else:
-            print(f"byte streams match for all {n} common reads; lengths differ:"
-                  f" golden={len(g_bytes)} sim={len(s_odd)}")
-            print("  (sim shorter = sim died mid-walk at the point below;"
-                  " sim longer = extra reads)")
-            side = g_bytes if len(g_bytes) > n else s_odd
-            for e in side[n:n + ctx]:
-                if side is g_bytes:
-                    print(f"  golden-only: F{e[1]} pc={e[2]:08X} "
-                          f"addr={e[3]:08X} val={e[4]:02X}")
-                else:
-                    print(f"  sim-only:    addr={e[1]:08X} val={e[2]:02X}")
+            print(f"sim stream ENDS after {n} reads (golden has"
+                  f" {len(g_bytes)}) — sim died mid-walk at:")
+            for e in g_bytes[n:n + ctx]:
+                print(f"  golden-only: F{e[1]} pc={e[2]:08X} "
+                      f"addr={e[3]:08X} val={e[4]:02X}")
     else:
         _, gf, gpc, ga, gv = g_bytes[div]
-        _, sa, sv = s_odd[div]
-        kind = "ADDRESS PATH" if ga != sa else "DATA"
-        print(f"FIRST DIVERGENCE at byte-read #{div} ({kind}):")
-        print(f"  golden: F{gf} pc={gpc:08X} addr={ga:08X} val={gv:02X}")
-        print(f"  sim:                        addr={sa:08X} val={sv:02X}")
-        print(f"  context (golden | sim), reads #{max(0, div - ctx)}..#{div + ctx}:")
+        _, sa, sd = s_reads[div]
+        kind = "ADDRESS PATH" if (ga & ~1) != sa else "DATA"
+        print(f"FIRST DIVERGENCE at read #{div} ({kind}):")
+        print(f"  golden: F{gf} pc={gpc:08X} byte addr={ga:08X} val={gv:02X}")
+        print(f"  sim:    cycle addr={sa:08X} data={sd:04X}")
+        print(f"  context (golden byte | sim cycle):")
         for i in range(max(0, div - ctx), min(n, div + ctx + 1)):
             _, gf, gpc, ga, gv = g_bytes[i]
-            _, sa, sv = s_odd[i]
-            mark = " <-- " if i == div else "     "
-            eq = "  " if (ga, gv) == (sa, sv) else "!="
-            print(f"  #{i:6d} {ga:08X}={gv:02X} {eq} {sa:08X}={sv:02X}{mark}")
+            _, sa, sd = s_reads[i]
+            sv = (sd & 0xFF) if (ga & 1) else (sd >> 8) & 0xFF
+            mark = " <-- " if i == div else ""
+            eq = "  " if ((ga & ~1) == sa and gv == sv) else "!="
+            print(f"  #{i:6d} {ga:08X}={gv:02X} {eq} {sa:08X}={sd:04X}{mark}")
 
+    # The 32-bit PrimaryInit reads appear in the sim stream as TWO 16-bit
+    # cycles right after the byte walk. Show both sides for eyeballing.
     print()
-    print(f"golden 32-bit reads (PrimaryInit phase):")
+    print("golden 32-bit reads (PrimaryInit phase):")
     for f, pc, a, d in g_longs:
         print(f"  F{f} pc={pc:08X} addr={a:08X} data={d:08X}")
-    if s_even:
-        print(f"sim even-addr cycles (first/last {ctx}):")
-        for a, d in s_even[:ctx]:
-            print(f"  addr={a:08X} data={d:04X}")
-        if len(s_even) > ctx:
-            print("  ...")
-            for a, d in s_even[-ctx:]:
-                print(f"  addr={a:08X} data={d:04X}")
+    base = len(g_bytes)
+    if len(s_reads) > base:
+        print(f"sim read cycles #{base}..#{min(len(s_reads), base + 2 * len(g_longs) + ctx) - 1}"
+              f" (should cover the longs, two cycles each):")
+        for seq, a, d in s_reads[base:base + 2 * len(g_longs) + ctx]:
+            print(f"  #{seq} addr={a:08X} data={d:04X}")
     if s_writes:
-        print(f"sim writes (first {ctx}):")
+        print(f"sim writes: {len(s_writes)} total, first {ctx}:")
         for a, d in s_writes[:ctx]:
             print(f"  addr={a:08X} data={d:04X}")
 
