@@ -345,3 +345,20 @@ hybrid card; or decl ROM → SDRAM lane frees 32 — both touch the sad-Mac prob
 ## NEXT: deploy release RBF to .143 → verify boot-to-Finder on card still works
 → mount the CD-ROM (OSD SC3 = Open Transport ISO) → confirm the disc appears
 in the guest OS. Then it's the release candidate (supersedes 20260712).
+
+---
+
+# ★ RELEASE VALIDATED ON HARDWARE (2026-07-13, .143) ★
+
+releases/MacIIvi_Unstable_20260713.rbf (md5 94c3d85b…) — the full release set,
+confirmed end to end on .143:
+- Boots System 7.5.5 to the Finder on the mdc824 card over HDMI (montype-7).
+- OSD trimmed: Memory 8MB(default)/20MB, Machine + Onboard-monitor options gone.
+- **CD-ROM WORKS**: the "Open Transport 1.3" ISO (auto-mounted via config/
+  MacIIvi.s3, same .sN mechanism as the disk) shows on the desktop as a
+  CD-ROM volume — releases/hw_143_release_cdrom_20260713.png. The ported
+  Apple CD-ROM target (SCSI ID 3) responds correctly on real silicon.
+- Fit: M10K 543/553 (the 2nd-disk-ring trim freed 10; CD fits), ALM 85%.
+This is the release candidate; supersedes MacIIvi_Unstable_20260712.rbf.
+(Tip: the "computer wasn't shut down properly" dialog on boot is just from
+mid-boot reloads; dismissed by sending kbd:confirm over /api/ws to the guest.)
