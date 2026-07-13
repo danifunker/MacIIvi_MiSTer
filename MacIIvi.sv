@@ -68,6 +68,7 @@ module emu
 		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 		"OA,Monitor,640x480 VGA,512x384 12in RGB;",
+		"O9,Onboard monitor,Connected,None - use card;",
 		"-;",
 		"O4,Machine,Mac IIvi,Performa 600;",
 		"O23,Memory,4MB,8MB,20MB,36MB;",
@@ -1036,19 +1037,26 @@ module emu
 							   status[17] ? 3'd4 : 3'd2;       // 16bpp override
 	*/
 
-	// Monitor ID Selection — OSD-selectable between 640x480 VGA (default,
-	// MAME-faithful) and 512x384 12" RGB. Portrait is not supported. This is
-	// the sense ID the ROM reads to pick V8 timing.
-	// Built-in video monitor sense. Stays a VALID sense (6/2) in BOTH display
-	// shapes: forcing 7 ("no display") WEDGES the ROM in early POST — proven
-	// against MAME with :vasp:MONTYPE forced to 7 (F2400 loop at $4084xxxx,
-	// zero slot traffic; the real no-monitor flow needs the extended sense
-	// dialogue static montype cannot model). The mdc824-primary path is the
-	// real-hardware one instead: healthy POST on sense 6, the F400 slot probe
-	// runs the card's declaration-ROM PrimaryInit, and the PRAM main-display
-	// setting (persisted in MacIIvi.nvr) routes the boot screen to the card.
-	wire [3:0] v8_monitor_id = status[10] ? 4'h2 :  // 512x384 12" RGB
-	                                         4'h6;   // 640x480 VGA (default)
+	// Monitor ID Selection — the sense ID the ROM reads for the onboard VASP
+	// video.  Two axes, both OSD-selectable:
+	//   status[9]  "Onboard monitor" : Connected (0) / None-use card (1)
+	//   status[10] "Monitor" size    : 640x480 VGA (0) / 512x384 12" RGB (1)
+	//
+	// status[9]=1 reports sense 7 = "no monitor on the onboard port".  The IIvi
+	// ROM then routes the WHOLE boot display (happy Mac / Welcome / Finder) to
+	// the NuBus mdc824 card — which is what the user's HDMI actually shows.
+	// PROVEN in sim 2026-07-13 (docs/resume_2026-07-12_display_routing.md,
+	// RESOLVED section): montype-7 boots through POST/video-init/ADB, the
+	// QuickDraw boot-desktop fill ($4082f1) writes ZERO to onboard VRAM (vs
+	// 1.08M under sense 6), and onboard VRAM becomes free RAM.  The earlier
+	// "sense 7 WEDGES the ROM" note was WRONG on two counts: the MAME wedge was
+	// MAME's incomplete static-sense model, and the sim "wedge" was a card-
+	// scanout frame-counting artifact (card ticks frames ~1.66x faster, so runs
+	// stopped mid-boot).  Default stays Connected/6 (safe, unchanged behavior);
+	// flip "Onboard monitor" to None on hardware to boot onto the card.
+	wire [3:0] v8_monitor_id = status[9]  ? 4'h7 :  // no onboard monitor -> card
+	                           status[10] ? 4'h2 :  // 512x384 12" RGB
+	                                        4'h6;    // 640x480 VGA (default)
 
 	// VASP-internal CLUT/DAC — same register interface as the LC's discrete
 	// Ariel RAMDAC (MAME vasp.cpp dac_r/dac_w), so the module carries over.

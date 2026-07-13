@@ -99,22 +99,35 @@ the only other display). Corroborating signals, all consistent:
 So the montype-7 / "report no onboard monitor" path is VIABLE and is the
 fix for Story A: the user's HDMI (the card) will show the boot screen.
 
-## REMAINING CAVEAT before FPGA (real, must resolve): `+mdc824` wedge/timing
+## The `+mdc824` "wedge" was a SIM FRAME-COUNTING ARTIFACT (not a real bug)
 
-The sim's `+mdc824` scanout flag has a CPU-visible side effect it should NOT
-have (it only feeds output muxes, sim.v:176-188; VBL sources are
-+mdc824-independent, lines 663/667). Evidence:
-- montype-7 + `+mdc824` WEDGES at $803F2C (SwapMMUMode tail; `cd7`, last HBs
-  all $803F2A-30, constant stack) — but montype-7 WITHOUT `+mdc824` reaches
-  the boot-wait fine (`ob7ext`). So the wedge is a `+mdc824` interaction.
-- montype-6 + `+mdc824` (`m6mdc`) stalled at the boot-wait with a mounted
-  disk instead of booting the System, while montype-6 without it booted.
-This matters because the FPGA ALWAYS scans out the card. EITHER it's a
-sim-only artifact of the `+mdc824` plusarg (then the FPGA card-scanout path,
-wired differently, is fine) OR it's a real card-scanout↔CPU interaction that
-would bite on hardware. MUST check how the FPGA (MacIIvi.sv) does card
-scanout vs the sim's `+mdc824`, and repro/trace the $803F2x wedge. Likely
-near the VBL/interrupt or a signal the scanout mux inadvertently gates.
+RESOLVED. The sim counts frames on `VGA_VS` edges (sim.v:194), and the CARD
+scanout has a different frame geometry than onboard (VIDDBG hbf: card=480
+lines vs onboard=525). Measured clk_sys (`main_time`) per frame: **card ≈
+533k, onboard ≈ 885k** — card scanout ticks frames ~**1.66× faster**. So a
+`+mdc824` run at "F1750" has only ~933M clk_sys vs an onboard run's ~1547M:
+it STOPPED EARLY, still inside a normal slow SwapMMUMode-heavy phase that the
+onboard run had already run past to the boot-wait. Every "+mdc824 wedge"
+(cd7 $803F2x, m6mdc boot-wait stall, the disk-test $803F2x) is the same
+artifact — the card runs needed ~1.66× more frames to reach the same boot
+state, and hit their --stop-at-frame first. `+mdc824` only feeds output
+muxes; there is NO CPU-side effect and NO real wedge. On HARDWARE there is
+no frame counter — it runs clk_sys continuously — so montype-7 + card
+scanout runs straight through. (Not 100%-confirmed in sim only because the
+F3600 confirmation run would take hours and the user redirected to hardware
+iteration — which is the correct call: hardware is real-time, no artifact.)
+
+## SHIPPED TO HARDWARE PATH (2026-07-13): montype-7 as an OSD toggle
+
+Wired into `MacIIvi.sv`: new OSD option **`O9,Onboard monitor,Connected,None
+- use card`**. `status[9]=1` → `v8_monitor_id = 4'h7` (no onboard monitor →
+ROM routes the whole display to the card). Default = Connected (sense 6,
+unchanged safe behavior). Building `MacIIvi.rbf` (Quartus) for deploy to
+**.143** (per user: "build and iterate on the hardware .143"). Test flow on
+hw: load core → OSD set "Onboard monitor = None - use card" → R0 Reset &
+Apply → expect the boot screen / Welcome / Finder ON the card (HDMI).
+NOTE: sim.v uses a `+montype=<n>` plusarg for the same thing (twin tops
+intentionally differ: sim has no OSD).
 
 ## (superseded) earlier MIXED + CONFOUNDED reading — kept for the trail
 
