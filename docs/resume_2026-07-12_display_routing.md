@@ -245,3 +245,28 @@ draw to see which VRAM it targets — onboard $60xxxxxx vs card slot-$E.)
 - `b126a8e` findings: gray hang REPRODUCED in sim — cursor engine, not ADB
 - `e62cafe` sim: headless path never built ps2_mouse — inject there too
 - `f52dd67` sim: --mouse-from/--mouse-to synthetic ADB mouse motion
+
+---
+
+# HARDWARE CONFIRMED (2026-07-13, .143): montype-7 routes the display to the card ✓✓
+
+Built MacIIvi.rbf with montype-7 as the default (O9 "Onboard monitor" =
+None), deployed to .143 (`deploy_screenshot.sh`, md5-verified, coreRunning=
+MacIIvi), grabbed the card over HDMI. RESULT — the card shows the **Mac boot
+desktop (gray $EE/$22 dither) + mouse cursor + the flashing boot-disk "?"
+floppy icon** (releases/hw_143_montype7_bootdisk_20260713.png). i.e. on REAL
+SILICON the ROM boots through POST + video-init, routes the WHOLE boot
+display to the mdc824 card, and reaches the boot-device search — all on the
+card's HDMI output. The old .189 montype-6 state was flat gray forever (OS on
+invisible onboard). Story A is SOLVED on hardware: report "no onboard
+monitor" (sense 7) and the card becomes the boot display. The sim "wedge"
+was, as diagnosed, a frame-counting artifact — hardware runs straight
+through.
+
+## NEXT (in progress): boot to Welcome/Finder on the card
+- boot755.hda (7.5.5) is staged at /media/fat/games/MacIIvi/ on .143 but NOT
+  mounted (the floppy "?" = no boot device). Mount SCSI-0 to it → expect
+  happy Mac → Welcome → Finder ON THE CARD.
+- Disk-mount mechanism on hw is the open question (OSD "Mount SCSI-0" vs a
+  MacIIvi.s0 auto-mount config — the 07-11/07-12 uncertainty). Blind in-core
+  OSD nav can't be screenshotted; may need the .s0 seed or user OSD action.
