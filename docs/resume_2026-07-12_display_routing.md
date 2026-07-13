@@ -70,7 +70,53 @@ SUCCEEDS and does not wedge. The "montype-7 is a dead end" note from
      `+mdc824` only feeds output muxes (sim.v:176-188), so it should NOT
      change CPU timing — unexplained. Re-verify determinism if it matters.
 
-## THE decisive check — RAN, result is MIXED + CONFOUNDED (untangle next session)
+## RESOLVED (2026-07-13): sense-7 ROUTES THE BOOT DISPLAY OFF ONBOARD ✓
+
+The clean, unconfounded test finally landed. Method: montype-6 vs montype-7,
+**no disk, ONBOARD scanout (no +mdc824), same binary**, each watching every
+write to onboard VRAM ($60000000-$60FFFFFF via +ramwatch), run to F1750 (past
+montype-7's slower paint phase — it reaches the boot-wait $80786E by F1748).
+Discriminator = the QuickDraw boot-desktop fill at PC $4082f1 (the routine
+that paints the gray boot desktop):
+
+| | QuickDraw fill $4082f1 → onboard VRAM |
+|---|---|
+| **montype-6** | **1,081,664 writes** (boot desktop painted on onboard) |
+| **montype-7** | **0 writes** (never paints onboard, even past the paint phase) |
+
+(The 688k `$00005262` writes in montype-7 are a low-RAM clear routine, common
+to BOTH — montype-6 has ~1.07M of them too — NOT the discriminator.)
+
+**Conclusion: with onboard sense=7 ("no monitor"), the ROM does NOT use
+onboard as the display** — the boot-desktop paint goes elsewhere (the card,
+the only other display). Corroborating signals, all consistent:
+- montype-7's RAM test runs ~340 frames LONGER because it tests onboard VRAM
+  as FREE RAM (the ROM no longer reserves it as a framebuffer).
+- montype-7 (no-mdc824) still boots normally to the no-disk boot-wait
+  $80786E — same end state as montype-6, just with the display rerouted.
+- The card scanout (montype-7 +mdc824) shows the gray boot-desktop dither.
+
+So the montype-7 / "report no onboard monitor" path is VIABLE and is the
+fix for Story A: the user's HDMI (the card) will show the boot screen.
+
+## REMAINING CAVEAT before FPGA (real, must resolve): `+mdc824` wedge/timing
+
+The sim's `+mdc824` scanout flag has a CPU-visible side effect it should NOT
+have (it only feeds output muxes, sim.v:176-188; VBL sources are
++mdc824-independent, lines 663/667). Evidence:
+- montype-7 + `+mdc824` WEDGES at $803F2C (SwapMMUMode tail; `cd7`, last HBs
+  all $803F2A-30, constant stack) — but montype-7 WITHOUT `+mdc824` reaches
+  the boot-wait fine (`ob7ext`). So the wedge is a `+mdc824` interaction.
+- montype-6 + `+mdc824` (`m6mdc`) stalled at the boot-wait with a mounted
+  disk instead of booting the System, while montype-6 without it booted.
+This matters because the FPGA ALWAYS scans out the card. EITHER it's a
+sim-only artifact of the `+mdc824` plusarg (then the FPGA card-scanout path,
+wired differently, is fine) OR it's a real card-scanout↔CPU interaction that
+would bite on hardware. MUST check how the FPGA (MacIIvi.sv) does card
+scanout vs the sim's `+mdc824`, and repro/trace the $803F2x wedge. Likely
+near the VBL/interrupt or a signal the scanout mux inadvertently gates.
+
+## (superseded) earlier MIXED + CONFOUNDED reading — kept for the trail
 
 **Does sense=7 route the boot display to the card AND still boot to Welcome?**
 Ran `+montype=7 +mdc824 --scsi0 <disk>` (`simsense_confirm/run3_*`,
