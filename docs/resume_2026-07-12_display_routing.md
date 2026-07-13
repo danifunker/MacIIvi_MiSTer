@@ -304,3 +304,44 @@ the 20260712 montype-6 rbf (on .189, flat-gray) is superseded.
 Remaining polish (later): PRAM display-depth/position; Story B (mouse-during-
 boot QuickDraw fill) still latent; decide whether montype-7 stays the default
 or the "Machine" picker gains an onboard-vs-card choice.
+
+---
+
+# RELEASE PREP (2026-07-13) — OSD trim + CD-ROM
+
+Building output_files/MacIIvi.rbf with the full release set (all committed):
+
+## OSD trims (MacIIvi.sv)
+- Memory: `O23,4/8/20/36MB` → `O2,Memory,8MB,20MB` (8MB default). 4MB too small,
+  36MB needs a 64MB SDRAM module and isn't working (investigate later).
+- Machine: removed the `O4,Machine,Mac IIvi,Performa 600` option; hardwired
+  `machine_p600=1'b0` (Mac IIvi, box ID $A55A2016). P600's 32MHz mode was never
+  enabled. status[4] freed.
+- Onboard monitor: removed the `O9` toggle; hardwired `v8_monitor_id = 4'h7`
+  (no onboard monitor → ROM boots the display on the mdc824 card, the
+  confirmed-on-.143 behavior). status[9] freed.
+
+## CD-ROM (ported from MacLC_MiSTer commits dd4d4da..5349a9a)
+Apple CD-ROM target at SCSI ID 3, read-only, ISO/TOAST. OSD `SC3,Mount CD-ROM`
++ `OI,CD-ROM Drive` (status[18], 0=Enabled). 7 files (rtl/scsi.v +392 with
+`parameter CDROM`, rtl/ncr5380.sv, rtl/dataController_top.sv, MacIIvi.sv,
+verilator/{sim.v,sim_main.cpp}, scsi_bench). Spliced into MacIIvi's older
+Toolbox-free scsi.v (no tb_* refs). Verilator: clean build, disk boot
+unbroken, `--cdrom` brings up the ID-3 target. Test ISO staged on .143:
+`/media/fat/games/MacIIvi/Open Transport 1.3.1.iso`.
+
+## M10K fit — why MacIIvi is tight (the key finding)
+Both MacIIvi and MacLC use an identical 384KB BRAM framebuffer (384 M10K) and
+sit at ~99% M10K. The ONLY difference: MacIIvi's mdc824 NuBus card bakes its
+32KB declaration ROM (341-0868) into 32 M10K (`nubus_video_mdc824.sv:167`,
+can't be logic — overflows; uses the full 32KB — can't shrink). MacLC has no
+NuBus card, so 7 M10K free (fits the CD); MacIIvi = 553/553, 0 free. To fit
+the CD ring WITHOUT touching the card layout (sad-Mac #9): boot disk (SCSI-0/
+ID 0) stays RING_LOG=5 (the #2-stall fix), 2nd disk (ID 1) → RING_LOG=4,
+CD_RING_LOG=2. Net M10K decreases. (Bigger reclaims deferred: the 384KB VRAM
+holds a 300KB 8bpp framebuffer → ~84 M10K reclaimable, but re-splits the
+hybrid card; or decl ROM → SDRAM lane frees 32 — both touch the sad-Mac probe.)
+
+## NEXT: deploy release RBF to .143 → verify boot-to-Finder on card still works
+→ mount the CD-ROM (OSD SC3 = Open Transport ISO) → confirm the disc appears
+in the guest OS. Then it's the release candidate (supersedes 20260712).
