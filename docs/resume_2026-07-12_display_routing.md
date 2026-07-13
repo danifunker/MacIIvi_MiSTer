@@ -270,3 +270,20 @@ through.
 - Disk-mount mechanism on hw is the open question (OSD "Mount SCSI-0" vs a
   MacIIvi.s0 auto-mount config — the 07-11/07-12 uncertainty). Blind in-core
   OSD nav can't be screenshotted; may need the .s0 seed or user OSD action.
+
+---
+
+# FULL BOOT ON THE CARD (2026-07-13, .143): System 7.5.5 starting up ✓✓✓
+
+Created config/MacIIvi.s0 (mount-memory: `games/MacIIvi/boot755.hda`,
+1024B NUL-padded, same format as the working .s2 PRAM mount) and relaunched
+the montype-7 core. The card's HDMI shows the **"Mac OS — Starting up…"
+splash (happy Mac + progress bar + the extension parade loading bottom-left)**
+— System 7.5.5 booting FROM THE SCSI DISK, on the card
+(releases/hw_143_montype7_macos_startup_20260713.png). So end to end on real
+silicon: montype-7 → boot display on card → SCSI-0 auto-mounts from .s0 →
+System loads. **The .s0 SCSI-0 auto-mount WORKS** (the 07-11/07-12
+uncertainty is resolved — the .189 test just couldn't SEE it because
+montype-6 kept the display on invisible onboard). Story A is fully solved on
+hardware. Next: confirm the Finder desktop; then this montype-7 build is the
+new deploy baseline (supersedes the 20260712 montype-6 rbf).
