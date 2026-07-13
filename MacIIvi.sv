@@ -68,10 +68,9 @@ module emu
 		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 		"OA,Monitor,640x480 VGA,512x384 12in RGB;",
-		"O9,Onboard monitor,None - use card,Connected;",
 		"-;",
 		"O4,Machine,Mac IIvi,Performa 600;",
-		"O23,Memory,4MB,8MB,20MB,36MB;",
+		"O2,Memory,8MB,20MB;",
 		"-;",
 		"R5,Interrupt (NMI / MacsBug);",
 		"R6,Reset PRAM & Core;",
@@ -538,15 +537,13 @@ module emu
 	// config-register banking. The ROM sizes memory by probing; open-bus $FFFF
 	// above ram_size ends the probe. Menu configs (status[3:2], latched at
 	// reset into status_mem):
-	//   4MB  = motherboard only (Apple base config, default)
-	//   8MB  = 4 + 4x1MB SIMMs
-	//   20MB = 4 + 4x4MB SIMMs
-	//   36MB = 4 + 32MB (MAME "36M" option) — REQUIRES a 64MB SDRAM module
-	// (68MB hardware max deferred: exceeds a 64MB module.)
-	wire [25:0] ram_size_bytes = (status_mem == 2'b00) ? 26'h0400000 :  // 4MB
-	                             (status_mem == 2'b01) ? 26'h0800000 :  // 8MB
-	                             (status_mem == 2'b10) ? 26'h1400000 :  // 20MB
-	                                                     26'h2400000;   // 36MB
+	//   8MB  = 4 + 4x1MB SIMMs  (status[2]=0, default)
+	//   20MB = 4 + 4x4MB SIMMs  (status[2]=1)
+	// OSD "Memory" is a single bit (O2). The 4MB (too small) and 36MB (needs a
+	// 64MB SDRAM module; not working yet — investigate later) options were
+	// removed 2026-07-13 for the release. 68MB hardware max also deferred.
+	wire [25:0] ram_size_bytes = status_mem[0] ? 26'h1400000 :  // 20MB
+	                                             26'h0800000;   // 8MB (default)
 				  
 	// Serial Ports
 	wire serialOut;
@@ -1038,29 +1035,17 @@ module emu
 	*/
 
 	// Monitor ID Selection — the sense ID the ROM reads for the onboard VASP
-	// video.  Two axes, both OSD-selectable:
-	//   status[9]  "Onboard monitor" : Connected (0) / None-use card (1)
-	//   status[10] "Monitor" size    : 640x480 VGA (0) / 512x384 12" RGB (1)
-	//
-	// "Onboard monitor = None" reports sense 7 = "no monitor on the onboard
-	// port".  The IIvi ROM then routes the WHOLE boot display (happy Mac /
-	// Welcome / Finder) to the NuBus mdc824 card — which is what the user's HDMI
-	// actually shows.  PROVEN in sim 2026-07-13 (docs/resume_2026-07-12_display_
-	// routing.md, RESOLVED section): montype-7 boots through POST/video-init/ADB,
-	// the QuickDraw boot-desktop fill ($4082f1) writes ZERO to onboard VRAM (vs
-	// 1.08M under sense 6), and onboard VRAM becomes free RAM.  The earlier
-	// "sense 7 WEDGES the ROM" note was WRONG on two counts: the MAME wedge was
-	// MAME's incomplete static-sense model, and the sim "wedge" was a card-
-	// scanout frame-counting artifact (card ticks frames ~1.66x faster, so runs
-	// stopped mid-boot).
-	//
-	// DEFAULT = None (status[9]=0) so the core boots onto the card out of the
-	// box — the whole point of the mdc824-primary shape, and it makes the .143
-	// hardware bring-up observable from a screenshot with no OSD interaction.
-	// Flip "Onboard monitor" to Connected for the old onboard-sense behavior.
-	wire [3:0] v8_monitor_id = status[9]  ? (status[10] ? 4'h2 :  // 512x384 12"
-	                                                       4'h6)  // 640x480 VGA
-	                                      : 4'h7;   // None (default) -> card boot
+	// video.  HARDWIRED to 7 = "no monitor on the onboard port", so the IIvi ROM
+	// routes the WHOLE boot display (happy Mac / Welcome / Finder) to the NuBus
+	// mdc824 card — which is what HDMI actually shows.  CONFIRMED on hardware
+	// 2026-07-13 (.143): System 7.5.5 boots to the Finder on the card
+	// (releases/hw_143_montype7_FINDER_20260713.png).  The earlier "sense 7
+	// WEDGES the ROM" note was WRONG (MAME's incomplete static-sense model + a
+	// sim card-scanout frame-counting artifact); see docs/resume_2026-07-12_
+	// display_routing.md.  The OSD "Onboard monitor" toggle was removed for the
+	// release — the card is the only display, so sense 7 is fixed.  (status[10]
+	// "Monitor" 640/512 still sets the — now unscanned — onboard video size.)
+	wire [3:0] v8_monitor_id = 4'h7;   // no onboard monitor -> ROM boots on card
 
 	// VASP-internal CLUT/DAC — same register interface as the LC's discrete
 	// Ariel RAMDAC (MAME vasp.cpp dac_r/dac_w), so the module carries over.
