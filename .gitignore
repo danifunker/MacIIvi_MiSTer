@@ -89,3 +89,13 @@ quartus_build*.log
 verilator/mame/roms/
 verilator/mame/roms_nomemcheck/
 scripts/local.env
+
+# ad-hoc sim/experiment CWDs (parallel Vemu runs; scratch)
+simsense*/
+simscrnbase/
+simsensecard/
+simwatchrun/
+simcardrun/
+simtracerun/
+simnodiskrun/
+simmouserun/
