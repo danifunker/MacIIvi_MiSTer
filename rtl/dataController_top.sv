@@ -110,6 +110,15 @@ module dataController_top(
 	output           [15:0] sd_buff_din[SCSI_DEVS],
 	input                   sd_buff_wr,
 
+	// ---- CD-ROM target (SCSI ID 3) dedicated block interface ----
+	input                   cd_enable,
+	input                   cd_img_mounted,
+	output           [31:0] cd_io_lba,
+	output                  cd_io_rd,
+	output                  cd_io_wr,
+	input                   cd_io_ack,
+	output           [15:0] cd_sd_buff_din,
+
 	// ---- PRAM persistence pass-through (to the Egret's pram[]) ----
 	input             [7:0] pram_load_addr,
 	input             [7:0] pram_load_data,
@@ -366,7 +375,7 @@ module dataController_top(
 	// also feed the pseudo-VIA IFR bits 3/0 LEVEL-wise — the on-disk HD SC
 	// 4.3 driver's async path sleeps on those flags between pseudo-DMA
 	// chunks (Apple_Driver43 partition; the System 7 Welcome wedge).
-	ncr5380 #(.DEVS(SCSI_DEVS), .ENABLE_EMPTY_CD(0)) scsi(
+	ncr5380 #(.DEVS(SCSI_DEVS)) scsi(
 		.clk(clk32),
 		.reset(!_cpuReset),
 		.bus_cs(selectSCSI),
@@ -394,6 +403,15 @@ module dataController_top(
 		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(sd_buff_din),
 		.sd_buff_wr(sd_buff_wr),
+
+		// CD-ROM target (SCSI ID 3) pass-through.
+		.cd_enable(cd_enable),
+		.cd_img_mounted(cd_img_mounted),
+		.cd_io_lba(cd_io_lba),
+		.cd_io_rd(cd_io_rd),
+		.cd_io_wr(cd_io_wr),
+		.cd_io_ack(cd_io_ack),
+		.cd_sd_buff_din(cd_sd_buff_din),
 
 		// JTAG probe feeds (consumed by dbg_probes.sv in the FPGA top)
 		.dbg_scsi(dbg_scsi),

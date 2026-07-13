@@ -66,7 +66,7 @@ assign io_lba_1 = io_lba[1];
 assign sd_buff_din_0 = sd_buff_din[0];
 assign sd_buff_din_1 = sd_buff_din[1];
 
-ncr5380 #(.DEVS(2), .ENABLE_EMPTY_CD(0)) ncr
+ncr5380 #(.DEVS(2)) ncr
 (
 	.clk(clk),
 	.reset(reset),
@@ -93,6 +93,15 @@ ncr5380 #(.DEVS(2), .ENABLE_EMPTY_CD(0)) ncr
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(sd_buff_din),
 	.sd_buff_wr(sd_buff_wr),
+
+	// CD-ROM target (SCSI ID 3) disabled for this disk-only bench.
+	.cd_enable(1'b0),
+	.cd_img_mounted(1'b0),
+	.cd_io_lba(),
+	.cd_io_rd(),
+	.cd_io_wr(),
+	.cd_io_ack(1'b0),
+	.cd_sd_buff_din(),
 
 	.dbg_scsi(),
 	.dbg_scsi2(),
