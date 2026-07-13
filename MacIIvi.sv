@@ -68,7 +68,7 @@ module emu
 		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 		"OA,Monitor,640x480 VGA,512x384 12in RGB;",
-		"O9,Onboard monitor,Connected,None - use card;",
+		"O9,Onboard monitor,None - use card,Connected;",
 		"-;",
 		"O4,Machine,Mac IIvi,Performa 600;",
 		"O23,Memory,4MB,8MB,20MB,36MB;",
@@ -1042,21 +1042,25 @@ module emu
 	//   status[9]  "Onboard monitor" : Connected (0) / None-use card (1)
 	//   status[10] "Monitor" size    : 640x480 VGA (0) / 512x384 12" RGB (1)
 	//
-	// status[9]=1 reports sense 7 = "no monitor on the onboard port".  The IIvi
-	// ROM then routes the WHOLE boot display (happy Mac / Welcome / Finder) to
-	// the NuBus mdc824 card — which is what the user's HDMI actually shows.
-	// PROVEN in sim 2026-07-13 (docs/resume_2026-07-12_display_routing.md,
-	// RESOLVED section): montype-7 boots through POST/video-init/ADB, the
-	// QuickDraw boot-desktop fill ($4082f1) writes ZERO to onboard VRAM (vs
+	// "Onboard monitor = None" reports sense 7 = "no monitor on the onboard
+	// port".  The IIvi ROM then routes the WHOLE boot display (happy Mac /
+	// Welcome / Finder) to the NuBus mdc824 card — which is what the user's HDMI
+	// actually shows.  PROVEN in sim 2026-07-13 (docs/resume_2026-07-12_display_
+	// routing.md, RESOLVED section): montype-7 boots through POST/video-init/ADB,
+	// the QuickDraw boot-desktop fill ($4082f1) writes ZERO to onboard VRAM (vs
 	// 1.08M under sense 6), and onboard VRAM becomes free RAM.  The earlier
 	// "sense 7 WEDGES the ROM" note was WRONG on two counts: the MAME wedge was
 	// MAME's incomplete static-sense model, and the sim "wedge" was a card-
 	// scanout frame-counting artifact (card ticks frames ~1.66x faster, so runs
-	// stopped mid-boot).  Default stays Connected/6 (safe, unchanged behavior);
-	// flip "Onboard monitor" to None on hardware to boot onto the card.
-	wire [3:0] v8_monitor_id = status[9]  ? 4'h7 :  // no onboard monitor -> card
-	                           status[10] ? 4'h2 :  // 512x384 12" RGB
-	                                        4'h6;    // 640x480 VGA (default)
+	// stopped mid-boot).
+	//
+	// DEFAULT = None (status[9]=0) so the core boots onto the card out of the
+	// box — the whole point of the mdc824-primary shape, and it makes the .143
+	// hardware bring-up observable from a screenshot with no OSD interaction.
+	// Flip "Onboard monitor" to Connected for the old onboard-sense behavior.
+	wire [3:0] v8_monitor_id = status[9]  ? (status[10] ? 4'h2 :  // 512x384 12"
+	                                                       4'h6)  // 640x480 VGA
+	                                      : 4'h7;   // None (default) -> card boot
 
 	// VASP-internal CLUT/DAC — same register interface as the LC's discrete
 	// Ariel RAMDAC (MAME vasp.cpp dac_r/dac_w), so the module carries over.
