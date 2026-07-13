@@ -128,11 +128,12 @@ module ncr5380
 	output      [31:0] dbg_wr
 );
 	parameter DEVS = 2;
-	// Read-prefetch ring depth for the CD target. 3 => 8 sectors / 4KB = two
-	// 2048-byte CD blocks buffered. Kept smaller than the disks' RING_LOG=5:
-	// the sector-buffer M10K budget is nearly full (scsi.v RING_LOG notes) and
-	// the CD is never the boot device, so latency-hiding matters less.
-	parameter CD_RING_LOG = 3;
+	// Read-prefetch ring depth for the CD target. 2 => 4 sectors / 2KB = one
+	// 2048-byte CD block buffered. Kept minimal because MacIIvi's M10K is full
+	// (mdc824 card VRAM); the freed block comes from the 2nd disk's ring above.
+	// The CD is read-only, low-bandwidth, and never the boot device, so a
+	// shallow ring is fine.
+	parameter CD_RING_LOG = 2;
 
 	reg  [7:0] mr;        /* Mode Register */
 	reg  [7:0] icr;       /* Initiator Command Register */
@@ -661,9 +662,16 @@ module ncr5380
 			// Boot disk = SCSI ID 0 (the Mac's conventional internal-drive ID),
 			// 2nd disk = ID 1. The old IDs 6/5 are LOWEST OS boot priority and a
 			// device at ID 6 is de-prioritized by the 7.x SCSI Manager, so 7.5.5
-			// would not boot from it (6.0.8's older SCSI Manager did). Phantom CD
-			// stays at ID 3 (future CD-ROM). Slot i -> SCSI ID i.
-			scsi #(.ID(i[2:0])) target
+			// would not boot from it (6.0.8's older SCSI Manager did). CD-ROM
+			// target is at ID 3 (cdrom_target above). Slot i -> SCSI ID i.
+			//
+			// M10K budget: the mdc824 card VRAM fills block RAM (553/553), so
+			// adding the CD read-ring means freeing M10K here. The BOOT disk (ID 0)
+			// keeps RING_LOG=5 — that depth fixed the #2 heavy-read stall on cold
+			// 7.5.5 extension loading. The 2nd disk (ID 1, not the boot path) drops
+			// to 4 (16-sector / 8KB ring, still 2x the old stall-prone 8), which
+			// frees the M10K the CD's CD_RING_LOG=2 ring needs. Net M10K decreases.
+			scsi #(.ID(i[2:0]), .RING_LOG(i == 0 ? 5 : 4)) target
 			(
 				.clk    ( clk ),
 				.rst    ( scsi_rst ),
