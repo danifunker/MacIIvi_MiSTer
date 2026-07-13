@@ -287,3 +287,20 @@ uncertainty is resolved — the .189 test just couldn't SEE it because
 montype-6 kept the display on invisible onboard). Story A is fully solved on
 hardware. Next: confirm the Finder desktop; then this montype-7 build is the
 new deploy baseline (supersedes the 20260712 montype-6 rbf).
+
+---
+
+# ★ DONE — FINDER DESKTOP ON THE CARD (2026-07-13, .143) ★
+
+releases/hw_143_montype7_FINDER_20260713.png: System 7.5.5 **Finder desktop**
+on the mdc824 card over HDMI — menu bar (File/Edit/View/Label/Special),
+clock, the mounted "Mac 7-5-5" SCSI disk icon top-right, Trash, cursor. The
+entire goal is achieved on real hardware: montype-7 (onboard sense 7) routes
+the boot display to the card, .s0 auto-mounts SCSI-0, System 7.5.5 boots to
+the Finder — all visible on the card. The user's insight ("tell the ROM there
+is no onboard monitor") was the key. This montype-7 build is the new baseline;
+the 20260712 montype-6 rbf (on .189, flat-gray) is superseded.
+
+Remaining polish (later): PRAM display-depth/position; Story B (mouse-during-
+boot QuickDraw fill) still latent; decide whether montype-7 stays the default
+or the "Machine" picker gains an onboard-vs-card choice.
