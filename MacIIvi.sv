@@ -318,10 +318,12 @@ module emu
 			// releases it via the load FSM (P_LD_CPY); a no-image (size==0) report
 			// releases it in the mount handler above. MiSTer's auto-mount of the save
 			// image can take many seconds, so we do NOT use a short timeout: the OLD
-			// blind ~1.5s gate (mislabelled "3s @ 32MHz"; clk_sys is ~65MHz) fired before
-			// the mount and seeded the all-zero default -> ROM InitUtil wiped PRAM every
-			// boot. This long backstop only covers the impossible "no mount status ever"
-			// case so boot can't hang (~65MHz: 3.9e9 cyc ~= 60s).
+			// short blind gate (~1.5s) fired before the mount and seeded the all-zero
+			// default -> ROM InitUtil wiped PRAM every boot. This long backstop only
+			// covers the impossible "no mount status ever" case so boot can't hang
+			// (3.9e9 cycles at clk_sys = 32.5 MHz ~= 120 s; an earlier revision of
+			// this comment claimed clk_sys was ~65 MHz — it is 32.5, per
+			// rtl/pll/pll_0002.v, confirmed in the 2026-07-15 clock audit).
 			if (!pram_ready) begin
 				if (pram_rdy_cnt >= 32'd3_900_000_000) pram_ready <= 1'b1;
 				else pram_rdy_cnt <= pram_rdy_cnt + 1'b1;

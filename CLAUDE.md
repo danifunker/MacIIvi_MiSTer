@@ -32,7 +32,8 @@ Key references:
   shell script or Makefile breaks it.
 - **No MiSTer hardware deploys** until explicitly requested — this core is in
   its simulator-first phase.
-- Work happens directly on `main` (per project owner).
+- Work happens on feature branches, merged to `main` once validated (policy
+  changed 2026-07-15 by the project owner; was direct-to-main).
 
 ## Build Commands
 
