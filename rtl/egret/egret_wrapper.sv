@@ -74,7 +74,9 @@ module egret_wrapper (
 // ============================================================================
 // Clock generation for 68HC05
 // MAME: M68HC05E1 runs at XTAL(32'768)*128 = 4.194304 MHz
-// From 32 MHz system clock, divide by 8 gives 4 MHz (close to 4.19 MHz)
+// Here: clk = clk_sys = 32.5 MHz, divide by 8 -> cen = 4.0625 MHz exactly
+// (-3.1% vs the real HC05 rate; firmware-relative timing is unaffected, and
+// the one-second/RTC period below is corrected in absolute terms).
 // ============================================================================
 reg [2:0] clk_div;
 wire cen = (clk_div == 3'b000);  // Pulse once every 8 cycles = 4 MHz
@@ -206,12 +208,17 @@ wire [7:0] timer_counter = cycle_total[9:2];  // Divide by 4, take lower 8 bits
 // 2. Sets Port C bit 1 as a hardware flag (for polling by firmware)
 // Register $12 bit 4 enables the timer, bit 6 is cleared by ISR
 //
-// Real hardware: 32.768 kHz crystal / 32768 = 1 Hz
-// Our approximation: count cen ticks (4 MHz). Use shorter period for simulation.
+// Real hardware: 32.768 kHz crystal / 32768 = 1 Hz.
+// Here: count cen pulses (4.0625 MHz exactly — see clock generation above).
+// The counter fires on the pulse where it REACHES ONESEC_PERIOD and restarts
+// at 0, i.e. every ONESEC_PERIOD+1 pulses: 4_062_499+1 = 4,062,500 = 1.000 s.
+// This period feeds the firmware's RTC-seconds ISR, so it must be correct in
+// ABSOLUTE time. (Was 22'd4000000 "~1 second at 4 MHz": a 0.9846 s real
+// period -> the Mac's wall clock gained ~22 min/day. 2026-07-15 clock audit.)
 `ifdef SIMULATION
-localparam ONESEC_PERIOD = 22'd8192;    // ~2ms at 4 MHz (fast for simulation)
+localparam ONESEC_PERIOD = 22'd8192;     // ~2ms (fast for simulation)
 `else
-localparam ONESEC_PERIOD = 22'd4000000; // ~1 second at 4 MHz
+localparam ONESEC_PERIOD = 22'd4062499;  // 1.000 s of cen pulses (see above)
 `endif
 
 reg [21:0] onesec_counter;
