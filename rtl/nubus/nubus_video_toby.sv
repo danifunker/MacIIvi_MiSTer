@@ -86,6 +86,10 @@ module nubus_video_toby (
     // in kHz), fire ce_pixel and subtract 31334. Effective rate within 0.001%
     // of 25.175 MHz (the 0.4 kHz residual from rounding 31334.4 → 31334 is
     // well under any VGA timing budget).
+    // *** NOT YET INTEGRATED in MacIIvi: this modulus assumes lbmactwo's
+    // 31.3344 MHz clk_sys. MacIIvi's clk_sys is 32.5 MHz — before wiring this
+    // card up here, change the modulus to 32500 (increment = pixel kHz), as
+    // was done in nubus_video_mdc824.sv (2026-07-15 clock audit). ***
     reg [15:0] clk_video_acc;
     reg clk_video_en;
 

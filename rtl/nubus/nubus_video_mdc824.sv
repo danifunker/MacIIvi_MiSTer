@@ -236,12 +236,22 @@ module nubus_video_mdc824 #(
                       (rmode == 4'h8) ? 2'd2 : 2'd3;  // 0xC/0xD -> 8bpp (24bpp later)
 
     // ========================================================================
-    // Pixel clock from clk_sys = 31.3344 MHz (fractional accumulator):
-    //   640x480 13": 30.24 MHz   (same divider as hi-res)
-    //   512x384 12": 15.6672 MHz (increment is exactly half the modulus, so
-    //                this degenerates to a clean divide-by-2)
+    // Pixel clock (fractional accumulator). clk here is THIS core's clk_sys =
+    // 32.5 MHz; the modulus is that clock in kHz, so the increment is the
+    // pixel rate in kHz exactly:
+    //   640x480 13": 31.360 MHz on the 896x525 raster below = 66.666 Hz, the
+    //                Apple 13" refresh (a real 8*24 does 30.24 MHz on 864x525
+    //                = 66.667 Hz; we keep the wider heritage raster and match
+    //                REFRESH, not dot clock)
+    //   512x384 12": 15.667 MHz on 640x407 = 60.147 Hz (the Apple 12" RGB
+    //                rate)
+    // History (2026-07-15 clock audit): the modulus was 31334 — carried from
+    // lbmactwo, whose clk_sys IS 31.3344 MHz. On our 32.5 MHz that scanned
+    // +3.72% fast: 512x384 refreshed at 62.4 Hz instead of 60.15 (640x480
+    // happened to land on 66.68 Hz because the wide 896-dot raster nearly
+    // cancelled the error).
     // ========================================================================
-    wire [15:0] clk_video_inc = monitor_512 ? 16'd15667 : 16'd30240;
+    wire [15:0] clk_video_inc = monitor_512 ? 16'd15667 : 16'd31360;
     reg [15:0] clk_video_acc;
     reg clk_video_en;
     always @(posedge clk) begin
@@ -249,8 +259,8 @@ module nubus_video_mdc824 #(
             clk_video_acc <= 16'd0;
             clk_video_en <= 1'b0;
         end else begin
-            if (clk_video_acc + clk_video_inc >= 16'd31334) begin
-                clk_video_acc <= clk_video_acc + clk_video_inc - 16'd31334;
+            if (clk_video_acc + clk_video_inc >= 16'd32500) begin
+                clk_video_acc <= clk_video_acc + clk_video_inc - 16'd32500;
                 clk_video_en <= 1'b1;
             end else begin
                 clk_video_acc <= clk_video_acc + clk_video_inc;

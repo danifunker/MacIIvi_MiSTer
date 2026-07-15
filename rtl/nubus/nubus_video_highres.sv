@@ -218,6 +218,10 @@ module nubus_video_highres #(
     // ========================================================================
     // Pixel clock: 30.24 MHz from clk_sys = 31.3344 MHz
     // Accumulator method: enable when acc + 30240 >= 31334 (≈ clk_sys in kHz)
+    // *** NOT YET INTEGRATED in MacIIvi: this modulus assumes lbmactwo's
+    // 31.3344 MHz clk_sys. MacIIvi's clk_sys is 32.5 MHz — before wiring this
+    // card up here, change the modulus to 32500 (increment = pixel kHz), as
+    // was done in nubus_video_mdc824.sv (2026-07-15 clock audit). ***
     // ========================================================================
     reg [15:0] clk_video_acc;
     reg clk_video_en;
