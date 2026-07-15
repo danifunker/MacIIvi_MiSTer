@@ -47,7 +47,7 @@ module addrDecoder(
     input _cpuAS,
     input _cpuRW,
     input memoryOverlayOn,
-    input [25:0] ram_size_bytes,   // contiguous RAM size (4/8/20/36 MB)
+    input [26:0] ram_size_bytes,   // contiguous RAM size (4/8/20/36/68 MB)
 
     output reg selectRAM,
     output reg selectROM,
@@ -72,8 +72,8 @@ module addrDecoder(
     output reg selectUnmapped
 );
 
-    // RAM: contiguous block at 0 (36MB max < 2^26)
-    wire in_ram = (address[31:26] == 6'b000000) && (address[25:0] < ram_size_bytes);
+    // RAM: contiguous block at 0 (68MB max < 2^27)
+    wire in_ram = (address[31:27] == 5'b00000) && (address[26:0] < ram_size_bytes);
     // RAM address space (where RAM/overlay/holes live): $00000000-$3FFFFFFF
     wire ram_space = (address[31:30] == 2'b00);
 

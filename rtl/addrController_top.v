@@ -11,7 +11,7 @@ module addrController_top(
 	// Contiguous RAM size in bytes (VASP model: 4MB motherboard + one SIMM
 	// bank presented as a single block at $0 — MAME vasp.cpp set_ram_info;
 	// there is NO V8-style config-register banking on this machine).
-	input [25:0] ram_size_bytes,
+	input [26:0] ram_size_bytes,
 
 	// 68030 CPU memory interface:
 	input _cpuReset,
@@ -22,7 +22,8 @@ module addrController_top(
 	input _cpuAS,
 
 	// RAM/ROM:
-	output [24:0] memoryAddr,  // 25-bit SDRAM word address (64MB module space)
+	output [25:0] memoryAddr,  // 26-bit SDRAM word address (128MB module space;
+	                           // bit 25 = second chip on 128MB modules)
 	output _memoryUDS,
 	output _memoryLDS,
 	output _romOE,
@@ -126,33 +127,36 @@ module addrController_top(
 
 	// ============================================================
 	// VASP RAM/ROM/VRAM → SDRAM translation
-	// All outputs are 25-bit SDRAM word addresses (64MB module space).
+	// All outputs are 26-bit SDRAM word addresses (128MB module space;
+	// word bit 25 = the second chip of a 128MB module — sdram.v routes it
+	// onto nCS, which the module inverts into chip 1).
 	//
 	// SDRAM Layout (word addresses) — fixed regions LOW so the 4/8/20MB RAM
-	// configs stay within a 32MB module; only 36MB needs a 64MB module:
+	// configs stay within a 32MB module; 36MB needs a 64MB module and 68MB
+	// a 128MB module (OSD options are gated by hps_io sdram_sz):
 	//   $0000000-$007FFFF  ROM (1MB; boot0.rom download target)
 	//   $0080000-$00FFFFF  onboard-video VRAM (1MB window backing)
 	//   $0100000-$017FFFF  reserved: mdc824 NuBus VRAM (if SDRAM-backed)
 	//   $0180000-$027FFFF  Floppy disk image 1 (2MB window)
 	//   $0280000-$037FFFF  Floppy disk image 2 (2MB window)
-	//   $0380000+          RAM, contiguous (4/8/20/36MB → top $157FFFF)
+	//   $0380000+          RAM, contiguous (4/8/20/36/68MB → top $257FFFF)
 	// Must match the download mapping in MacIIvi.sv and verilator/sim.v.
 	// ============================================================
-	localparam [24:0] SDRAM_ROM_BASE  = 25'h0000000;
-	localparam [24:0] SDRAM_VRAM_BASE = 25'h0080000;
-	localparam [24:0] SDRAM_DSK1_BASE = 25'h0180000;
-	localparam [24:0] SDRAM_DSK2_BASE = 25'h0280000;
-	localparam [24:0] SDRAM_RAM_BASE  = 25'h0380000;
+	localparam [25:0] SDRAM_ROM_BASE  = 26'h0000000;
+	localparam [25:0] SDRAM_VRAM_BASE = 26'h0080000;
+	localparam [25:0] SDRAM_DSK1_BASE = 26'h0180000;
+	localparam [25:0] SDRAM_DSK2_BASE = 26'h0280000;
+	localparam [25:0] SDRAM_RAM_BASE  = 26'h0380000;
 
-	// RAM: contiguous at CPU $0 (≤36MB ⇒ cpuAddr[25:1] covers it)
-	wire [24:0] ram_sdram_word  = SDRAM_RAM_BASE + {1'b0, cpuAddr[25:1]};
+	// RAM: contiguous at CPU $0 (≤68MB ⇒ cpuAddr[26:1] covers it)
+	wire [25:0] ram_sdram_word  = SDRAM_RAM_BASE + {1'b0, cpuAddr[26:1]};
 
 	// ROM: 1MB image, mirrored every 1MB across $4xxxxxxx (and the overlay at $0)
-	wire [24:0] rom_sdram_word  = {6'b000000, cpuAddr[19:1]};
+	wire [25:0] rom_sdram_word  = {7'b0000000, cpuAddr[19:1]};
 
 	// VRAM: 1MB window at $60000000, mirrored; backed 1:1 in SDRAM
 	wire [19:0] vram_cpu_offset = cpuAddr[19:0];
-	wire [24:0] vram_sdram_word = SDRAM_VRAM_BASE + {6'b0, vram_cpu_offset[19:1]};
+	wire [25:0] vram_sdram_word = SDRAM_VRAM_BASE + {7'b0, vram_cpu_offset[19:1]};
 
 	// ---- On-chip framebuffer (BRAM) write mirror ----
 	// VASP scans with a fixed 2048-byte (1024-word) row stride at every depth
@@ -171,14 +175,14 @@ module addrController_top(
 	assign vram_we = selectVRAM && !_cpuRW && cpuBusControl && memoryLatch && vram_col_visible;
 
 	// Floppy disk addresses: byte offset → SDRAM word
-	wire [24:0] dsk_int_sdram_word = SDRAM_DSK1_BASE + {4'b0, dskReadAddrInt[21:1]};
-	wire [24:0] dsk_ext_sdram_word = SDRAM_DSK2_BASE + {4'b0, dskReadAddrExt[21:1]};
+	wire [25:0] dsk_int_sdram_word = SDRAM_DSK1_BASE + {5'b0, dskReadAddrInt[21:1]};
+	wire [25:0] dsk_ext_sdram_word = SDRAM_DSK2_BASE + {5'b0, dskReadAddrExt[21:1]};
 
 	// CPU address mux (selects based on address decode)
-	wire [24:0] cpu_sdram_word = selectVRAM ? vram_sdram_word :
+	wire [25:0] cpu_sdram_word = selectVRAM ? vram_sdram_word :
 	                              selectROM ? rom_sdram_word :
 	                              selectRAM ? ram_sdram_word :
-	                              25'h0;
+	                              26'h0;
 
 	// ============================================================
 	// Extra bus slots (disk reads)

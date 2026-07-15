@@ -60,7 +60,7 @@ module emu
 	output [31:0] debug_data_addr,
 
 	// RAM debug outputs
-	output [24:0] debug_ram_addr,
+	output [25:0] debug_ram_addr,
 	output [15:0] debug_ram_din,
 	output [15:0] debug_ram_dout,
 	output        debug_ram_we,
@@ -92,14 +92,14 @@ module emu
 
 	// Machine configuration inputs
 	input  [1:0]  cfg_cpuType,      // Unused, kept for sim_main.cpp compatibility
-	input         cfg_memSize,      // 0=1MB, 1=4MB
+	input  [2:0]  cfg_memSize,      // --ram: 0=4MB 1=8MB 2=20MB 3=36MB 4=68MB
+	input  [1:0]  cfg_sdramMod,     // --sdram-module: emulated module 1=32MB 2=64MB 3=128MB
 	input         nmi_pulse         // --nmi-at-frame: pulse a Level-7 NMI (MacsBug test)
 );
 
 	localparam SCSI_DEVS = 2;
 
 	// Configuration
-	wire      status_mem = cfg_memSize;      // 0=1MB, 1=4MB
 	localparam [1:0] status_cpu = 2'b10;     // 68020
 	// Mac LC always runs at C15M (~15.67 MHz) - use 16 MHz clock enables
 
@@ -203,10 +203,16 @@ module emu
 	assign AUDIO_R = asc_sample_r;
 
 	// Macintosh IIvi memory configuration — VASP model: one contiguous block
-	// at $0 (docs/VASP_RETARGET.md). Sim defaults to the 4MB base config for
-	// the fastest RAM march during boot bring-up; 8/20/36MB come via the same
-	// wire once a CLI plumb is added (cfg_memSize is the legacy LC hook).
-	wire [25:0] ram_size_bytes = 26'h0400000;  // 4MB
+	// at $0 (docs/VASP_RETARGET.md). Default (--ram absent) stays the 4MB base
+	// config for the fastest RAM march during boot bring-up. Unlike MacIIvi.sv
+	// there is deliberately NO sdram_sz clamp here: the sim runs any RAM size
+	// against any emulated module (cfg_sdramMod -> sim_ram) so the oversized-
+	// config corruption can be reproduced on purpose.
+	wire [26:0] ram_size_bytes = (cfg_memSize == 3'd4) ? 27'h4400000 :  // 68MB
+	                             (cfg_memSize == 3'd3) ? 27'h2400000 :  // 36MB
+	                             (cfg_memSize == 3'd2) ? 27'h1400000 :  // 20MB
+	                             (cfg_memSize == 3'd1) ? 27'h0800000 :  // 8MB
+	                                                     27'h0400000;   // 4MB
 
 	// Serial Ports - connect SCC Channel A to sim via serial_txd/serial_rxd ports
 	wire serialOut;              // SCC Channel A TX (driven by SCC)
@@ -256,7 +262,7 @@ module emu
 	wire _memoryUDS, _memoryLDS;
 	wire dioBusControl;
 	wire cpuBusControl;
-	wire [24:0] memoryAddr;  // 25-bit SDRAM word address from address controller
+	wire [25:0] memoryAddr;  // 26-bit SDRAM word address from address controller
 	wire [15:0] memoryDataOut;
 	wire memoryLatch;
 	// peripherals
@@ -1142,7 +1148,7 @@ module emu
 	//   ROM (1MB): $000000 + offset
 	//   Floppy 1:  $180000 + offset
 	//   Floppy 2:  $280000 + offset
-	reg [24:0] dio_a;
+	reg [25:0] dio_a;
 	reg [15:0] dio_data;
 	reg        dio_write;
 	reg        dio_old_cyc = 0;
@@ -1165,9 +1171,9 @@ module emu
 			// Don't byte-swap for sim_ram (original swaps for SDRAM byte ordering)
 			dio_data <= ioctl_dout;
 			case (dio_index[1:0])
-				2'b01:   dio_a <= 25'h0180000 + {5'b0, dio_flp_a};  // Floppy 1
-				2'b10:   dio_a <= 25'h0280000 + {5'b0, dio_flp_a};  // Floppy 2
-				default: dio_a <= {6'b0, dio_addr[18:0]};           // ROM (1MB) at $000000 (must match addrController rom_sdram_word)
+				2'b01:   dio_a <= 26'h0180000 + {6'b0, dio_flp_a};  // Floppy 1
+				2'b10:   dio_a <= 26'h0280000 + {6'b0, dio_flp_a};  // Floppy 2
+				default: dio_a <= {7'b0, dio_addr[18:0]};           // ROM (1MB) at $000000 (must match addrController rom_sdram_word)
 			endcase
 			ioctl_wait <= 1;
 		end
@@ -1183,12 +1189,12 @@ module emu
 	wire download_cycle = dio_download && ioctl_wr;
 
 	// SDRAM word address mapping (VASP layout — docs/VASP_RETARGET.md):
-	// memoryAddr[24:0] is already the SDRAM word address from addrController.
+	// memoryAddr[25:0] is already the SDRAM word address from addrController.
 	// Download path uses dio_a_comb directly.
-	wire [24:0] dio_a_comb;
-	assign dio_a_comb = (ioctl_index[1:0] == 2'b01) ? 25'h0180000 + {5'b0, ioctl_addr[20:1]} :  // Floppy 1
-	                    (ioctl_index[1:0] == 2'b10) ? 25'h0280000 + {5'b0, ioctl_addr[20:1]} :  // Floppy 2
-	                    {6'b0, ioctl_addr[19:1]};                                                 // ROM (1MB) at $000000 (must match addrController rom_sdram_word)
+	wire [25:0] dio_a_comb;
+	assign dio_a_comb = (ioctl_index[1:0] == 2'b01) ? 26'h0180000 + {6'b0, ioctl_addr[20:1]} :  // Floppy 1
+	                    (ioctl_index[1:0] == 2'b10) ? 26'h0280000 + {6'b0, ioctl_addr[20:1]} :  // Floppy 2
+	                    {7'b0, ioctl_addr[19:1]};                                                 // ROM (1MB) at $000000 (must match addrController rom_sdram_word)
 
 	// Card cold-tail (ext) SDRAM access — twin of MacIIvi.sv. The card's ext
 	// port owns card words [196608, 524288) at SDRAM word $100000 + word
@@ -1197,7 +1203,7 @@ module emu
 	// are idle by construction; only floppy staging can collide, and then
 	// the ext op just waits (the ready counter only advances on presented
 	// cycles). Priority: download > floppy staging > card ext > cpu.
-	wire [24:0] card_ext_addr = 25'h0100000 + {5'd0, mdc_vram_addr[19:0]};
+	wire [25:0] card_ext_addr = 26'h0100000 + {6'd0, mdc_vram_addr[19:0]};
 	wire        card_ext_req  = card_ext_rd || card_ext_wr;
 	wire        card_ext_slot = card_ext_req && !download_cycle
 	                            && !dskReadAckInt && !dskReadAckExt;
@@ -1211,7 +1217,7 @@ module emu
 	assign card_ext_ready = (card_ext_cnt == 2'd3);
 	assign card_ext_din   = ram_do_raw;
 
-	wire [24:0] ram_addr = download_cycle ? dio_a_comb :
+	wire [25:0] ram_addr = download_cycle ? dio_a_comb :
 	                       card_ext_slot  ? card_ext_addr : memoryAddr;
 
 	// Use ioctl_dout directly for download (bypass registered dio_data)
@@ -1246,6 +1252,7 @@ module emu
 		.we             ( ram_we      ),
 		.oe             ( ram_oe      ),
 		.dout           ( ram_do_raw  ),
+		.module_sz      ( cfg_sdramMod ),
 		.frame_count    ( sim_frame_count )
 	);
 

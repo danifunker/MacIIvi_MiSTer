@@ -68,7 +68,9 @@ int multi_step_amount = 1024;
 //   cfg_cpuType=3  -> cpu="11" (68020)
 // Mac LC needs 68020 mode (cfg_cpuType=2 or 3)
 int cfg_cpuType = 2;       // 68020 mode via TG68K
-int cfg_memSize = 1;       // 0=1MB, 1=4MB
+int cfg_memSize = 0;       // --ram: 0=4MB 1=8MB 2=20MB 3=36MB 4=68MB (default 4MB: fastest boot march)
+int cfg_sdramMod = 3;      // --sdram-module: emulated module 1=32MB 2=64MB 3=128MB (default: everything fits)
+static const int ram_mb_table[5] = {4, 8, 20, 36, 68};
 
 // Verbose bring-up diagnostics (overlay/FC/march/STM/RAMCFG/bus/CPU-trace
 // console spam). Off by default for a quiet console; enable with --verbose/-v.
@@ -294,9 +296,10 @@ int verilate() {
 		// Set system clock in core
 		VERTOPINTERN->clk_sys = clk_sys.clk;
 
-		// Set machine configuration (Mac LC only)
+		// Set machine configuration
 		VERTOPINTERN->cfg_cpuType = cfg_cpuType;
 		VERTOPINTERN->cfg_memSize = cfg_memSize;
+		VERTOPINTERN->cfg_sdramMod = cfg_sdramMod;
 
 		// Simulate both edges of system clock
 		if (clk_sys.clk != clk_sys.old) {
@@ -1203,6 +1206,11 @@ void show_help() {
 	printf("  --scsi0 <file>                Mount SCSI-0 hard disk image (.img/.vhd/.hda)\n");
 	printf("  --scsi1 <file>                Mount SCSI-1 hard disk image\n");
 	printf("  --cdrom <file>                Mount CD-ROM image (.iso/.toast, 2048-byte sectors) on SCSI-3\n");
+	printf("  --ram <mb>                    Mac RAM size: 4, 8, 20, 36 or 68 (default 4)\n");
+	printf("  --sdram-module <mb>           Emulated SDRAM module: 32, 64 or 128 (default 128).\n");
+	printf("                                Undersized modules alias/deselect exactly like real\n");
+	printf("                                chips (e.g. --ram 36 --sdram-module 32 reproduces the\n");
+	printf("                                hardware corruption that motivated the sdram_sz gate)\n");
 	printf("\n");
 	printf("Examples:\n");
 	printf("  ./Vemu                        Run simulator in windowed mode\n");
@@ -1335,6 +1343,23 @@ int main(int argc, char** argv, char** env) {
 			floppy_disk_files[1] = argv[++i]; // secondary floppy
 		} else if (strcmp(argv[i], "--rom") == 0 && i + 1 < argc) {
 			rom_file_override = argv[++i];    // boot ROM path (default ../releases/boot0.rom)
+		} else if (strcmp(argv[i], "--ram") == 0 && i + 1 < argc) {
+			int mb = std::stoi(argv[++i]);
+			cfg_memSize = -1;
+			for (int k = 0; k < 5; k++) if (ram_mb_table[k] == mb) cfg_memSize = k;
+			if (cfg_memSize < 0) {
+				fprintf(stderr, "--ram %d: invalid size (valid: 4, 8, 20, 36, 68)\n", mb);
+				return 1;
+			}
+			printf("Mac RAM size: %dMB\n", mb);
+		} else if (strcmp(argv[i], "--sdram-module") == 0 && i + 1 < argc) {
+			int mb = std::stoi(argv[++i]);
+			cfg_sdramMod = (mb == 32) ? 1 : (mb == 64) ? 2 : (mb == 128) ? 3 : -1;
+			if (cfg_sdramMod < 0) {
+				fprintf(stderr, "--sdram-module %d: invalid size (valid: 32, 64, 128)\n", mb);
+				return 1;
+			}
+			printf("Emulated SDRAM module: %dMB\n", mb);
 		} else if (strcmp(argv[i], "--heartbeat") == 0) {
 			pc_heartbeat = true;              // once-per-frame 68k PC print
 		} else if (strcmp(argv[i], "--mouse-from") == 0 && i + 1 < argc) {
@@ -1613,8 +1638,8 @@ int main(int argc, char** argv, char** env) {
 
 		// Machine configuration (display only - requires restart to change)
 		ImGui::Separator();
-		ImGui::Text("Machine: Mac LC | CPU: TG68K | RAM: %s",
-			cfg_memSize ? "4MB" : "1MB");
+		ImGui::Text("Machine: Mac IIvi | CPU: TG68K | RAM: %dMB",
+			ram_mb_table[cfg_memSize]);
 
 		ImGui::End();
 

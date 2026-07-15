@@ -103,8 +103,10 @@ rows, MAME-captured + IIcx-silicon-adjudicated). The tg68k Verilator bench:
 - Box ID: $5FFFFFFC reads $A55A2016 (Mac IIvi) or $A55A2017 (Performa 600,
   OSD "Machine" select; ROM masks #$7 → BoxFlag table $4084AB4A). Both
   machines run 16MHz for now; P600 32MHz CPU mode is a tracked follow-up.
-- RAM: contiguous at $0 — OSD options 4/8/20/36MB (68MB = hardware max,
-  deferred; 36MB needs a 64MB SDRAM module).
+- RAM: contiguous at $0 — OSD options 8/20/36/68MB, gated by the fitted
+  SDRAM module (hps_io sdram_sz; 36MB needs a 64MB module, 68MB a 128MB
+  module — undersized selections clamp; sim: `--ram <mb>`,
+  `--sdram-module 32|64|128` emulates module aliasing).
 - I/O at $50000000 (+ $00F00000 mirrors): VIA1 +$0, SCC +$4000, SCSI pDMA
   +$6000, SCSI +$10000, pDMA +$12000, ASC +$14000, SWIM +$16000, VDAC
   +$24000, pseudoVIA +$26000.

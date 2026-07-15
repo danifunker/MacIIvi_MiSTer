@@ -39,7 +39,8 @@ module sdram
 
 	input [15:0]        din,        // data input from chipset/cpu
 	output reg [15:0]   dout,       // data output to chipset/cpu
-	input [24:0]        addr,       // 25 bit word address (bit 24 = col A9, 64MB modules only)
+	input [25:0]        addr,       // 26 bit word address (bit 24 = col A9, 64MB+
+	                                // modules; bit 25 = second chip, 128MB modules)
 	input [1:0]         ds,         // upper/lower data strobe
 	input               oe,         // cpu/chipset requests read
 	input               we,         // cpu/chipset requests write
@@ -119,14 +120,30 @@ localparam CMD_LOAD_MODE       = 4'b0000;
 
 reg [3:0] sd_cmd;   // current command sent to sd ram
 
+// Chip targeting (2026-07-15, 68MB support): nCS is now driven from its own
+// register instead of sd_cmd[3]. MiSTer 128MB modules carry TWO 64MB chips
+// (2x AS4C32M16SB) and INVERT nCS into the second one (PSX_MiSTer sdram.sv
+// precedent: `SDRAM_nCS = chip`), so the nCS LEVEL selects the chip a
+// command goes to: 0 = chip 0 (all of a 32/64MB module), 1 = chip 1 (upper
+// 64MB of a 128MB module). The idle level stays 1 exactly like the old
+// CMD_INHIBIT encoding: chip 0 sees INHIBIT, chip 1 sees NOP — both no-ops.
+// On 32/64MB modules a chip-1 command is simply ignored (nCS=1 = deselected);
+// the OSD gating in MacIIvi.sv keeps addr[25] at 0 for those modules.
+reg sd_cs_r = 1'b1;
+
 // drive control signals according to current command
-assign sd_cs  = sd_cmd[3];
+assign sd_cs  = sd_cs_r;
 assign sd_ras = sd_cmd[2];
 assign sd_cas = sd_cmd[1];
 assign sd_we  = sd_cmd[0];
+// DQM shares pins with A12/A11 BY BOARD DESIGN: the SDRAM module PCB shorts
+// A12/A11 to DQMH/DQML to save connector pins, and both chips' column space
+// stops at A9 (+A10 auto-precharge), so A12/A11 are column don't-cares. The
+// row phase uses them as real row bits (DQM is ignored outside data phases).
 assign sd_dqm = sd_addr[12:11];
 
 reg oe_latch, we_latch;
+reg rfsh_chip = 1'b0;   // idle-slot refresh alternates between the two chips
 
 // Address-capture latch (2026-06-25): the SDRAM column (issued at the CAS phase,
 // STATE_CMD_CONT) must use the address sampled at the command slot
@@ -142,7 +159,7 @@ reg oe_latch, we_latch;
 // and byte strobes stay LIVE (valid only at the CAS phase). This replaces the
 // 2026-06-24 pending-service latch, whose late re-service path corrupted normal
 // SDRAM accesses (gray-stall, builds #13/#14/#16).
-reg [24:0] addr_latch;
+reg [25:0] addr_latch;
 
 // Read-data-valid handshake (2026-06-25): a RAM/VRAM READ's DTACK (in MacIIvi.sv)
 // must wait for the SDRAM to ACTUALLY finish the read, not fire at slot-start. The
@@ -151,32 +168,39 @@ reg [24:0] addr_latch;
 // Mac). That the re-read retry boots PROVES the data is in SDRAM and the single read
 // was merely mis-timed. dout_addr/dout_valid record which address `dout` currently
 // holds; any write invalidates it, so a read can never return pre-write data.
-reg [24:0] dout_addr;
+reg [25:0] dout_addr;
 reg        dout_valid;
 assign ram_ready = dout_valid && (dout_addr == addr);
 
 always @(posedge clk_64) begin
-	sd_cmd <= CMD_INHIBIT;  // default: idle
+	sd_cmd <= CMD_INHIBIT;  // default: idle (with nCS=1: INHIBIT to chip 0,
+	sd_cs_r <= 1'b1;        // NOP to a 128MB module's inverted-nCS chip 1)
 	sd_data <= 16'bZZZZZZZZZZZZZZZZ;
 
 	if(reset != 0) begin
 		dout_valid <= 1'b0;
-		// init ladder, one command slot per chipset cycle (~123ns apart):
-		// 1023..65 = NOP wait, 64 = PRECHARGE ALL, 56/52/../28 = 8x AUTO
-		// REFRESH, 2 = LOAD MODE. tRP/tRFC/tMRD are all satisfied by orders
-		// of magnitude at this spacing.
+		// init ladder, one command slot per chipset cycle (~123ns apart), run
+		// for BOTH chips of a 128MB module (even slot = chip 0, odd = chip 1;
+		// on 32/64MB modules the chip-1 slots land on a deselected nCS and are
+		// inert): 1023..67 = NOP wait, 66/65 = PRECHARGE ALL, 58..43 = 8x AUTO
+		// REFRESH each, 4/3 = LOAD MODE. Same-chip commands are >=246ns apart,
+		// so tRP/tRFC/tMRD are satisfied by orders of magnitude.
 		if(t == STATE_CMD_START) begin
 
-			if(reset == 64) begin
+			if(reset == 66 || reset == 65) begin
 				sd_cmd <= CMD_PRECHARGE;
+				sd_cs_r <= reset[0];
 				sd_addr[10] <= 1'b1;      // precharge all banks
 			end
 
-			if(reset >= 28 && reset <= 56 && reset[1:0] == 2'b00)
+			if(reset >= 43 && reset <= 58) begin
 				sd_cmd <= CMD_AUTO_REFRESH;
+				sd_cs_r <= reset[0];
+			end
 
-			if(reset == 2) begin
+			if(reset == 4 || reset == 3) begin
 				sd_cmd <= CMD_LOAD_MODE;
+				sd_cs_r <= reset[0];
 				sd_addr <= MODE;
 			end
 
@@ -191,17 +215,23 @@ always @(posedge clk_64) begin
 			if (we) dout_valid <= 1'b0;   // a write invalidates the read-data cache
 			if (we || oe) begin
 				// Capture the access address NOW for the CAS column (see the
-				// addr_latch comment above). A12 = addr[23]: unlock the UPPER
-				// 16MB of the 32MB MT48LC16M16 — the relocated motherboard bank
-				// (mb_hi -> addr[23]=1) lands up there; all other users keep
-				// addr[23]=0 (lower 16MB, unchanged).
+				// addr_latch comment above). A12 = addr[23] (13th row bit);
+				// nCS level = addr[25] picks the chip on 128MB modules.
 				addr_latch <= addr;
 				sd_cmd <= CMD_ACTIVE;
+				sd_cs_r <= addr[25];
 				sd_addr <= { addr[23], addr[19:8] };
 				sd_ba <= addr[21:20];
 		// ------------------------ no access --------------------------
 			end else begin
+				// Idle slot: refresh, alternating chips so BOTH chips of a
+				// 128MB module get their full 8192/64ms cadence (a chip-1
+				// refresh is inert on 32/64MB modules). The CPU can hold at
+				// most 3 of 4 slots, so each chip still refreshes at least
+				// every ~1us — an ~8x margin over the 7.8us requirement.
 				sd_cmd <= CMD_AUTO_REFRESH;
+				sd_cs_r <= rfsh_chip;
+				rfsh_chip <= ~rfsh_chip;
 			end
 		end
 
@@ -210,12 +240,13 @@ always @(posedge clk_64) begin
 		// DATA and the byte strobes stay LIVE — they are only valid at CAS.
 		if(t == STATE_CMD_CONT && (we_latch || oe_latch)) begin
 			sd_cmd <= we_latch?CMD_WRITE:CMD_READ;
+			sd_cs_r <= addr_latch[25];   // same chip as the ACTIVE row
 			if (we_latch) sd_data <= din;
 			// always return both bytes in a read. The cpu may not
 			// need it, but the caches need to be able to store everything
 			// Column: A10=1 (auto precharge), A9=addr[24] (the 10th column
-			// bit on 64MB MT48LC32M16 modules; always 0 for accesses below
-			// 32MB, so 32MB MT48LC16M16 modules are unaffected).
+			// bit on 64MB+ chips; always 0 for accesses below 32MB, so 32MB
+			// MT48LC16M16 modules are unaffected).
 			sd_addr <= { we_latch ? ~ds : 2'b00, 1'b1, addr_latch[24],
 			             addr_latch[22], addr_latch[7:0] };  // auto precharge
 		end

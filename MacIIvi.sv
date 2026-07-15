@@ -74,7 +74,15 @@ module emu
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 		"OA,Monitor,640x480 VGA,512x384 12in RGB;",
 		"-;",
-		"O2,Memory,8MB,20MB;",
+		// Memory: one line per SDRAM-module tier (same O23 status bits), so only
+		// sizes the fitted module can actually back are offered. menumask bit 0 =
+		// module >=64MB, bit 1 = module =128MB (from hps_io sdram_sz; H hides when
+		// the bit is SET, h when CLEAR). 36MB tops out SDRAM word $157FFFF (needs
+		// 64MB module), 68MB word $257FFFF (needs 128MB). With an unknown module
+		// (old Main / menu core never run) only 8/20MB show.
+		"H0O23,Memory,8MB,20MB;",
+		"h0H1O23,Memory,8MB,20MB,36MB;",
+		"h1O23,Memory,8MB,20MB,36MB,68MB;",
 		"-;",
 		"R5,Interrupt (NMI / MacsBug);",
 		"R6,Reset PRAM & Core;",
@@ -161,6 +169,17 @@ module emu
 	// the status register is controlled by the on screen display (OSD)
 	wire [31:0] status;
 	wire  [1:0] buttons;
+
+	// Fitted SDRAM module, reported by Main (menu core probes it once and Main
+	// replays it to every core): [15] = valid, [1:0] 1=32MB 2=64MB 3=128MB.
+	// Gates which Memory OSD line shows and clamps ram_size_bytes so a stale
+	// selection can never address past the module (the 36MB-on-32MB failure
+	// mode: RAM above 25MB wraps onto the ROM/VRAM/floppy staging words and
+	// corrupts the machine mid-session).
+	wire [15:0] sdram_sz;
+	wire        sdram_128 = sdram_sz[15] && (sdram_sz[1:0] == 2'd3);
+	wire        sdram_64p = sdram_sz[15] && (sdram_sz[1:0] >= 2'd2);  // 64 or 128MB
+	wire [15:0] status_menumask = {14'd0, sdram_128, sdram_64p};
 
 	// hps_io block-device buses (all VDNUM devices)
 	wire [31:0] sd_lba[VDNUM];
@@ -373,6 +392,8 @@ module emu
 
 		.buttons(buttons),
 		.status(status),
+		.status_menumask(status_menumask),
+		.sdram_sz(sdram_sz),
 
 		.sd_lba(sd_lba),
 		.sd_rd(sd_rd),
@@ -560,13 +581,23 @@ module emu
 	// config-register banking. The ROM sizes memory by probing; open-bus $FFFF
 	// above ram_size ends the probe. Menu configs (status[3:2], latched at
 	// reset into status_mem):
-	//   8MB  = 4 + 4x1MB SIMMs  (status[2]=0, default)
-	//   20MB = 4 + 4x4MB SIMMs  (status[2]=1)
-	// OSD "Memory" is a single bit (O2). The 4MB (too small) and 36MB (needs a
-	// 64MB SDRAM module; not working yet — investigate later) options were
-	// removed 2026-07-13 for the release. 68MB hardware max also deferred.
-	wire [25:0] ram_size_bytes = status_mem[0] ? 26'h1400000 :  // 20MB
-	                                             26'h0800000;   // 8MB (default)
+	//   8MB  = 4 + 4x1MB SIMMs   (00, default)
+	//   20MB = 4 + 4x4MB SIMMs   (01)
+	//   36MB = 4 + 4x8MB SIMMs   (10) — RAM top = SDRAM word $157FFFF: 64MB module
+	//   68MB = 4 + 4x16MB SIMMs  (11) — RAM top = SDRAM word $257FFFF: 128MB module
+	// The selection is clamped to what the fitted module can back (sdram_sz
+	// above; unknown module = treat as 32MB). Without the clamp an oversized
+	// config wraps its upper RAM onto the ROM/VRAM/floppy staging words —
+	// boots, then corrupts at random once the OS grows into high memory (the
+	// pre-.143 "36MB random Finder error").
+	wire [1:0]  mem_cap = sdram_128 ? 2'd3 :   // 68MB allowed
+	                      sdram_64p ? 2'd2 :   // 36MB allowed
+	                                  2'd1;    // 20MB max (32MB/unknown module)
+	wire [1:0]  mem_eff = (status_mem > mem_cap) ? mem_cap : status_mem;
+	wire [26:0] ram_size_bytes = (mem_eff == 2'd3) ? 27'h4400000 :  // 68MB
+	                             (mem_eff == 2'd2) ? 27'h2400000 :  // 36MB
+	                             (mem_eff == 2'd1) ? 27'h1400000 :  // 20MB
+	                                                 27'h0800000;   // 8MB (default)
 				  
 	// Serial Ports
 	wire serialOut;
@@ -636,7 +667,7 @@ module emu
 	wire _memoryUDS, _memoryLDS;
 	wire dioBusControl;
 	wire cpuBusControl;
-	wire [24:0] memoryAddr;  // 25-bit SDRAM word address from address controller
+	wire [25:0] memoryAddr;  // 26-bit SDRAM word address from address controller
 	wire [15:0] memoryDataOut;
 	wire memoryLatch;
 	// peripherals
@@ -1855,7 +1886,7 @@ module emu
 	//   ROM (1MB): $000000 + offset
 	//   Floppy 1:  $180000 + offset
 	//   Floppy 2:  $280000 + offset
-	reg [24:0] dio_a;
+	reg [25:0] dio_a;
 	reg [15:0] dio_data;
 	reg        dio_write;
 
@@ -1877,9 +1908,9 @@ module emu
 			end
 			dio_data <= {ioctl_data[7:0], ioctl_data[15:8]};
 			case (dio_index[1:0])
-				2'b01:   dio_a <= 25'h0180000 + {5'b0, dio_flp_a};  // Floppy 1
-				2'b10:   dio_a <= 25'h0280000 + {5'b0, dio_flp_a};  // Floppy 2
-				default: dio_a <= {6'b0, dio_addr[18:0]};           // ROM (1MB) at $000000 (must match addrController rom_sdram_word)
+				2'b01:   dio_a <= 26'h0180000 + {6'b0, dio_flp_a};  // Floppy 1
+				2'b10:   dio_a <= 26'h0280000 + {6'b0, dio_flp_a};  // Floppy 2
+				default: dio_a <= {7'b0, dio_addr[18:0]};           // ROM (1MB) at $000000 (must match addrController rom_sdram_word)
 			endcase
 			ioctl_wait <= 1;
 		end
@@ -1902,10 +1933,11 @@ module emu
 	////////////////////////// SDRAM /////////////////////////////////
 
 	// SDRAM Address mapping (VASP layout — docs/VASP_RETARGET.md):
-	// memoryAddr[24:0] is already the SDRAM word address from addrController
+	// memoryAddr[25:0] is already the SDRAM word address from addrController
 	// (ROM $000000, VRAM $080000, floppies $180000/$280000, RAM $380000+).
-	// The 36MB RAM config reaches above the 32MB module boundary and needs a
-	// 64MB SDRAM module (sdram.v drives column A9 from addr[24]).
+	// 36MB RAM reaches above the 32MB module boundary (sdram.v drives column
+	// A9 from addr[24]); 68MB reaches into a 128MB module's second chip
+	// (addr[25] -> nCS level). Both are OSD-gated by sdram_sz above.
 
 	// Card cold-tail (ext) SDRAM access — twin of verilator/sim.v (long note
 	// there). Card words [MDC_VRAM_WORDS, 1MB) map to SDRAM word $100000 +
@@ -1917,7 +1949,7 @@ module emu
 	// declared done after 14 presented clk_sys (~3.5 chipset windows —
 	// >=2 clean command windows by margin, each an idempotent rewrite).
 	// Priority: download > floppy staging > card ext > cpu.
-	wire [24:0] card_ext_addr = 25'h0100000 + {5'd0, mdc_vram_addr[19:0]};
+	wire [25:0] card_ext_addr = 26'h0100000 + {6'd0, mdc_vram_addr[19:0]};
 	wire        card_ext_req  = card_ext_rd || card_ext_wr;
 	wire        card_ext_slot = card_ext_req && !download_cycle
 	                            && !dskReadAckInt && !dskReadAckExt;
@@ -1933,7 +1965,7 @@ module emu
 	                      : (card_ext_wcnt == 4'd14);
 	assign card_ext_din   = sdram_out;
 
-	wire [24:0] sdram_addr = download_cycle ? dio_a :
+	wire [25:0] sdram_addr = download_cycle ? dio_a :
 	                         card_ext_slot  ? card_ext_addr : memoryAddr;
 	wire [15:0] sdram_din  = download_cycle ? dio_data :
 	                         card_ext_slot  ? mdc_vram_dout : memoryDataOut;

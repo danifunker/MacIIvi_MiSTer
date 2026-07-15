@@ -61,25 +61,31 @@ The ROM sizes memory by probing. Consequences:
 - The pseudoVIA RAM-config register becomes what MAME has: reg $01 reads via
   the (unconnected → 0) config handler, writes dropped.
 
-### Verified size options (OSD: 4/8/20/36 MB)
+### Verified size options (OSD: 8/20/36/68 MB, gated by fitted SDRAM)
 
 MAME `maciivx.cpp:316`: default `4M`, extras `8M,16M,32M,36M,48M,64M,68M`
 (model: 4MB motherboard + one SIMM bank up to 64MB).
 Real IIvi: 4MB soldered + 4× 30-pin SIMM slots (one bank).
 
-| OSD | Composition | Validity |
-|---|---|---|
-| 4MB | motherboard only | Apple base config; MAME default |
-| 8MB | 4 + 4×1MB SIMMs | Apple-supported; MAME option |
-| 20MB | 4 + 4×4MB SIMMs | Apple-supported real config; **not** in MAME's list (their list is round numbers, not bank math) — contiguous model boots regardless |
-| 36MB | 4 + 32 (4×8MB) | in MAME's list; 8MB 30-pin SIMMs are nonstandard-but-real |
-| *68MB* | 4 + 4×16MB | hardware max — **deferred**: doesn't fit a 64MB SDRAM module; revisit for 128MB modules |
+| OSD | Composition | Needs module | Validity |
+|---|---|---|---|
+| 8MB | 4 + 4×1MB SIMMs | 32MB | Apple-supported; MAME option; OSD default |
+| 20MB | 4 + 4×4MB SIMMs | 32MB | Apple-supported real config; **not** in MAME's list (their list is round numbers, not bank math) — contiguous model boots regardless |
+| 36MB | 4 + 32 (4×8MB) | 64MB | in MAME's list; 8MB 30-pin SIMMs are nonstandard-but-real |
+| 68MB | 4 + 4×16MB | 128MB | hardware max (2026-07-15: implemented — needs the dual-chip addressing below) |
 
-36MB requires a 64MB SDRAM module (gate via `sdram_sz` from hps_io; hide the
-OSD option or clamp when only 32MB is present). 4/8/20 fit 32MB modules with
-the layout below.
+(4MB motherboard-only was dropped from the OSD 2026-07-13 as too small to be
+useful.) The gate is `sdram_sz` from hps_io ([15]=valid, [1:0] 1/2/3 =
+32/64/128MB — Main replays what the menu core probed): the CONF_STR carries
+one Memory line per module tier behind `status_menumask` H/h masks, so only
+backable sizes are OFFERED, and `ram_size_bytes` additionally CLAMPS a stale
+oversized selection (36→20, 68→36/20). Without the clamp an oversized config
+wraps its upper RAM onto the fixed SDRAM regions below — the machine boots
+(the ROM's sizing probe reads back its own aliased writes consistently) and
+then corrupts ROM/VRAM/staging words at random once the OS grows into high
+memory. That was the pre-.143 "36MB random Finder error" on a 32MB module.
 
-### New SDRAM layout (16-bit word addresses, 25-bit space)
+### New SDRAM layout (16-bit word addresses, 26-bit space)
 
 Fixed regions LOW so small-RAM configs work on 32MB modules; RAM after:
 
@@ -90,12 +96,32 @@ Fixed regions LOW so small-RAM configs work on 32MB modules; RAM after:
 | `$0100000-$017FFFF` | reserved: mdc824 VRAM (1MB) if it lands in SDRAM |
 | `$0180000-$027FFFF` | floppy image 1 (2MB window) |
 | `$0280000-$037FFFF` | floppy image 2 (2MB window) |
-| `$0380000 + word` | RAM, contiguous (4/8/20/36MB → tops out at `$157FFFF`) |
+| `$0380000 + word` | RAM, contiguous (8/20/36/68MB → tops out at `$257FFFF`) |
 
 20MB config ends at `$D7FFFF` (< 32MB module limit ✓); 36MB ends at
-`$157FFFF` (64MB module ✓). `sdram.v` grows `addr` to `[24:0]`; on 64MB
-modules (MT48LC32M16: 10-bit column) `addr[24]` drives column A9. The LC II
-`mb_hi` upper-16MB relocation trick is retired — the address is linear now.
+`$157FFFF` (64MB module ✓); 68MB ends at `$257FFFF` (128MB module ✓).
+`sdram.v` takes `addr[25:0]`:
+
+- `addr[24]` drives **column A9** — the 10th column bit on 64MB+ chips
+  (MT48LC32M16 / AS4C32M16SB). On a 32MB MT48LC16M16 the pin is a row-only
+  bit, so the chip IGNORES it during CAS: word X and word X+$1000000 alias.
+  That physical alias is why 36MB cannot work on a 32MB module.
+- `addr[25]` drives the **nCS level** — MiSTer 128MB modules carry two 64MB
+  chips and invert nCS into the second one (PSX_MiSTer precedent), so nCS=0
+  commands chip 0 and nCS=1 chip 1. `sdram.v` runs the init ladder for both
+  chips and alternates idle-slot auto-refresh between them (each chip still
+  refreshes ≥8× faster than the 7.8µs JEDEC cadence). On 32/64MB modules a
+  chip-1 command lands on a deselected chip and is inert.
+- DQM stays on `sd_addr[12:11]` **by board design** — the SDRAM module PCB
+  shorts A12/A11 to DQMH/DQML to save connector pins; both are column
+  don't-cares on every supported chip (columns stop at A9), and the row
+  phase uses them as genuine row bits.
+
+The LC II `mb_hi` upper-16MB relocation trick is retired — the address is
+linear now. `verilator/sim_ram.v` models the module-size failure modes
+(`--sdram-module 32|64|128`): an undersized module aliases `addr[24]` /
+deselects `addr[25]` exactly like the real chips, so the corruption case is
+reproducible in sim on purpose.
 
 ## PseudoVIA: V8 variant → base-RBV variant
 
