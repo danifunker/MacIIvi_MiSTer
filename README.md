@@ -8,9 +8,11 @@ machine).
 
 **It boots.** System 7.5.5 runs to the Finder on the mdc824 card over HDMI,
 on real MiSTer hardware. Latest build:
-[`releases/MacIIvi_Unstable_20260713.rbf`](releases/).
+[`releases/MacIIvi_Unstable_20260715.rbf`](releases/) — adds selectable
+**8 / 20 / 36 / 48 MB** RAM (all four hardware-validated on a MiSTer with a
+64 MB+ SDRAM module).
 
-![System 7.5.5 Finder + CD-ROM on the card](releases/hw_143_release_cdrom_20260713.png)
+![System 7.5.5, 48 MB, Finder on the card](releases/hw_143_48mb_finder_20260715.png)
 
 ## What works
 
@@ -41,12 +43,12 @@ Put a bootable 7.x disk image in `/media/fat/games/MacIIvi/`, then in the
 core's OSD **Mount SCSI-0** and **Reset & Apply**. To use a CD, **Mount
 CD-ROM** (SCSI-3) with a data ISO.
 
-**OSD options:** Memory (8 MB default / 20 / 36 / 68 MB — the list adapts to
-your SDRAM module: 36 MB needs a 64 MB module, 68 MB a 128 MB module; with a
-32 MB module only 8/20 MB show), Monitor size, Aspect/Scale, Mount SCSI-0/1,
-Mount CD-ROM, CD-ROM Drive (enable/disable), Mount PRAM, Reset PRAM & Core,
-Reset & Apply. If the larger Memory options don't appear, your MiSTer has a
-smaller module (or Main hasn't probed it — enter the main MiSTer menu once).
+**OSD options:** Memory (8 MB default / 20 / 36 / 48 MB — the list adapts to
+your SDRAM module: 36 and 48 MB need a 64 MB+ module; with a 32 MB module only
+8/20 MB show), Monitor size, Aspect/Scale, Mount SCSI-0/1, Mount CD-ROM,
+CD-ROM Drive (enable/disable), Mount PRAM, Reset PRAM & Core, Reset & Apply.
+If the larger Memory options don't appear, your MiSTer has a smaller module
+(or Main hasn't probed it — enter the main MiSTer menu once).
 
 ## Building
 
@@ -94,11 +96,13 @@ foundation is silicon-adjudicated on a real Macintosh IIcx (68030) and an
 ## Status & known limitations
 
 - **Working:** boot to Finder on the card, SCSI disk + CD-ROM, sound, ADB.
-- Memory: 8/20 MB on any SDRAM module; 36 MB needs a 64 MB module and 68 MB
-  (the IIvi hardware max) a 128 MB module — the OSD only offers what your
-  module can back. On a 32 MB module larger sizes are physically impossible
-  (the upper RAM would alias over the ROM/VRAM staging area — the cause of
-  the old "random Finder errors at 36 MB").
+- Memory: 8/20 MB on any SDRAM module; 36 and 48 MB need a 64 MB+ module —
+  the OSD only offers what your module can back. On a 32 MB module larger
+  sizes are physically impossible (the upper RAM would alias over the
+  ROM/VRAM staging area — the cause of the old "random Finder errors at
+  36 MB"). 68 MB (the IIvi hardware max, needs a 128 MB module's second
+  chip) is implemented in RTL but not yet exposed — the second-chip path
+  still hangs at boot and is under investigation.
 - Mouse motion *during* the boot animation can wedge a QuickDraw fill (a
   latent ROM-interaction bug; fine once booted). Onboard-video scanout, the
   Performa 600 personality (32 MHz), and CD audio are deferred.

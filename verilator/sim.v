@@ -208,7 +208,8 @@ module emu
 	// there is deliberately NO sdram_sz clamp here: the sim runs any RAM size
 	// against any emulated module (cfg_sdramMod -> sim_ram) so the oversized-
 	// config corruption can be reproduced on purpose.
-	wire [26:0] ram_size_bytes = (cfg_memSize == 3'd4) ? 27'h4400000 :  // 68MB
+	wire [26:0] ram_size_bytes = (cfg_memSize == 3'd5) ? 27'h4400000 :  // 68MB
+	                             (cfg_memSize == 3'd4) ? 27'h3000000 :  // 48MB
 	                             (cfg_memSize == 3'd3) ? 27'h2400000 :  // 36MB
 	                             (cfg_memSize == 3'd2) ? 27'h1400000 :  // 20MB
 	                             (cfg_memSize == 3'd1) ? 27'h0800000 :  // 8MB

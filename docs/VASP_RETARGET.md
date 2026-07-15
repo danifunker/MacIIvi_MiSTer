@@ -61,29 +61,42 @@ The ROM sizes memory by probing. Consequences:
 - The pseudoVIA RAM-config register becomes what MAME has: reg $01 reads via
   the (unconnected → 0) config handler, writes dropped.
 
-### Verified size options (OSD: 8/20/36/68 MB, gated by fitted SDRAM)
+### Verified size options (OSD: 8/20/36/48 MB, gated by fitted SDRAM)
 
 MAME `maciivx.cpp:316`: default `4M`, extras `8M,16M,32M,36M,48M,64M,68M`
 (model: 4MB motherboard + one SIMM bank up to 64MB).
 Real IIvi: 4MB soldered + 4× 30-pin SIMM slots (one bank).
 
-| OSD | Composition | Needs module | Validity |
-|---|---|---|---|
-| 8MB | 4 + 4×1MB SIMMs | 32MB | Apple-supported; MAME option; OSD default |
-| 20MB | 4 + 4×4MB SIMMs | 32MB | Apple-supported real config; **not** in MAME's list (their list is round numbers, not bank math) — contiguous model boots regardless |
-| 36MB | 4 + 32 (4×8MB) | 64MB | in MAME's list; 8MB 30-pin SIMMs are nonstandard-but-real |
-| 68MB | 4 + 4×16MB | 128MB | hardware max (2026-07-15: implemented — needs the dual-chip addressing below) |
+| OSD | Composition | Needs module | Chip | Status (2026-07-15) |
+|---|---|---|---|---|
+| 8MB | 4 + 4×1MB SIMMs | 32MB | 0 | Apple-supported; MAME option; OSD default |
+| 20MB | 4 + 4×4MB SIMMs | 32MB | 0 | Apple-supported; boots (not in MAME's round-number list) |
+| 36MB | 4 + 4×8MB | 64MB | 0 | in MAME's list; **HW-CONFIRMED** on .143 (36,864K, Finder) |
+| 48MB | (contiguous) | 64MB | 0 | in MAME's list; chip-0 only (word top $1B7FFFF); also the widening-isolation probe |
+| *68MB* | 4 + 4×16MB | 128MB | 0+1 | hardware max — **OSD-HIDDEN**: froze at Happy Mac (chip-1/nСS path unverified). RTL keeps the size; clamp caps to it |
 
-(4MB motherboard-only was dropped from the OSD 2026-07-13 as too small to be
-useful.) The gate is `sdram_sz` from hps_io ([15]=valid, [1:0] 1/2/3 =
-32/64/128MB — Main replays what the menu core probed): the CONF_STR carries
-one Memory line per module tier behind `status_menumask` H/h masks, so only
-backable sizes are OFFERED, and `ram_size_bytes` additionally CLAMPS a stale
-oversized selection (36→20, 68→36/20). Without the clamp an oversized config
-wraps its upper RAM onto the fixed SDRAM regions below — the machine boots
-(the ROM's sizing probe reads back its own aliased writes consistently) and
-then corrupts ROM/VRAM/staging words at random once the OS grows into high
-memory. That was the pre-.143 "36MB random Finder error" on a 32MB module.
+The gate is `sdram_sz` from hps_io ([15]=valid, [1:0] 1/2/3 = 32/64/128MB —
+Main replays what the menu core probed). CONF_STR carries one Memory line per
+module tier behind `status_menumask` (bit0 = module ≥64MB) — `H0` shows 8/20
+on a 32MB/unknown module, `h0` shows 8/20/36/48 on ≥64MB. `ram_size_bytes`
+additionally CLAMPS a stale oversized selection to the chip-0 max we trust
+(≥64MB module → 48MB; else → 20MB), so a config carried over from a bigger
+machine can't reach the dead second chip or wrap. Without the clamp an
+oversized config wraps its upper RAM onto the fixed SDRAM regions below (or,
+at 68MB, the unverified chip 1) — the machine boots (the ROM's sizing probe
+reads back its own aliased writes consistently) and then corrupts once the OS
+grows into high memory. That was the pre-.143 "36MB random Finder error" on a
+32MB module, and the same shape froze 68MB at the Happy Mac.
+
+**68MB / chip-1 status:** the RTL (26-bit word path, `addr[25]→nCS`, per-chip
+init/refresh) is complete and the address math checks out, but on the bench
+128MB module 68MB freezes at the early Happy Mac — the cold RAM march passes
+(Happy Mac draws) then the OS-load into high memory hangs, the signature of
+chip-1 addresses aliasing onto chip 0 (nCS not switching the physical chip).
+Refresh-alternation is exonerated (36MB already runs the halved refresh on
+chip 0 and boots). It can't be bisected in sim (sim swaps `sdram.v` for
+`sim_ram`). Re-expose 68MB once the nCS path is confirmed against the specific
+module's chip-select wiring; a booting 48MB proves the widening itself is clean.
 
 ### New SDRAM layout (16-bit word addresses, 26-bit space)
 

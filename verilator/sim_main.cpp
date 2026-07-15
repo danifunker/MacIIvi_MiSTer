@@ -68,9 +68,9 @@ int multi_step_amount = 1024;
 //   cfg_cpuType=3  -> cpu="11" (68020)
 // Mac LC needs 68020 mode (cfg_cpuType=2 or 3)
 int cfg_cpuType = 2;       // 68020 mode via TG68K
-int cfg_memSize = 0;       // --ram: 0=4MB 1=8MB 2=20MB 3=36MB 4=68MB (default 4MB: fastest boot march)
+int cfg_memSize = 0;       // --ram: index into ram_mb_table (default 4MB: fastest boot march)
 int cfg_sdramMod = 3;      // --sdram-module: emulated module 1=32MB 2=64MB 3=128MB (default: everything fits)
-static const int ram_mb_table[5] = {4, 8, 20, 36, 68};
+static const int ram_mb_table[6] = {4, 8, 20, 36, 48, 68};
 
 // Verbose bring-up diagnostics (overlay/FC/march/STM/RAMCFG/bus/CPU-trace
 // console spam). Off by default for a quiet console; enable with --verbose/-v.
@@ -1206,7 +1206,7 @@ void show_help() {
 	printf("  --scsi0 <file>                Mount SCSI-0 hard disk image (.img/.vhd/.hda)\n");
 	printf("  --scsi1 <file>                Mount SCSI-1 hard disk image\n");
 	printf("  --cdrom <file>                Mount CD-ROM image (.iso/.toast, 2048-byte sectors) on SCSI-3\n");
-	printf("  --ram <mb>                    Mac RAM size: 4, 8, 20, 36 or 68 (default 4)\n");
+	printf("  --ram <mb>                    Mac RAM size: 4, 8, 20, 36, 48 or 68 (default 4)\n");
 	printf("  --sdram-module <mb>           Emulated SDRAM module: 32, 64 or 128 (default 128).\n");
 	printf("                                Undersized modules alias/deselect exactly like real\n");
 	printf("                                chips (e.g. --ram 36 --sdram-module 32 reproduces the\n");
@@ -1346,9 +1346,9 @@ int main(int argc, char** argv, char** env) {
 		} else if (strcmp(argv[i], "--ram") == 0 && i + 1 < argc) {
 			int mb = std::stoi(argv[++i]);
 			cfg_memSize = -1;
-			for (int k = 0; k < 5; k++) if (ram_mb_table[k] == mb) cfg_memSize = k;
+			for (int k = 0; k < 6; k++) if (ram_mb_table[k] == mb) cfg_memSize = k;
 			if (cfg_memSize < 0) {
-				fprintf(stderr, "--ram %d: invalid size (valid: 4, 8, 20, 36, 68)\n", mb);
+				fprintf(stderr, "--ram %d: invalid size (valid: 4, 8, 20, 36, 48, 68)\n", mb);
 				return 1;
 			}
 			printf("Mac RAM size: %dMB\n", mb);

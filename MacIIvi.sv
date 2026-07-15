@@ -74,15 +74,18 @@ module emu
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 		"OA,Monitor,640x480 VGA,512x384 12in RGB;",
 		"-;",
-		// Memory: one line per SDRAM-module tier (same O23 status bits), so only
-		// sizes the fitted module can actually back are offered. menumask bit 0 =
-		// module >=64MB, bit 1 = module =128MB (from hps_io sdram_sz; H hides when
-		// the bit is SET, h when CLEAR). 36MB tops out SDRAM word $157FFFF (needs
-		// 64MB module), 68MB word $257FFFF (needs 128MB). With an unknown module
-		// (old Main / menu core never run) only 8/20MB show.
-		"H0O23,Memory,8MB,20MB;",
-		"h0H1O23,Memory,8MB,20MB,36MB;",
-		"h1O23,Memory,8MB,20MB,36MB,68MB;",
+		// Memory: one line per SDRAM-module tier (O234 = status[4:2]), so only
+		// sizes the fitted module can back are offered. menumask bit 0 = module
+		// >=64MB (from hps_io sdram_sz; H hides when the bit is SET, h when CLEAR).
+		// 36MB tops out SDRAM word $157FFFF and 48MB word $1B7FFFF — both inside a
+		// 64MB module's (and a 128MB module's chip-0) $1FFFFFF limit, so both need
+		// only a >=64MB module. 48MB doubles as the chip-0-only probe that isolates
+		// the 68MB chip-1/nCS fault. 68MB (word $257FFFF, needs a 128MB module's
+		// SECOND chip) is HIDDEN pending a hardware fix of that path — the RTL
+		// still supports the size, it's just not OSD-reachable (and the clamp below
+		// caps any stale selection). With an unknown/32MB module only 8/20MB show.
+		"H0O234,Memory,8MB,20MB;",
+		"h0O234,Memory,8MB,20MB,36MB,48MB;",
 		"-;",
 		"R5,Interrupt (NMI / MacsBug);",
 		"R6,Reset PRAM & Core;",
@@ -121,10 +124,11 @@ module emu
 	reg rom_loaded = 1'b0;
 	always @(posedge clk_sys) if (dio_download && dio_index == 0) rom_loaded <= 1'b1;
 
-	reg [1:0] status_mem = 2'b00;        // latched memory selection (status[2])
+	reg [2:0] status_mem = 3'b000;       // latched memory selection (status[4:2])
 	// Machine is hardwired to Mac IIvi ($A55A2016); the Performa 600 OSD option
 	// was removed for the release (P600's 32MHz CPU mode was never enabled — it
-	// ran at 16MHz like the IIvi anyway). status[4] freed.
+	// ran at 16MHz like the IIvi anyway). status[4] freed by that removal and now
+	// reused as the Memory field's 3rd bit (O234, five sizes 8/20/36/48/68).
 	localparam [1:0] status_cpu = 2'b10; // 68020
 	reg       n_reset = 0;
 	reg       pram_force_reset = 1'b0;  // "Reset PRAM & Core" -> system reset pulse
@@ -151,7 +155,7 @@ module emu
 			end
 			else if(rst_cnt) begin
 				rst_cnt     <= rst_cnt - 1'd1;
-				status_mem  <= status[3:2];
+				status_mem  <= status[4:2];
 			end
 			else begin
 				n_reset <= 1;
@@ -177,9 +181,11 @@ module emu
 	// mode: RAM above 25MB wraps onto the ROM/VRAM/floppy staging words and
 	// corrupts the machine mid-session).
 	wire [15:0] sdram_sz;
-	wire        sdram_128 = sdram_sz[15] && (sdram_sz[1:0] == 2'd3);
 	wire        sdram_64p = sdram_sz[15] && (sdram_sz[1:0] >= 2'd2);  // 64 or 128MB
-	wire [15:0] status_menumask = {14'd0, sdram_128, sdram_64p};
+	// menumask bit 0 = "module >=64MB" gates the 8/20/36/48 vs 8/20 Memory lines.
+	// (128MB detection retired with the 68MB OSD entry — the offered sizes now top
+	// out at 48MB = chip-0-only; re-add sdram_128 when the chip-1/nCS path is fixed.)
+	wire [15:0] status_menumask = {15'd0, sdram_64p};
 
 	// hps_io block-device buses (all VDNUM devices)
 	wire [31:0] sd_lba[VDNUM];
@@ -579,24 +585,29 @@ module emu
 	// Macintosh IIvi memory configuration — VASP model (docs/VASP_RETARGET.md):
 	// one CONTIGUOUS block at $0 (4MB motherboard + one SIMM bank), no V8-style
 	// config-register banking. The ROM sizes memory by probing; open-bus $FFFF
-	// above ram_size ends the probe. Menu configs (status[3:2], latched at
+	// above ram_size ends the probe. Menu configs (status[4:2], latched at
 	// reset into status_mem):
-	//   8MB  = 4 + 4x1MB SIMMs   (00, default)
-	//   20MB = 4 + 4x4MB SIMMs   (01)
-	//   36MB = 4 + 4x8MB SIMMs   (10) — RAM top = SDRAM word $157FFFF: 64MB module
-	//   68MB = 4 + 4x16MB SIMMs  (11) — RAM top = SDRAM word $257FFFF: 128MB module
-	// The selection is clamped to what the fitted module can back (sdram_sz
-	// above; unknown module = treat as 32MB). Without the clamp an oversized
-	// config wraps its upper RAM onto the ROM/VRAM/floppy staging words —
-	// boots, then corrupts at random once the OS grows into high memory (the
-	// pre-.143 "36MB random Finder error").
-	wire [1:0]  mem_cap = sdram_128 ? 2'd3 :   // 68MB allowed
-	                      sdram_64p ? 2'd2 :   // 36MB allowed
-	                                  2'd1;    // 20MB max (32MB/unknown module)
-	wire [1:0]  mem_eff = (status_mem > mem_cap) ? mem_cap : status_mem;
-	wire [26:0] ram_size_bytes = (mem_eff == 2'd3) ? 27'h4400000 :  // 68MB
-	                             (mem_eff == 2'd2) ? 27'h2400000 :  // 36MB
-	                             (mem_eff == 2'd1) ? 27'h1400000 :  // 20MB
+	//   8MB  = 4 + 4x1MB SIMMs   (000, default)
+	//   20MB = 4 + 4x4MB SIMMs   (001)
+	//   36MB = 4 + 4x8MB SIMMs   (010) — RAM top = SDRAM word $157FFFF (chip 0)
+	//   48MB (011)                     — RAM top = SDRAM word $1B7FFFF (chip 0);
+	//                                    MAME-listed size; also the chip-0 probe
+	//   68MB = 4 + 4x16MB SIMMs  (100) — RAM top = SDRAM word $257FFFF (chip 1):
+	//                                    HIDDEN pending the chip-1/nCS fix, but the
+	//                                    RTL supports it and the clamp caps to it.
+	// The selection is clamped to what the fitted module can back (sdram_sz above;
+	// unknown module = treat as 32MB). Cap = 48MB on a >=64MB module (chip-0 max
+	// we currently trust), 20MB otherwise. Without the clamp an oversized config
+	// wraps its upper RAM onto the ROM/VRAM/floppy staging words (or the dead
+	// second chip) — boots, then corrupts once the OS grows into high memory (the
+	// pre-.143 "36MB random Finder error"; the same shape froze 68MB at Happy Mac).
+	wire [2:0]  mem_cap = sdram_64p ? 3'd3 :   // 48MB allowed (chip 0)
+	                                  3'd1;    // 20MB max (32MB/unknown module)
+	wire [2:0]  mem_eff = (status_mem > mem_cap) ? mem_cap : status_mem;
+	wire [26:0] ram_size_bytes = (mem_eff == 3'd4) ? 27'h4400000 :  // 68MB (RTL-only)
+	                             (mem_eff == 3'd3) ? 27'h3000000 :  // 48MB
+	                             (mem_eff == 3'd2) ? 27'h2400000 :  // 36MB
+	                             (mem_eff == 3'd1) ? 27'h1400000 :  // 20MB
 	                                                 27'h0800000;   // 8MB (default)
 				  
 	// Serial Ports
