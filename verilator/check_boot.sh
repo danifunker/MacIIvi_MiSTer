@@ -52,24 +52,29 @@ fi
 MILESTONES=$(echo "$TRACE_LINES" | awk '{pc=substr($2,1,6); if(pc!=last) {print NR" "pc; last=pc}}')
 MILESTONE_COUNT=$(echo "$MILESTONES" | wc -l | tr -d ' ')
 
-# Check for known boot stages
-HAS_ROM_INIT=$(echo "$MILESTONES" | grep -c "00A02E" || true)
-HAS_MAIN_STARTUP=$(echo "$MILESTONES" | grep -c "00A463" || true)
-HAS_HW_INIT=$(echo "$MILESTONES" | grep -c "00A14C" || true)
-HAS_RAM_TEST=$(echo "$TRACE_LINES" | grep -c "00A46AF0" || true)
-HAS_MEM_CLEAR=$(echo "$TRACE_LINES" | grep -c "00A4685E" || true)
+# Check for known boot stages.
+# Retargeted for the Mac IIvi 2026-07-15: the original LC II stage addresses
+# (00A02Exx/00A463xx/00A14Cxx/00A46AF0/00A4685E — 24-bit ROM at $A00000) can
+# never occur on this core (1MB ROM at $40800000, overlay-mirrored at $0), so
+# the check had FAILed unconditionally since the MacLCII import. IIvi markers
+# below were verified against a healthy 30-frame boot trace; same Universal-
+# ROM lineage, so the offsets echo the LC list ($xx2Exx POST, $xx14Cxx hw
+# init). The box-ID/BoxFlag table is documented at $4084AB4A (CLAUDE.md).
+HAS_OVERLAY=$(echo "$MILESTONES" | grep -c " 00002E" || true)
+HAS_ROM_HOME=$(echo "$MILESTONES" | grep -Ec " 408" || true)
+HAS_EARLY_INIT=$(echo "$MILESTONES" | grep -c " 40802E" || true)
+HAS_BOX_ID=$(echo "$MILESTONES" | grep -c " 4084AB" || true)
+HAS_STARTUP=$(echo "$MILESTONES" | grep -Ec " 40846[2-8]" || true)
+HAS_HW_INIT=$(echo "$MILESTONES" | grep -c " 40814C" || true)
 
 # Check last 1000 lines for stuck loop (same PC repeated)
 LAST_UNIQUE=$(echo "$TRACE_LINES" | tail -1000 | awk '{print substr($2,1,8)}' | sort -u | wc -l | tr -d ' ')
 
-# The ASC startup-chime feeds its FIFO by POLLING FIFOSTAT in a tiny 3-4-PC wait
-# loop at $A45E3A (read $804) .. $A45E44 (jmp). That loop legitimately spins tens
-# of thousands of times per refill — MAME's maclc2 does it 792k times across the
-# chime (docs/findings_asc_chime_mame_2026-06-15.md). Stopping mid-chime (e.g.
-# --run 90; the chime spans ~frames 28-94) therefore looks like a 3-PC "LOOP"
-# even though boot is fine. Detect that case so it is not mistaken for a hang.
-LAST_PCS=$(echo "$TRACE_LINES" | tail -1000 | awk '{print substr($2,1,8)}' | sort -u | tr -d ':' | tr '\n' ' ')
-IS_CHIME_WAIT=$(echo "$LAST_PCS" | grep -c "00A45E3A" || true)
+# (The LC II version special-cased its ASC boot-chime FIFOSTAT poll at
+# $A45E3A, a legitimate 3-PC spin that a mid-chime stop misreads as a hang —
+# docs/findings_asc_chime_mame_2026-06-15.md. The IIvi ROM's equivalent poll
+# PC hasn't been pinned down yet; if a run reports LOOP in an ASC-polling
+# region mid-chime, treat it as benign and re-run with more frames.)
 
 echo "=== CPU Boot Progress ==="
 echo "Total instructions: $TOTAL_LINES"
@@ -78,29 +83,26 @@ echo "Last PC:  $LAST_PC"
 echo "PC range transitions: $MILESTONE_COUNT"
 echo ""
 echo "Boot stages:"
-[ "$HAS_ROM_INIT" -gt 0 ]    && echo "  [x] ROM early init (A02Exx)"    || echo "  [ ] ROM early init (A02Exx)"
-[ "$HAS_MAIN_STARTUP" -gt 0 ] && echo "  [x] Main startup (A463xx)"      || echo "  [ ] Main startup (A463xx)"
-[ "$HAS_HW_INIT" -gt 0 ]     && echo "  [x] Hardware init (A14Cxx)"     || echo "  [ ] Hardware init (A14Cxx)"
-[ "$HAS_RAM_TEST" -gt 0 ]    && echo "  [x] RAM test (A46AF0)"          || echo "  [ ] RAM test (A46AF0)"
-[ "$HAS_MEM_CLEAR" -gt 0 ]   && echo "  [x] Memory clear (A4685E)"     || echo "  [ ] Memory clear (A4685E)"
+[ "$HAS_OVERLAY" -gt 0 ]    && echo "  [x] POST via \$0 overlay (00002Exx)"     || echo "  [ ] POST via \$0 overlay (00002Exx)"
+[ "$HAS_ROM_HOME" -gt 0 ]   && echo "  [x] ROM 32-bit home (\$408xxxxx)"        || echo "  [ ] ROM 32-bit home (\$408xxxxx)"
+[ "$HAS_EARLY_INIT" -gt 0 ] && echo "  [x] ROM-home early init (40802Exx)"      || echo "  [ ] ROM-home early init (40802Exx)"
+[ "$HAS_BOX_ID" -gt 0 ]     && echo "  [x] Box ID / BoxFlag (4084ABxx)"         || echo "  [ ] Box ID / BoxFlag (4084ABxx)"
+[ "$HAS_STARTUP" -gt 0 ]    && echo "  [x] Main startup (40846[2-8]xx)"         || echo "  [ ] Main startup (40846[2-8]xx)"
+[ "$HAS_HW_INIT" -gt 0 ]    && echo "  [x] Hardware init (40814Cxx)"            || echo "  [ ] Hardware init (40814Cxx)"
 echo ""
 
-if [ "$LAST_UNIQUE" -le 4 ] && [ "$IS_CHIME_WAIT" -gt 0 ]; then
-    echo "Status: CHIME WAIT (normal — in the ASC FIFO poll at \$A45E3A; the chime"
-    echo "        ends ~frame 94. Re-run with more frames, e.g. --run 150, to see"
-    echo "        boot continue past it. NOT a hang — see docs/findings_asc_chime_mame_2026-06-15.md)"
-elif [ "$LAST_UNIQUE" -le 3 ]; then
+if [ "$LAST_UNIQUE" -le 3 ]; then
     echo "Status: LOOP (last 1000 insns only $LAST_UNIQUE unique PCs)"
 else
     echo "Status: ADVANCING ($LAST_UNIQUE unique PCs in last 1000 insns)"
 fi
 
 # Determine exit code
-# Success = got past reset and reached at least ROM init
-if [ "$HAS_ROM_INIT" -gt 0 ]; then
+# Success = got past reset and reached the ROM's 32-bit home ($40800000+)
+if [ "$HAS_ROM_HOME" -gt 0 ]; then
     echo "Result: PASS"
     exit 0
 else
-    echo "Result: FAIL (never reached ROM init)"
+    echo "Result: FAIL (never reached the ROM home at \$408xxxxx)"
     exit 1
 fi
