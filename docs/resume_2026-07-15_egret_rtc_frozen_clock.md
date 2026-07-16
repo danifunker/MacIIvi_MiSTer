@@ -63,9 +63,25 @@ REMAINING: owner-gated deploy to .143 + hardware clock soak, then merge.**
    −0.149 ns HDMI-PLL violation is GONE; ALM 35,614 = −19 vs bad build,
    the level-IRQ change nets smaller). output_files/MacIIvi.rbf
    (Jul 15 23:57) is the deployable artifact.
-4. [PENDING — owner gate] Deploy to .143 + hardware soak: menu-bar clock
-   advancing 1:1 over ≥30 min. NO deploy without explicit request. Then
-   merge to main.
+4. [PASS — 2026-07-16] Deployed to .143 on owner request (md5-verified,
+   launcher confirmed core-up). 30.5-min hardware soak: Mac 1:31 AM @
+   host 07:40:01 → 2:02 AM @ 08:10:36 (+31 Mac min / +30m35s host; all
+   four checkpoints consistent with exact 1:1, screenshots
+   scratch/soak_t{0,1,2,3}.png). FREEZE CURED. Note: first post-deploy
+   boot bombed once in "CFM-68K Runtime Enabler" (bus error); clean
+   desktop boot on core reload — attributed to the dirty HFS volume from
+   rebooting the MiSTer under a live Mac; watch on future boots.
+
+## Follow-up identified during soak: +172 ppm rate bias (+14.8 s/day)
+
+Owner perceived the clock "a little fast". Root: the PLL's ACTUAL
+clk_sys is 50 MHz × 1165/128 ÷ 14 = 32.5055804 MHz (+171.7 ppm vs the
+32.5 MHz nominal the one-second divider assumes; see the STA Clocks
+table). Fix is one line: egret_wrapper.sv ONESEC_PERIOD 4062499 →
+4063197 (= round(4,063,197.545 actual cen Hz) − 1), residual −0.1 ppm
+(−10 ms/day). Needs rebuild + redeploy; DECISION PENDING with owner.
+Do NOT retune to the PLL's 4.194304 MHz outclk2 — the shared VCO can't
+generate it (nearest taps ±0.46%).
 
 ## Watch item RESOLVED: via6522 SR external-clock arming
 
