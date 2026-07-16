@@ -72,16 +72,23 @@ REMAINING: owner-gated deploy to .143 + hardware clock soak, then merge.**
    desktop boot on core reload — attributed to the dirty HFS volume from
    rebooting the MiSTer under a live Mac; watch on future boots.
 
-## Follow-up identified during soak: +172 ppm rate bias (+14.8 s/day)
+## Follow-up RESOLVED same day: +172 ppm rate bias (+14.8 s/day)
 
 Owner perceived the clock "a little fast". Root: the PLL's ACTUAL
 clk_sys is 50 MHz × 1165/128 ÷ 14 = 32.5055804 MHz (+171.7 ppm vs the
-32.5 MHz nominal the one-second divider assumes; see the STA Clocks
-table). Fix is one line: egret_wrapper.sv ONESEC_PERIOD 4062499 →
-4063197 (= round(4,063,197.545 actual cen Hz) − 1), residual −0.1 ppm
-(−10 ms/day). Needs rebuild + redeploy; DECISION PENDING with owner.
-Do NOT retune to the PLL's 4.194304 MHz outclk2 — the shared VCO can't
-generate it (nearest taps ±0.46%).
+32.5 MHz nominal the one-second divider assumed; see the STA Clocks
+table). Fixed on owner request (commit 8c65574, merged): ONESEC_PERIOD
+4062499 → 4063197 (= round(4,063,197.545 actual cen Hz) − 1), residual
+−0.11 ppm (~10 ms/day slow). Do NOT retune to the PLL's 4.194304 MHz
+outclk2 — the shared VCO can't generate it (nearest taps ±0.46%).
+The retuned netlist rolled the HDMI divclk negative on SEED 2 (−0.441);
+seed sweep landed SEED 5 = +0.081 all-met (history note in MacIIvi.qsf).
+Deployed 2026-07-16 ~09:33; owner confirms the clock runs in sync
+("looks really good"), desktop screenshot minute-synced mod DST.
+RELEASED as releases/MacIIvi_Unstable_20260716.rbf (md5 aec53ff7…,
+evidence PNGs alongside). Still open: DST hour (framework timestamp is
+fixed EST) + RTC epoch seed (+2082844800 + local offset) — the owner is
+preparing a new disk image addressing the year; re-check both after.
 
 ## Watch item RESOLVED: via6522 SR external-clock arming
 
