@@ -48,7 +48,7 @@ set_global_assignment -name ECO_OPTIMIZE_TIMING ON
 set_global_assignment -name PERIPHERY_TO_CORE_PLACEMENT_AND_ROUTING_OPTIMIZATION ON
 set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT LOW
-set_global_assignment -name SEED 2
+set_global_assignment -name SEED 5
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -364,8 +364,11 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 #   * Aggressive routability        -> resolves the routing congestion.
 #   * Register/logic duplication OFF -> overrides the ON's earlier in this file;
 #     keeps ALM down so the HDMI setup recovers (it was -0.425 with dup left on).
-# SEED stays 2 (line above): a sweep to SEED 3 dropped ALM to 90% but broke
-# CPU-domain (clk_sys) setup to -0.331 ns.
+# SEED history: 3 dropped ALM to 90% but broke CPU-domain (clk_sys) setup to
+# -0.331 ns. 2 closed for a long stretch (+0.166..+0.183 HDMI worst) but the
+# 2026-07-16 onesec-retune netlist rolled the HDMI divclk to -0.441 on it;
+# sweep on that netlist: 4 -> -0.060 (HDMI divclk), 5 -> +0.081 all met. The
+# violations were always HDMI-scaler-only; clk_sys/egret stayed >= +1.2.
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION OFF
 set_global_assignment -name ROUTER_LCELL_INSERTION_AND_LOGIC_DUPLICATION OFF
