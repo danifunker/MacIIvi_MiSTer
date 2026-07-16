@@ -183,6 +183,7 @@ wire [8:0]  ram_addr = addr13[8:0] - 9'h90;  // RAM offset
 reg [7:0]  pll_ctrl;     // PLL control (0x07)
 reg [7:0]  timer_ctrl;   // Timer control (0x08)
 reg [7:0]  onesec_ctrl;  // One-second control (0x12)
+reg        onesec_armed; // one-second counter armed (set on the firmware's first $12 write)
 reg [31:0] cycle_total;  // Total cycles for timer counter
 
 // Timer prescaler based on PLL setting
@@ -221,33 +222,49 @@ localparam ONESEC_PERIOD = 22'd8192;     // ~2ms (fast for simulation)
 localparam ONESEC_PERIOD = 22'd4062499;  // 1.000 s of cen pulses (see above)
 `endif
 
+// M68HC05E1 one-second register ($12) semantics, per MAME m68hc05e1
+// (onesec_w / seconds_tick, real-silicon oracle — confirmed to advance the
+// Mac wall clock 1:1):
+//   * bit 6 (0x40) = FLAG. Hardware SETS it on every 1 Hz tick; firmware
+//     clears it by writing 0 to bit 6 ("BCLR 6,$12" in the RTC ISR). It is
+//     readable at $12 and is what the seconds ISR polls.
+//   * bit 4 (0x10) = interrupt ENABLE. A tick raises the $FFF6 IRQ only when
+//     bit 4 is set — but the FLAG (and the Port C bit-1 poll flag) is set on
+//     every tick regardless, so a polled (bit4=0) RTC still advances.
+//   * the counter FREE-RUNS once the firmware first arms the timer (any $12
+//     write); on real silicon it is a fixed 32.768 kHz/32768 divider that the
+//     control register cannot stop.
+// The old model gated the COUNT on bit 4 and never surfaced the flag at $12,
+// so the seconds ISR never observed a tick -> the Mac clock was frozen
+// (2026-07-15 hardware soak: 0 min advance over 31 min). See onesec_armed
+// (set on the first $12 write in the register block below) and the $12 read
+// mux, which returns onesec_flag in bit 6.
 reg [21:0] onesec_counter;
-reg        onesec_irq_flag;  // Sticky flag, generates interrupt edge
-wire       onesec_irq_n = ~onesec_irq_flag;
+reg        onesec_flag;      // bit 6: set on tick, cleared by firmware write
+wire       onesec_irq_n = ~(onesec_flag & onesec_ctrl[4]);  // IRQ gated by enable
 
 always @(posedge clk) begin
     if (reset) begin
         onesec_counter <= 22'd0;
-        onesec_irq_flag <= 1'b0;
+        onesec_flag    <= 1'b0;
     end else if (cen) begin
-        // Count when one-second timer is enabled (onesec_ctrl bit 4)
-        if (onesec_ctrl[4]) begin
+        // Free-running once the firmware has armed the timer (onesec_armed).
+        if (onesec_armed) begin
             if (onesec_counter >= ONESEC_PERIOD) begin
                 onesec_counter <= 22'd0;
-                onesec_irq_flag <= 1'b1;
-                `ifdef VERBOSE_TRACE
-                $display("EGRET_ONESEC[%0d]: Timer fired! Setting PC1 and IRQ", cycle_count);
+                onesec_flag    <= 1'b1;
+                `ifdef SIMULATION
+                $display("EGRET_ONESEC[%0d]: Timer fired! flag set, IRQ en=%b", cycle_count, onesec_ctrl[4]);
                 `endif
             end else begin
                 onesec_counter <= onesec_counter + 22'd1;
             end
         end
 
-        // Clear IRQ flag when firmware clears bit 6 of onesec_ctrl ($12)
-        // The ISR does "BCLR 6,$12" as its last action before RTI
+        // Firmware clears the flag by writing 0 to bit 6 of $12 (ISR "BCLR 6,$12").
         if (port_cs && !cpu_wr && cpu_addr[4:0] == 5'h12) begin
             if (!(cpu_dout & 8'h40)) begin  // Writing 0 to bit 6
-                onesec_irq_flag <= 1'b0;
+                onesec_flag <= 1'b0;
             end
         end
     end
@@ -607,6 +624,7 @@ always @(posedge clk) begin
         pll_ctrl <= 8'h00;
         timer_ctrl <= 8'h00;
         onesec_ctrl <= 8'h00;
+        onesec_armed <= 1'b0;   // one-second timer starts on the firmware's first $12 write
         cycle_total <= 32'h0;
         timer_prescale <= 16'h0;
         timer_prescale_max <= 16'd1024;
@@ -670,8 +688,9 @@ always @(posedge clk) begin
                 $display("EGRET[%0d]: Timer ctrl write = 0x%02x", cycle_count, cpu_dout);
                 `endif
             end
-            5'h12: begin  // One-second timer
-                onesec_ctrl <= cpu_dout;
+            5'h12: begin  // One-second timer control: arm the free-running counter
+                onesec_ctrl  <= cpu_dout;
+                onesec_armed <= 1'b1;
             end
         endcase
         end // port_cs write
@@ -679,7 +698,7 @@ always @(posedge clk) begin
         // One-second timer hardware: set Port C bit 1 when timer fires
         // Per MAME m68hc05e1: m_portc_data |= 0x02 on one-second tick
         // This flag persists until firmware clears it (via Port C write)
-        if (onesec_irq_flag && !pc_latch[1]) begin
+        if (onesec_flag && !pc_latch[1]) begin
             pc_latch[1] <= 1'b1;
             `ifdef VERBOSE_TRACE
             $display("EGRET_ONESEC[%0d]: Setting PC1 flag (Port C bit 1)", cycle_count);
@@ -755,13 +774,18 @@ always @(posedge clk) begin
             `endif
         end else if (ram_cs && !cpu_wr && cen) begin  // !cpu_wr means write
             intram[ram_addr] <= cpu_dout;
+        `ifdef SIMULATION
+        // $CC is the firmware's seconds counter — ONLY the $1E10 one-second
+        // ISR increments it, so this line is the ISR-liveness probe for the
+        // frozen-clock investigation (proves the tick IRQ was taken).
+        if (ram_addr == 9'h3C) begin
+            $display("EGRET_CC_WRITE[%0d]: PC=%04x $CC=%02x",
+                     cycle_count, last_pc, cpu_dout);
+        end
+        `endif
         `ifdef VERBOSE_TRACE
         if (ram_addr == 9'h04) begin
             $display("EGRET_RAM_WRITE[%0d]: PC=%04x addr=$94 data=%02x",
-                     cycle_count, last_pc, cpu_dout);
-        end
-        if (ram_addr == 9'h3C) begin
-            $display("EGRET_RAM_WRITE[%0d]: PC=%04x addr=$CC data=%02x",
                      cycle_count, last_pc, cpu_dout);
         end
         if (ram_addr == 9'h13) begin
@@ -865,7 +889,7 @@ always @(*) begin
             end
             5'h08: cpu_din_r = timer_ctrl;     // Timer control
             5'h09: cpu_din_r = timer_counter;  // Timer counter (8-bit, free-running)
-            5'h12: cpu_din_r = onesec_ctrl;    // One-second timer control
+            5'h12: cpu_din_r = {onesec_ctrl[7], onesec_flag, onesec_ctrl[5:0]};  // $12: bit6 = hw one-second flag
             default: cpu_din_r = 8'h00;  // Unmapped ports return 0 (makes bit tests fail safely)
         endcase
     end else if (ram_cs) begin

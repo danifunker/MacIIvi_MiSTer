@@ -939,7 +939,7 @@ module via6522 (
             end
         end
 
-        `ifdef VERBOSE_TRACE
+        `ifdef SIMULATION
         if (rising == 1'b1 && serial_event == 1'b1) begin
             $display("VIA: SR IRQ fired! SR=0x%02x, IFR before=0x%02x", shift_reg, irq_flags);
         end

@@ -178,19 +178,31 @@ module m68hc05_core (
 
         end else if (cen) begin
             // Clock enabled - normal operation
-            // IRQ edge detection for all three sources
             // Priority: one-second (highest) > timer > external IRQ (lowest)
+            //
+            // The INTERNAL sources (one-second $12.6, timer $08.7) are
+            // LEVEL-sensitive: their flags are latched in the peripheral
+            // registers and stay asserted until the firmware's ISR clears
+            // them, so the request must be re-sampled whenever I is clear
+            // (real 68HC05 / MAME m68hc05e1 behavior). Edge-detecting them
+            // dropped any tick whose falling edge landed inside a SEI window
+            // or another ISR (flagI=1): the line then sat low forever, no
+            // further one-second ISRs ran, the Egret never sent its
+            // per-second tick packet to the host again, and the Mac's
+            // time-of-day clock froze (2026-07-15 frozen-clock RCA). The
+            // external /IRQ pin keeps edge sensing (tied inactive in
+            // egret_wrapper).
             irq_d <= irq;
             timer_irq_d <= timer_irq;
             onesec_irq_d <= onesec_irq;
             if (flagI == 1'b0 && !irqRequest) begin
-                if ((onesec_irq == 1'b0) && (onesec_irq_d == 1'b1)) begin
+                if (onesec_irq == 1'b0) begin
                     irqRequest <= 1'b1;
                     irq_source <= 2'd2;
                     `ifdef VERBOSE_TRACE
                     $display("HC05: ONE-SEC IRQ request! PC=%04x", regPC);
                     `endif
-                end else if ((timer_irq == 1'b0) && (timer_irq_d == 1'b1)) begin
+                end else if (timer_irq == 1'b0) begin
                     irqRequest <= 1'b1;
                     irq_source <= 2'd1;
                     `ifdef VERBOSE_TRACE
