@@ -20,7 +20,19 @@ Key references:
 - `docs/VASP_RETARGET.md` — V8→VASP delta plan + SDRAM layout + decisions
 - `68030_CPU_IMPLEMENTATION_PLAN.md`, `68030_PMMU_TESTBENCH.md` — CPU/PMMU
 - Local MAME source tree: `../mame/src/mame/apple/{maciivx,vasp,v8,maclc}.cpp`
-  — always check MAME before guessing hardware behavior.
+  (tree = 0.288-132) — always check MAME before guessing hardware behavior.
+- **MAME version discipline (owner decision 2026-07-17):** review against
+  **0.288 source** (the local tree) as primary reference, BUT the installed
+  runtime oracle and every HW-validated behavior of this core to date is
+  **0.264** — and 0.288's sound/IRQ rework (afed5d318e4) is twice-suspect
+  (error-41 hunt; the asc_v8 semantics port 6c95e20→reverted bc31773 broke
+  app sound/froze games/slowed the clock on HW). When 0.288 and 0.264
+  disagree, treat neither as automatically right: port coherent subsystem
+  PAIRS (e.g., ASC + pseudoVIA latch semantics together, never one half),
+  and gate on hardware sound/clock validation. 0.288 pairs maciivi's
+  level-style ASC with the EDGE-latch base pseudovia — a fragile contract;
+  the LC pairs it with a level-through v8_pseudovia (the ASCTester-validated
+  combo). Our asc.sv+pseudovia.sv pair is 0.264-faithful and HW-proven.
 
 ## Hard rules
 
