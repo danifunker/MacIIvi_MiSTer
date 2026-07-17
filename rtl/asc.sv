@@ -99,16 +99,12 @@ module asc(
 	wire pop_a        = pop_tick && (count_a != 0);
 	wire fifo_a_push  = fifo_a_write && (count_a < 1024) && !fifo_clear;
 
-	// Live FIFO A status byte ($804), per MAME 0.288 asc_v8 (validated there
-	// against a real Mac LC ASCTester run — "804Idle: $03"): bit0 =
-	// STAT_HALF_FULL_A (cap < 0x200, half-empty), bit1 = STAT_EMPTY_OR_FULL_A
-	// which on the V8 is EMPTY ONLY (cap == 0) — NOT full. (An earlier
-	// revision also set bit1 at FULL per pre-0.288 MAME; 0.288's real-silicon
-	// pass corrected it, and the IIvi ROM's $804 pollers — fill-pacing waits
-	// on bit1=EMPTY and drain-waits on (stat&3)==3 — are all satisfied by the
-	// empty-only form.)
+	// Live FIFO A status byte ($804): bit0 = STAT_HALF_FULL_A (half-empty),
+	// bit1 = STAT_EMPTY_OR_FULL_A. Per MAME asc_v8, bit1 is set when the FIFO is
+	// EMPTY (cap==0) OR FULL (cap>=0x3ff) — the ROM FIFO POST ($A45F2C) fills the
+	// FIFO and spins until bit1 reports FULL, so bit1 must include the full case.
 	wire [7:0] fifo_stat = {6'b0,
-	                        (count_a == 0),
+	                        (count_a == 0) || (count_a >= 11'd1023),
 	                        (count_a < 512)};
 
 	integer i;
@@ -165,22 +161,15 @@ module asc(
 				endcase
 			end
 
-			// IRQ: half-empty FIFO A, per MAME 0.288 asc_v8 exactly. The V8's
-			// IRQ is a LEVEL: (re)asserted at every output sample while the
-			// FIFO sits below half (real LC silicon fires ~50k idle IRQs in
-			// ASCTester — the storm is authentic), and a FIFOSTAT ($804) read
-			// deasserts it ONLY when the FIFO is at/above half. The RBV-style
-			// pseudoVIA edge-latches this line, so a steady level = ONE latched
-			// event per below-half crossing. Our previous model cleared on
-			// every $804 read and re-asserted next sample tick, turning the
-			// level into a ~1.4 kHz EDGE stream — each Sound Manager ISR pass
-			// (read status, RTE with FIFO still low) then re-interrupted
-			// forever: the zero-PRAM InitUtil SysBeep boot wedge.
-			// Order matters: the assert term is evaluated after the read-clear
-			// so a same-cycle read cannot drop a below-half level.
-			if (reg_read && addr[3:0] == 4'h4 && !(count_a < 512))
+			// IRQ: half-empty FIFO A. MAME re-evaluates this once per OUTPUT
+			// SAMPLE (in sound_stream_update), not every clock. Re-asserting every
+			// clock would re-interrupt the CPU before its ISR can RTE — an
+			// interrupt storm that hangs the boot once the chime driver unmasks
+			// the ASC IRQ. So only (re)assert on the sample tick; a FIFOSTAT read
+			// clears it and it then stays low until the next tick (~1460 clocks).
+			if (reg_read && addr[3:0] == 4'h4)
 				irq <= 1'b0;
-			if (pop_tick && ((count_a - {10'b0, pop_a}) < 512))
+			else if (pop_tick && (count_a < 512))
 				irq <= 1'b1;
 		end
 	end
