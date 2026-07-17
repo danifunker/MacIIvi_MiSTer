@@ -252,6 +252,10 @@ module m68hc05_core (
                         opcode <= 8'h83;  // Special SWI interrupt
                         addrMux <= addrSP;
                         mainFSM <= 4'h3;
+                        `ifdef SIMULATION
+                        $display("HC05_IRQENT[%0t]: src=%0d intPC=%04x A=%02x X=%02x SP=%04x HINZC=%b%b%b%b%b",
+                                 $time, irq_source, regPC, regA, regX, regSP, flagH, flagI, flagN, flagZ, flagC);
+                        `endif
                     end else begin
                         opcode <= datain;
                         `ifdef VERBOSE_TRACE
@@ -1425,6 +1429,11 @@ module m68hc05_core (
                             regPC[7:0] <= datain;
                             addrMux <= addrPC;
                             mainFSM <= 4'h2;
+                            `ifdef SIMULATION
+                            if (opcode == 8'h80)
+                                $display("HC05_RTIEXIT[%0t]: retPC=%04x A=%02x X=%02x SP=%04x HINZC=%b%b%b%b%b",
+                                         $time, {regPC[15:8], datain}, regA, regX, regSP, flagH, flagI, flagN, flagZ, flagC);
+                            `endif
                         end
                         
                         8'h83: begin  // SWI / IRQ entry
