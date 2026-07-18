@@ -42,8 +42,15 @@ Key references:
 - **Line endings**: repo policy is LF (`core.autocrlf=false`, enforced for
   *.sh via .gitattributes). The sim toolchain runs under **WSL** — CRLF in a
   shell script or Makefile breaks it.
-- **No MiSTer hardware deploys** until explicitly requested — this core is in
-  its simulator-first phase.
+- **Hardware deploys are ask-first**: never deploy/reboot the MiSTer without
+  the owner's go for that specific build. Once authorized, HW validation on
+  the device is the standard, decisive loop (deploy =
+  `bash scripts/deploy_screenshot.sh` from Git-Bash, never WSL).
+- **Framework files law** (adopted 2026-07-18 from MacLC `0d38a1a`): `sys/`
+  is off-limits except wholesale template updates — constrain framework
+  behavior from `rtl/` + qsf/sdc only. Q17 Lite has NO per-instance
+  RAM_BLOCK_TYPE qsf assignment (illegal name); per-instance
+  AUTO_SHIFT_REGISTER_RECOGNITION is legal.
 - Work happens on feature branches, merged to `main` once validated (policy
   changed 2026-07-15 by the project owner; was direct-to-main).
 
