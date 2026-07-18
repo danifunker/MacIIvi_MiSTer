@@ -6,6 +6,26 @@ this core. Everything below is verified against this repo's fresh fit report
 deployed/validated `ed92857f` rbf) and against the MacLC commits by diff, not
 by assumption.
 
+## OUTCOME — DELIVERED + HW-VALIDATED (2026-07-18)
+
+Branch landed in four commits (`e6dbbe6` qsf repair → `6697281` docs →
+`2e910af` tier 1 → `8c82738` prefetch). **543 → 495/553 M10K blocks (−48,
+8.7% of device)**, content bits 4,339,263 → 4,018,944, STA met on both RTL
+commits (worst +0.258 / +0.207, SEED 5).
+
+**Hardware validation on .143** (rbf `9de08c35`, owner-authorized deploy):
+boots happy-Mac → 7.6.1 → **Finder on the mdc824 card**; boot-volume window
+renders a real HFS catalog (the SCSI pseudo-DMA READ path — the exact
+prefetch redesign — returning correct data); ADB mouse tracks; RTC advancing;
+**boot chime pitch confirmed correct by the owner** (the regression canary for
+any RAM/divider change). Evidence: `releases/hw_143_m10k_*_20260718.png`.
+Sim corroboration: `scsi_bench` full alignment sweep 0 fails (pre & post),
+1300-frame boot A/B bit-identical to baseline, F2200 soak = 24 reads +
+1 write through the prefetch dpram, no timeout/stall/wedge.
+
+Not-yet-exercised (lower risk, bench+soak+MacLC-HW cover the mechanism):
+extension-heavy read stress, large-copy write-verify, CD mount.
+
 ## Baseline (main @ c7f88b3 + working-tree qsf repair)
 
 | Metric | Value |
