@@ -790,6 +790,26 @@ always @(posedge clk) begin
             $display("EGRET_CC_WRITE[%0d]: PC=%04x $CC=%02x",
                      cycle_count, last_pc, cpu_dout);
         end
+        // PRAM-region writes (intram $70-$16F = CPU $100-$1FF = PRAM $00-$FF):
+        // one line per byte the FIRMWARE lands in PRAM, with its PC — the
+        // zero-PRAM InitUtil write-verify livelock hunt (identifies which
+        // host write-command handler fails to land its byte; the boot-copy
+        // injection uses a different code path and is not logged here).
+        if (ram_addr >= 9'h070 && ram_addr <= 9'h16F) begin
+            $display("EGRET_PRAM_WRITE[%0d]: PC=%04x pram[%02x]=%02x",
+                     cycle_count, last_pc, ram_addr - 9'h070, cpu_dout);
+        end
+        // Work-RAM window (intram $00-$5F = CPU $90-$EF, stack excluded):
+        // covers the cmd-$08 trampoline STAGING bytes (CPU $A7-$AA = opcode/
+        // addrH/addrL/RTS — shows the firmware's computed target address for
+        // every direct-memory write), the alarm/compare vars, and the $B3
+        // livelock target. Gated to the storm era to keep volume sane. Note
+        // last_pc freezes at the last ROM fetch, so trampoline-executed
+        // stores report the JSR-site PC.
+        if (ram_addr <= 9'h05F && cycle_count >= 32'd30_000_000) begin
+            $display("EGRET_WORK_WRITE[%0d]: PC=%04x cpu$%02x=%02x",
+                     cycle_count, last_pc, ram_addr + 9'h090, cpu_dout);
+        end
         `endif
         `ifdef VERBOSE_TRACE
         if (ram_addr == 9'h04) begin
