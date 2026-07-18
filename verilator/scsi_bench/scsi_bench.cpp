@@ -20,7 +20,10 @@
 // Usage: ./obj_dir/Vscsi_bench_top                 full sweep matrix
 //        ... --mode word --ds 0 --gap 2 --detail   single run, per-read log
 //        ... --sectors 4 --hps 6000                transfer size / HPS latency
-//        ... --id 6                                target SCSI ID (slot 0 = 6 @HEAD)
+//        ... --id 6                                target SCSI ID (this core's
+//                                                  generate maps slot i -> ID i,
+//                                                  so slot 0 = --id 0; the old
+//                                                  "slot 0 = 6" note was MacLC)
 
 #include <cstdio>
 #include <cstdint>
@@ -558,7 +561,7 @@ int main(int argc, char** argv) {
 	top = new Vscsi_bench_top;
 
 	// defaults
-	int sectors = 2, hps_lat = 600, scsi_id = 6, id_slot = 0;
+	int sectors = 2, hps_lat = 600, scsi_id = 0, id_slot = 0;
 	int one_ds = -1, one_gap = -1;
 	const char* one_mode = nullptr;
 	bool detail = false;

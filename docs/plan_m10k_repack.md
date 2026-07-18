@@ -95,9 +95,10 @@ patterns are included anyway as future-proof no-ops.
 - The CD target instantiates the same scsi_dpram → gets the prefetch for
   free; MacLC's whole cd-audio campaign ran ON the prefetch dpram afterward
   (extra confidence in the mechanism under CD-read patterns).
-- The ported scsi_dpram carries its own `(* ramstyle = "M10K,no_rw_check" *)`
-  pin on `ram_ab` (a2ae04d included it; visible at MacLC HEAD scsi.v:1978) —
-  the surviving array stays protected with zero extra work.
+- `ram_ab` pin: a2ae04d shipped the redesign UNPINNED (the 2544a1f merge had
+  silently dropped bae8fd8's pin), and MacLC re-added it 2026-07-18 in
+  `effb436` after this port review flagged it. Our transplanted module
+  carries the `(* ramstyle = "M10K,no_rw_check" *)` pin from day one.
 - `sys/` stays untouched (see provenance below). The framework RAMs
   (osd_buffer, ascal tables) are unpinned here, same as MacLC post-law;
   protection = the headroom this branch creates + the per-commit zero-flip
@@ -143,13 +144,17 @@ the same "almost 10%" MacLC got, from the same moves.
    wording (HW validation is standard practice; deploys stay ask-first,
    owner-authorized) and codify the framework-files law (sys/ off-limits
    except wholesale template updates; constrain from rtl/ + qsf/sdc only).
-1. **tier 1**: six `AUTO_SHIFT_REGISTER_RECOGNITION OFF` instance patterns
-   (MacLC's five + one for the second `vga_out` din1 instance; confirm each
-   lands via map.rpt "Source assignments" sections) + `(* ramstyle = "MLAB" *)`
-   on `rtl/adb_device.sv` kbdFifo and `rtl/swim.v` ism_param (port of
-   MacLC 9c5d47f — rtl/ files only, law-compliant; the qsf instance
-   assignments are the legal Q17 kind, HW-proven in MacLC's fit). Expect
-   −9 blk, +~350 regs, −~3.3K bits, zero flips.
+1. **tier 1** (LANDED as `2e910af`, outcome differs from the MacLC recipe):
+   `AUTO_SHIFT_REGISTER_RECOGNITION OFF` **globally**, not per-instance —
+   three fit iterations proved Q17's shift-taps conversion works a global
+   budget, so pinning the five known instances just rolled the block onto
+   the next candidate each time (ascal `o_v_poly_phase` 320b → vga_out
+   `csync1` 78b → vga_osd `de2` 78b). This core's complete altshift_taps
+   inventory is junk-class (largest 324b; no 4–6Kbit ascal shifters like
+   MacLC kept), so global OFF costs ≤~640 regs and retires the class.
+   Plus `(* ramstyle = "MLAB" *)` on kbdFifo/ism_param (9c5d47f port).
+   Landed audit: 534/553 (−9 blk), −831 bits, +779 regs, ALM −180, pure-
+   deletion RAM diff (zero flips), STA met (+0.258 worst, SEED 5).
 2. **pdma-prefetch port**: transplant `a2ae04d`'s scsi_dpram module (its
    `ram_ab` `"M10K,no_rw_check"` pin comes with it) + the ncr5380
    dma_settle 4→8 widening. Expect −39 blk, −319,488 bits, +~500 regs,
