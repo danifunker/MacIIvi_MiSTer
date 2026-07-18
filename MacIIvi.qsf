@@ -378,3 +378,20 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/dbg_probes.sv
 set_global_assignment -name VERILOG_FILE rtl/mfm_track_encoder.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/vram_bram.sv
 set_global_assignment -name VERILOG_FILE rtl/pll_video.v
+
+# --- m10k-repack tier 1: stop tiny delay-line shifters from eating M10K blocks.
+# Baseline fit (2026-07-17 22:47, 543/553): 7 blocks held by altshift_taps at
+# 1-4% utilization (shadowmask vid 324b, vga_out/vga_scaler_out din1 90/93b,
+# yc phase 36b) plus 2 more by tiny core RAMs (adb kbdFifo 64b, swim
+# ism_param 128b — those are pinned to MLAB in rtl/). Recognition-off is
+# GLOBAL, not per-instance: Q17's shift-taps conversion works a global
+# budget, so per-instance pins just moved the block to the next candidate
+# (attempt 1 rolled ascal o_v_poly_phase_a2.t3 320b IN, attempt 2 vga_out
+# csync1 78b, attempt 3 osd vga_osd de2 78b — whack-a-mole cannot converge).
+# This core's COMPLETE altshift_taps inventory is junk-class (324/96/93/90/
+# 36 bits; no 4-6Kbit ascal shifters like the ones MacLC deliberately kept),
+# so global OFF costs at most ~640 registers and retires the whole class.
+# Framework constrained from OUR qsf; sys/ stays stock per the framework
+# files law. If a future port brings a legitimately BIG shifter, re-enable
+# per-instance: ... AUTO_SHIFT_REGISTER_RECOGNITION ON -to "<instance>".
+set_global_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF
