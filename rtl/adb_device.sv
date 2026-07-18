@@ -97,6 +97,7 @@ module adb_device(
 	reg [3:0]  send_bits;
 	reg [1:0]  send_byte;
 	reg        cur_bit;
+	reg [17:0] low_dur;      // low phase of the current bit cell (captured at rise)
 	reg [15:0] lrx_sr;       // Listen data shift register (16-bit Register 3 payload)
 	reg        lrx_target;   // which device this Listen addresses: 1 = mouse, 0 = keyboard
 `ifdef USE_ADB_ISSP
@@ -117,7 +118,7 @@ module adb_device(
 
 	always @(posedge clk) begin
 		if (reset) begin
-			hl_d <= 1'b1; dur <= 0; st <= S_IDLE; dev_line <= 1'b1;
+			hl_d <= 1'b1; dur <= 0; low_dur <= 0; st <= S_IDLE; dev_line <= 1'b1;
 			command <= 0; bitcnt <= 0;
 			kbd_addr <= ADDR_KBD; mouse_addr <= ADDR_MOUSE;
 			resp_len <= 0; resp0 <= 0; resp1 <= 0;
@@ -146,6 +147,18 @@ module adb_device(
 			// duration counter (cycles since last observed-line edge)
 			if (fall || rise) dur <= 0;
 			else if (dur != 18'h3FFFF) dur <= dur + 18'd1;
+
+			// low-phase capture: at a rise, dur holds the LOW phase of the
+			// current bit cell (cell = low then high; the fall that follows
+			// compares the high phase against this). Ratio decoding makes the
+			// bit value cell-rate-invariant per the ADB spec ("1" = low
+			// shorter than high), where the old fixed T_BITTH=470 threshold
+			// only decoded correctly at the one cell rate it was tuned for —
+			// the Egret firmware's Listen-R3 payload cells run faster than
+			// its command cells, which made address-relocation payloads read
+			// as garbage and stranded devices during the zero-PRAM boot's
+			// full ADB enumeration (the happy-Mac livelock).
+			if (rise) low_dur <= dur;
 
 			// ---- PS2 keyboard: decode scan code on the synchronized strobe edge ----
 			key_pending <= 1'b0;
@@ -705,7 +718,7 @@ module adb_device(
 			end
 			S_BITS: begin
 				if (fall) begin
-					command <= {command[6:0], (dur > T_BITTH)};
+					command <= {command[6:0], (dur > low_dur)};
 					bitcnt  <= bitcnt + 4'd1;
 					if (bitcnt == 4'd7) st <= S_TSTOP;
 				end
@@ -732,6 +745,11 @@ module adb_device(
 `endif
 					end
 					else if (cmd_type == 2'b11) begin // Talk
+`ifdef SIMULATION
+						$display("ADB_TALK[%0t]: addr=%x reg=%0d (kbd@%x mouse@%x)%s",
+						         $time, cmd_addr, cmd_reg, kbd_addr, mouse_addr,
+						         (cmd_addr != kbd_addr && cmd_addr != mouse_addr) ? " NO-DEVICE" : "");
+`endif
 						if (cmd_addr == kbd_addr) begin
 							case (cmd_reg)
 								2'd3: begin resp0 <= {1'b0,1'b1,1'b1,1'b0,kbd_addr}; resp1 <= 8'h02; resp_len <= 2'd2; end
@@ -844,7 +862,7 @@ module adb_device(
 			S_LRX_BITS: begin
 				if (rise && (dur > T_ATTN)) begin st <= S_ATTN; command <= 0; bitcnt <= 0; end
 				else if (fall) begin
-					lrx_sr <= {lrx_sr[14:0], (dur > T_BITTH)};  // sample data bit (long high = 1)
+					lrx_sr <= {lrx_sr[14:0], (dur > low_dur)};  // "1" = high phase longer than low (rate-invariant)
 					bitcnt <= bitcnt + 4'd1;
 					if (bitcnt == 4'd15) st <= S_LRX_DONE;       // 16 data bits captured
 				end
@@ -858,6 +876,12 @@ module adb_device(
 					if (lrx_target) mouse_addr <= lrx_sr[11:8];
 					else            kbd_addr   <= lrx_sr[11:8];
 				end
+`ifdef SIMULATION
+				$display("ADB_LRX_DONE[%0t]: %s payload=%04x -> %s (newaddr=%x handler=%02x)",
+				         $time, lrx_target ? "mouse" : "kbd", lrx_sr,
+				         (lrx_sr[7:0] != 8'hFF && lrx_sr[11:8] != 4'd0) ? "RELOCATE" : "IGNORED",
+				         lrx_sr[11:8], lrx_sr[7:0]);
+`endif
 `ifdef USE_ADB_ISSP
 				dbg_listen_done <= dbg_listen_done + 8'd1;
 `endif
