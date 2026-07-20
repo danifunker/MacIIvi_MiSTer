@@ -67,7 +67,7 @@ module emu
 		// CD-ROM (SCSI ID 3). ISO/TOAST (TO* matches .toast) are raw 2048-byte
 		// images and work today; CUE/BIN/CHD are listed for the Main_MiSTer
 		// translation layer — a 2048-byte-sector .bin also works mounted directly.
-		"SC3,ISOTO*CUEBINCHD,Mount CD-ROM;",
+		"SC4,ISOTO*CUEBINCHD,Mount CD-ROM;",
 		"OI,CD-ROM Drive,Enabled,Disabled;",
 		"-;",
 		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
@@ -167,8 +167,8 @@ module emu
 
 	localparam SCSI_DEVS = 2;          // SCSI block devices -> hps_io slots 0,1
 	localparam VD_PRAM   = 2;          // PRAM NVRAM save image -> hps_io slot 2
-	localparam VD_CDROM  = 3;          // CD-ROM image (SCSI ID 3) -> hps_io slot 3
-	localparam VD_TOOLBOX = 4;         // BlueSCSI Toolbox shared folder -> hps_io slot 4
+	localparam VD_TOOLBOX = 3;         // BlueSCSI Toolbox shared folder -> hps_io slot 3
+	localparam VD_CDROM  = 4;          // CD-ROM image (SCSI ID 3) -> hps_io slot 4
 	localparam VDNUM     = 5;          // total hps_io block devices
 
 	// the status register is controlled by the on screen display (OSD)
@@ -213,7 +213,7 @@ module emu
 	assign sd_buff_din[0] = scsi_buff_din[0];
 	assign sd_buff_din[1] = scsi_buff_din[1];
 
-	// CD-ROM (SCSI ID 3) dedicated slot (3): read-only block device driven by
+	// CD-ROM (SCSI ID 3) dedicated slot (4): read-only block device driven by
 	// the cdrom target through dataController. cd_wr is tied off — the target
 	// never issues writes (read-only device, WRITE commands CHECK).
 	wire [31:0] cd_lba;
@@ -230,14 +230,14 @@ module emu
 	// hardware A/B lever given the SCSI wedge history.
 	wire        cd_enable  = ~status[18];
 
-	// BlueSCSI Toolbox dedicated slot (4): isolated block device driven by the
+	// BlueSCSI Toolbox dedicated slot (3): isolated block device driven by the
 	// primary SCSI target (ID 0) through dataController. There is deliberately
-	// NO OSD "SC4" file-picker entry — the Toolbox shared folder is exposed by
+	// NO OSD "SC3" file-picker entry — the Toolbox shared folder is exposed by
 	// the HPS (Main_MiSTer) handler, not user-mounted, matching MacLC. Inert
-	// (graceful degradation) until a MacIIvi Main build mounts a shared folder
-	// here (tb_mounted) and answers the round-trips; see the BlueSCSI core/HPS
-	// contract. SLOT-INDEX CONTRACT: the Main Toolbox handler for MacIIvi MUST
-	// use slot 4 (MacLC uses slot 3 there — CD-ROM already owns slot 3 here).
+	// (graceful degradation) until the HPS mounts a shared folder here
+	// (tb_mounted) and answers the round-trips; see the BlueSCSI core/HPS
+	// contract. Slot layout matches MacLC exactly (Toolbox 3, CD-ROM 4), so the
+	// HPS needs NO per-core slot override — maclc_toolbox_slot() = TOOLBOX_SLOT.
 	wire [31:0] tb_lba;
 	wire        tb_rd, tb_wr;
 	wire [15:0] tb_buff_din;
@@ -1876,7 +1876,7 @@ module emu
 		.cd_io_ack(cd_ack),
 		.cd_sd_buff_din(cd_buff_din),
 
-		// BlueSCSI Toolbox dedicated slot (4) — Main-managed shared folder.
+		// BlueSCSI Toolbox dedicated slot (3) — Main-managed shared folder.
 		.tb_mounted(tb_mounted),
 		.tb_lba(tb_lba),
 		.tb_rd(tb_rd),
