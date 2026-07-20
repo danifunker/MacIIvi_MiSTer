@@ -119,6 +119,25 @@ module dataController_top(
 	input                   cd_io_ack,
 	output           [15:0] cd_sd_buff_din,
 
+	// ---- BlueSCSI Toolbox dedicated block interface (primary target / ID 0) ----
+	input                   tb_mounted,
+	output           [31:0] tb_lba,
+	output                  tb_rd,
+	output                  tb_wr,
+	input                   tb_ack,
+	output           [15:0] tb_buff_din,
+
+	// ---- CD audio PCM (from the CDROM target's cd_audio engine) ----
+	output signed    [15:0] cd_snd_l,
+	output signed    [15:0] cd_snd_r,
+
+	// ---- CD-audio engine / CD target JTAG visibility (CDA0..CDA4) ----
+	output           [31:0] dbg_cda0,
+	output           [31:0] dbg_cda1,
+	output           [31:0] dbg_cda2,
+	output           [31:0] dbg_cda3,
+	output           [31:0] dbg_cda4,
+
 	// ---- PRAM persistence pass-through (to the Egret's pram[]) ----
 	input             [7:0] pram_load_addr,
 	input             [7:0] pram_load_data,
@@ -413,6 +432,18 @@ module dataController_top(
 		.cd_io_ack(cd_io_ack),
 		.cd_sd_buff_din(cd_sd_buff_din),
 
+		// BlueSCSI Toolbox dedicated slot (primary target / ID 0) pass-through.
+		.tb_mounted(tb_mounted),
+		.tb_lba(tb_lba),
+		.tb_rd(tb_rd),
+		.tb_wr(tb_wr),
+		.tb_ack(tb_ack),
+		.tb_buff_din(tb_buff_din),
+
+		// CD audio PCM from the CDROM target's cd_audio playback engine
+		.cd_snd_l(cd_snd_l),
+		.cd_snd_r(cd_snd_r),
+
 		// JTAG probe feeds (consumed by dbg_probes.sv in the FPGA top)
 		.dbg_scsi(dbg_scsi),
 		.dbg_scsi2(dbg_scsi2),
@@ -421,7 +452,13 @@ module dataController_top(
 		.dbg_scsi5(dbg_scsi5),
 		.dbg_ncr(dbg_ncr),
 		.dbg_ncr2(dbg_ncr2),
-		.dbg_wr(dbg_wr)
+		.dbg_wr(dbg_wr),
+		// CD-audio engine + CD target command visibility (JTAG CDA0..CDA4)
+		.dbg_cda0(dbg_cda0),
+		.dbg_cda1(dbg_cda1),
+		.dbg_cda2(dbg_cda2),
+		.dbg_cda3(dbg_cda3),
+		.dbg_cda4(dbg_cda4)
 	);
 
 	// onesec (VIA1 CA2) is derived from the fixed 60.15 Hz system tick — see

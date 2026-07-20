@@ -9,6 +9,7 @@ module scsi
 
 	// scsi interface
 	input 	  rst, // bus reset from initiator
+	input 	  sys_rst, // system reset (CD engine state survives bus resets)
 	input 	  sel,
 	input 	  bus_busy, // another device currently holds the bus (its BSY)
 	input 	  atn, // initiator requests to send a message
@@ -30,11 +31,15 @@ module scsi
 	output [15:0] dout_pair,
 	output [15:0] dout_pair_next,
 
+	// CD audio PCM (CDROM targets only; zeros on disks). Mixed at the top.
+	output signed [15:0] cd_snd_l,
+	output signed [15:0] cd_snd_r,
+
 	// interface to io controller
 	input         img_mounted,
 	input  [31:0] img_blocks,
 	output [31:0] io_lba,
-	output reg 	  io_rd,
+	output        io_rd,
 	output reg 	  io_wr,
 	input         io_ack,
 
@@ -65,17 +70,38 @@ module scsi
 	// block-flush handshake, the double-buffer select, and tlen.
 	//   [15:0]=data_cnt [18:16]=phase [19]=data_complete [20]=io_wr [21]=io_ack
 	//   [22]=io_busy [23]=sd_buff_sel [24]=cmd_write [30:25]=tlen[5:0] [31]=req
-	output [31:0] dbg_wrstall
+	output [31:0] dbg_wrstall,
+	output [31:0] dbg_cda0,     // JTAG CDA0: cd_audio TOC/engine state (see cd_audio.sv)
+	output [31:0] dbg_cda2,     // JTAG CDA2: last 0xC1 CDB {op9, start5, alloc7, alloc8}
+output [31:0] dbg_cda3,     // JTAG CDA3: last play-class CDB {op, cdb3, cdb4, cdb5}
+output [31:0] dbg_cda4,     // JTAG CDA4: last play-class CDB {cdb1, cdb6, cdb7, cdb8}
+	output [31:0] dbg_cda1,     // JTAG CDA1: {toc_rdy,no_media,mounted,ok, sense_asc, sense_key, cmd_cnt, last_op}
+
+	// ===== BlueSCSI Toolbox dedicated block interface (TOOLBOX_ENABLE only) ====
+	// Isolated from the disk block interface above so the disk read/write path is
+	// untouched (docs/BLUESCSI_CORE_HPS_CONTRACT.md). Inert when TOOLBOX_ENABLE=0.
+	// The round-trip FSM that drives tb_rd/tb_wr is M1 stage 2; stage 1 wires the
+	// slot end-to-end and ties the outputs off (fs ops 0xD0-D5 already CHECK, as
+	// they are not in cmd_ok).
+	input         tb_mounted,    // img_mounted[VD_TOOLBOX]: shared folder ready
+	output [31:0] tb_lba,
+	output        tb_rd,
+	output        tb_wr,
+	input         tb_ack,
+	output [15:0] tb_buff_din
 );
 
 // SCSI device id
 parameter [2:0] ID = 0;
-
-// Apple CD-ROM mode (MAME nscsi_cdrom_apple_device is the byte-for-byte
-// oracle). 0 = hard disk: every CDROM conditional below constant-folds away,
-// leaving the wedge-hardened disk target bit-identical. 1 = read-only CD-ROM:
-// 2048-byte logical blocks served as 4 consecutive 512-byte HPS blocks
-// (lba/tlen <<2), AppleCD INQUIRY/TOC/no-disc sense.
+// Set on the PRIMARY target only (ID 6). Gates the BlueSCSI Toolbox so just one
+// target presents as a Toolbox device and owns the dedicated tb_* transport.
+// docs/BLUESCSI_CORE_HPS_CONTRACT.md
+parameter TOOLBOX_ENABLE = 0;
+// Apple CD-ROM mode (docs/plan_scsi_cdrom.md; MAME nscsi_cdrom_apple_device is
+// the byte-for-byte oracle). 0 = hard disk: every CDROM conditional below
+// constant-folds away, leaving the wedge-hardened disk target bit-identical.
+// 1 = read-only CD-ROM: 2048-byte logical blocks served as 4 consecutive
+// 512-byte HPS blocks (lba/tlen <<2), AppleCD INQUIRY/TOC/no-disc sense.
 parameter CDROM = 0;
 
 // Read-prefetch ring depth (number of 512-byte sectors held in the buffer).
@@ -99,6 +125,15 @@ localparam RING_BLOCKS = 1 << RING_LOG; // sectors buffered for reads
 localparam BUF_AW      = 8 + RING_LOG;  // dpram word-address width (256 words/sector)
 
 assign dbg_mounted = mounted;
+
+// BlueSCSI Toolbox transport — stage-1 tie-offs (the round-trip FSM is stage 2).
+// The slot is wired end-to-end but inert; fs ops (0xD0-D5) already CHECK because
+// they are not in cmd_ok. tb_mounted/tb_ack feed the stage-2 FSM.
+// BlueSCSI Toolbox transport outputs — driven by the round-trip FSM below
+// (search "Toolbox transport"). tb_buff_din is driven there (buffer read-back).
+assign tb_lba = tb_lba_r;
+assign tb_rd  = tb_rd_r;
+assign tb_wr  = tb_wr_r;
 assign dbg_phase = phase;
 
 localparam PHASE_IDLE        = 3'd0;
@@ -107,6 +142,7 @@ localparam PHASE_DATA_OUT    = 3'd2;
 localparam PHASE_DATA_IN     = 3'd3;
 localparam PHASE_STATUS_OUT  = 3'd4;
 localparam PHASE_MESSAGE_OUT = 3'd5;
+localparam PHASE_TB          = 3'd6;  // BlueSCSI Toolbox HPS round-trip
 reg [2:0]  phase;
 
 // ------------ sector buffer IO controller read/write -----------------------
@@ -158,7 +194,7 @@ scsi_dpram #(.ADDRWIDTH(BUF_AW)) buffer0
 
 	.address_a(hps_addr),
 	.data_a(buf0_data_a),
-	.wren_a(sd_buff_wr),
+	.wren_a(sd_buff_wr && !ca_io_active),
 	.q_a(buf0_q_a),
 
 	.address_b(mac_addr),
@@ -214,7 +250,7 @@ scsi_dpram #(.ADDRWIDTH(BUF_AW)) buffer1
 
 	.address_a(hps_addr),
 	.data_a(buf1_data_a),
-	.wren_a(sd_buff_wr),
+	.wren_a(sd_buff_wr && !ca_io_active),
 	.q_a(buf1_q_a),
 
 	.address_b(mac_addr),
@@ -235,7 +271,12 @@ always @(posedge clk) begin
 	if (phase == PHASE_IDLE)
 		sd_buff_sel <= 0;
 	else
-		if (old_io_ack & ~io_ack) sd_buff_sel <= !sd_buff_sel;
+		// ~ca_io_active: a CD-audio channel transfer started at bus-idle can
+		// still be in flight when the Mac's next command reaches a data phase;
+		// its ack falling here toggled the write double-buffer and bumped the
+		// ring counter below - wrong sectors served (HW 2026-07-17: artifacted
+		// CD icons, then a wedged READ). Same scope the io_busy term always had.
+		if (old_io_ack & ~io_ack & ~ca_io_active) sd_buff_sel <= !sd_buff_sel;
 
 	// READ ring fetch counter: # of sectors the HPS has delivered this command.
 	// Reset alongside data_cnt (any non-transfer phase); bump on each io_ack
@@ -243,7 +284,7 @@ always @(posedge clk) begin
 	if (phase != PHASE_DATA_OUT && phase != PHASE_DATA_IN &&
 	    phase != PHASE_STATUS_OUT && phase != PHASE_MESSAGE_OUT)
 		rd_hps_blk <= 23'd0;
-	else if (old_io_ack & ~io_ack & cmd_read)
+	else if (old_io_ack & ~io_ack & cmd_read & ~ca_io_active)
 		rd_hps_blk <= rd_hps_blk + 23'd1;
 end
 
@@ -268,9 +309,14 @@ assign io = (phase == PHASE_DATA_OUT) || (phase == PHASE_STATUS_OUT) || (phase =
 // serve data combinationally with no HPS fetch (rd_hps_blk stays 0), so they
 // must NOT take this stall. Depth-independent; replaces the old 2-slot "half
 // being filled" test. WRITE + non-data clauses unchanged.
-wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && (rd_cur_blk >= rd_hps_blk)) ||
-                 (phase == PHASE_DATA_IN  && (io_wr | io_ack) && data_cnt[9] == sd_buff_sel) ||
-                 (phase != PHASE_DATA_OUT && phase != PHASE_DATA_IN && (io_rd | io_wr | io_ack));
+// '&& mounted' in the read clause: media loss mid-READ (guest eject) stops
+// the ring refill, and holding DTACK on data that will never arrive ground
+// the whole OS at the 8ms watchdog ceiling per poll (HW 2026-07-17). With
+// the medium gone the read completes with stale bytes and the driver gets
+// its error through the normal status path instead.
+wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted && (rd_cur_blk >= rd_hps_blk)) ||
+                 (phase == PHASE_DATA_IN  && (io_wr | (io_ack & ~ca_io_active)) && data_cnt[9] == sd_buff_sel) ||
+                 (phase != PHASE_DATA_OUT && phase != PHASE_DATA_IN && (io_rd_d | io_wr | (io_ack & ~ca_io_active)));
 	// A zero-length transfer (e.g. INQUIRY with allocation length 0, or a
 	// WRITE with transfer length 0) must complete immediately: data_complete
 	// only sets on an ACK edge, which never comes when the initiator expects
@@ -289,7 +335,7 @@ wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && (rd_cur_blk >= rd_hps_b
 	// loop seen on the FPGA (but not on real HW or MAME). Drop the !sel gate;
 	// `phase != PHASE_IDLE` already prevents REQ during the IDLE->selection
 	// sampling window, so REQ now comes up on selection like the references.
-	assign req = (phase != PHASE_IDLE) && !ack && !io_busy && !data_phase_complete;
+	assign req = (phase != PHASE_IDLE) && (phase != PHASE_TB) && !ack && !io_busy && !data_phase_complete;
 
 	// Bus-VISIBLE REQ (CSR bit 5 / BSR DRQ): stays asserted across the HPS
 	// 512-byte block-boundary fetches in the data phases. Real drives never
@@ -304,7 +350,7 @@ wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && (rd_cur_blk >= rd_hps_b
 	// Non-data phases keep the io_busy suppression (status byte must not
 	// be offered while a flush/fetch is still in flight).
 	// (LBMacTwo 5adc2e1, HW-validated with 2d025c5 in round 6.)
-	assign req_bus = (phase != PHASE_IDLE) && !ack && !data_phase_complete &&
+	assign req_bus = (phase != PHASE_IDLE) && (phase != PHASE_TB) && !ack && !data_phase_complete &&
 	                 ((phase == PHASE_DATA_OUT) || (phase == PHASE_DATA_IN) || !io_busy);
 
 assign bsy = (phase != PHASE_IDLE);
@@ -330,8 +376,14 @@ wire [7:0] cmd_dout =
 		cmd_mode_sense?mode_sense_dout:
 		cmd_request_sense?request_sense_dout:
 		cmd_cd_toc?cd_toc_dout:
+		(cmd_cd_t43f2 || cmd_cd_t43f1)?cd_toc2_dout:
+		cmd_cd_t43f0?cd_toc43_dout:
 		cmd_cd_subq?cd_subq_dout:
+		cmd_cd_subq43?cd_subq43_dout:
 		cmd_cd_astat?cd_astat_dout:
+		cmd_tb_devinfo?tb_devinfo_dout:
+		cmd_tb_debug?tb_debug_dout:
+		cmd_tb_fs_in?tb_serve:
 		8'h00;
 wire [15:0] cmd_dout_pair =
 		cmd_read?(data_cnt[0] ? {buffer1_dout, buffer0_dout_next} : {buffer0_dout, buffer1_dout}):
@@ -340,8 +392,14 @@ wire [15:0] cmd_dout_pair =
 		cmd_mode_sense?{mode_sense_dout, mode_sense_dout_next}:
 		cmd_request_sense?{request_sense_dout, request_sense_dout_next}:
 		cmd_cd_toc?{cd_toc_dout, cd_toc_dout_next}:
+		(cmd_cd_t43f2 || cmd_cd_t43f1)?{cd_toc2_dout, cd_toc2_dout_next}:
+		cmd_cd_t43f0?{cd_toc43_dout, cd_toc43_dout_next}:
 		cmd_cd_subq?{cd_subq_dout, cd_subq_dout_next}:
+		cmd_cd_subq43?{cd_subq43_dout, cd_subq43_dout_next}:
 		cmd_cd_astat?{cd_astat_dout, cd_astat_dout_next}:
+		cmd_tb_devinfo?{tb_devinfo_dout, tb_devinfo_dout_next}:
+		cmd_tb_debug?{tb_debug_dout, tb_debug_dout_next}:
+		cmd_tb_fs_in?tb_serve_pair:
 		16'h0000;
 wire [15:0] cmd_dout_pair_next =
 		cmd_read?(data_cnt[0] ? {buffer1_dout_next, buffer0_dout_next2} : {buffer0_dout_next, buffer1_dout_next}):
@@ -350,8 +408,14 @@ wire [15:0] cmd_dout_pair_next =
 		cmd_mode_sense?{mode_sense_dout_next2, mode_sense_dout_next3}:
 		cmd_request_sense?{request_sense_dout_next2, request_sense_dout_next3}:
 		cmd_cd_toc?{cd_toc_dout_next2, cd_toc_dout_next3}:
+		(cmd_cd_t43f2 || cmd_cd_t43f1)?{cd_toc2_dout_next2, cd_toc2_dout_next3}:
+		cmd_cd_t43f0?{cd_toc43_dout_next2, cd_toc43_dout_next3}:
 		cmd_cd_subq?{cd_subq_dout_next2, cd_subq_dout_next3}:
+		cmd_cd_subq43?{cd_subq43_dout_next2, cd_subq43_dout_next3}:
 		cmd_cd_astat?{cd_astat_dout_next2, cd_astat_dout_next3}:
+		cmd_tb_devinfo?{tb_devinfo_dout_next2, tb_devinfo_dout_next3}:
+		cmd_tb_debug?{tb_debug_dout_next2, tb_debug_dout_next3}:
+		cmd_tb_fs_in?tb_serve_pair_next:
 		16'h0000;
 
 // REQUEST SENSE response: minimal fixed-format sense, "NO SENSE".
@@ -375,6 +439,15 @@ wire [7:0] request_sense_dout_next  = sense_byte(data_cnt_next);
 wire [7:0] request_sense_dout_next2 = sense_byte(data_cnt_next2);
 wire [7:0] request_sense_dout_next3 = sense_byte(data_cnt_next3);
 
+// INQUIRY vendor id (8 bytes, space-padded). The value is SCSI_VENDOR_STRING,
+// defined in the included rtl/scsi_vendor.vh (committed default "MiSTer  "). A
+// throwaway build (e.g. BlueSCSI Toolbox co-testing) overrides the vendor by
+// editing that one file — no build-specific vendor string ever lives here, and
+// the edit is kept out of commits with:
+//   git update-index --skip-worktree rtl/scsi_vendor.vh   (undo: --no-skip-worktree)
+`include "scsi_vendor.vh"
+localparam [63:0] SCSI_VENDOR_ID = `SCSI_VENDOR_STRING;
+
 // output of inquiry command, identify as "MiSTer  VIRTUAL DISKx" (x = SCSI ID)
 //   vendor  (bytes  8-15): "MiSTer  "        (8 chars, space-padded)
 //   product (bytes 16-31): "VIRTUAL DISKx   " (16 chars, x = '0'+ID)
@@ -384,18 +457,19 @@ wire [7:0] request_sense_dout_next3 = sense_byte(data_cnt_next3);
 // the standard 36 bytes then left 1 unserved byte on the target -> REQ held
 // forever -> the post-clamp Welcome wedge of 2026-06-10c.
 // CDROM INQUIRY: byte-exact copy of MAME nscsi_cdrom_apple_device (data taken
-// from the ROM of an AppleCD 150). The stock Apple CD-ROM extension binds only
-// to known Apple-shipped drives, so the SONY CDU-8002 identity is required for
-// the driver to attach (hardware emulation fidelity, like MAME — not a vendor-
-// string cosmetic). 5 + additional-length 0x31 = 54-byte standard response.
+// from the ROM of an AppleCD 150; same descriptor scsi_empty_cd shipped). The
+// stock Apple CD-ROM extension binds only to known Apple-shipped drives, so
+// the SONY CDU-8002 identity is required for the driver to attach (this is
+// hardware emulation fidelity, like MAME — not a vendor-string cosmetic).
+// 5 + additional-length 0x31 = 54-byte standard response.
 function [7:0] cd_inquiry_byte;
 	input [31:0] cnt;
 	begin
 		cd_inquiry_byte =
 			(cnt == 32'd0 )?8'h05:  // CD-ROM device class
 			(cnt == 32'd1 )?8'h80:  // removable
-			(cnt == 32'd2 )?8'h01:
-			(cnt == 32'd3 )?8'h01:
+			(cnt == 32'd2 )?8'h02:  // ANSI SCSI-2 (dialect tier; Snow-matched)
+			(cnt == 32'd3 )?8'h02:
 			(cnt == 32'd4 )?8'h31:  // additional length
 			(cnt == 32'd8 )?"S":(cnt == 32'd9 )?"O":
 			(cnt == 32'd10)?"N":(cnt == 32'd11)?"Y":
@@ -407,9 +481,9 @@ function [7:0] cd_inquiry_byte;
 			(cnt == 32'd24)?"D":(cnt == 32'd25)?"U":
 			(cnt == 32'd26)?"-":(cnt == 32'd27)?"8":
 			(cnt == 32'd28)?"0":(cnt == 32'd29)?"0":
-			(cnt == 32'd30)?"2":(cnt == 32'd31)?" ":
+			(cnt == 32'd30)?"4":(cnt == 32'd31)?" ":  // 8004: standard dialect
 			(cnt == 32'd32)?"1":(cnt == 32'd33)?".":
-			(cnt == 32'd34)?"8":(cnt == 32'd35)?"g":
+			(cnt == 32'd34)?"9":(cnt == 32'd35)?"a":
 			(cnt == 32'd39)?8'hd0:(cnt == 32'd40)?8'h90:
 			(cnt == 32'd41)?8'h27:(cnt == 32'd42)?8'h3e:
 			(cnt == 32'd43)?8'h01:(cnt == 32'd44)?8'h04:
@@ -427,10 +501,11 @@ function [7:0] inquiry_byte;
 		else inquiry_byte =
 			(cnt == 32'd4 )?8'd31:  // additional length
 
-			(cnt == 32'd8 )?"M":(cnt == 32'd9 )?"i":
-			(cnt == 32'd10)?"S":(cnt == 32'd11)?"T":
-			(cnt == 32'd12)?"e":(cnt == 32'd13)?"r":
-			(cnt == 32'd14)?" ":(cnt == 32'd15)?" ":
+			// vendor id (bytes 8-15) from the SCSI_VENDOR_ID parameter. A string's
+			// first char is its most-significant byte, so byte (cnt-8) sits at
+			// SCSI_VENDOR_ID[(15-cnt)*8 +: 8]. Default "MiSTer  "; build-time
+			// override lives in the gitignored rtl/scsi_vendor_local.vh (see above).
+			((cnt >= 32'd8) && (cnt <= 32'd15)) ? SCSI_VENDOR_ID[(15 - cnt)*8 +: 8] :
 
 			(cnt == 32'd16)?"V":(cnt == 32'd17)?"I":
 			(cnt == 32'd18)?"R":(cnt == 32'd19)?"T":
@@ -509,104 +584,179 @@ wire [7:0] read_capacity_dout_next3 =
 // =====================================================================
 // CDROM response synthesis (folds away on disk targets).
 //
-// Apple READ TOC (0xC1, MAME nscsi_cdrom_apple_device): BCD values, MSF
-// addresses, op = CDB[9][7:6]:
-//   00 -> {first track 01, last track 01, 0, 0}
-//   01 -> lead-out start {M, S, F, 0}
-//   10 -> per-track 4-byte descriptors {ADR/control, M, S, F}, repeating the
-//         last track past the end. One data track at LBA 0 => every descriptor
-//         is {0x14, 00, 00, 00} (MAME to_msf() has NO +150 pregap offset in the
-//         Apple handler — matched deliberately).
-// The only computed field is the lead-out MSF: a tiny FSM converts capacity to
-// BCD M/S/F once per mount (~160 clks), so the serve path stays pure
-// combinational constants — no divider near the REQ/ACK machinery.
+// The cd_audio engine (rtl/cd_audio.sv) owns the real multi-track TOC
+// (fetched from the HPS MCDA blob window, with a synthesized single-track
+// fallback for stock Main / sim / flat images), the AppleCD playback state
+// machine and the live position registers. This section only wires its
+// precomputed 0xC1 response RAM and live 0xCC/0xC2 registers into the
+// serve lanes — the serve path stays free of any live arithmetic.
+// Oracle: MAME nscsi_cdrom_apple_device, as before.
 // =====================================================================
-reg [7:0] cd_lead_m = 8'h00, cd_lead_s = 8'h00, cd_lead_f = 8'h00;  // BCD
-
-function [7:0] cd_to_bcd;
-	input [6:0] v;   // 0..99
-	reg [6:0] tens;
-	reg [6:0] ones;
-	begin
-		tens = v / 7'd10;
-		ones = v % 7'd10;
-		cd_to_bcd = {tens[3:0], ones[3:0]};
-	end
+function [7:0] cd_bcd2bin;
+	input [7:0] b;
+	cd_bcd2bin = {4'd0, b[7:4]} * 8'd10 + {4'd0, b[3:0]};
 endfunction
 
-reg [19:0] cd_msf_val;
-reg  [6:0] cd_msf_m;
-reg  [5:0] cd_msf_s;
-reg  [1:0] cd_msf_st = 2'd0;
-always @(posedge clk) begin
-	if ((CDROM != 0) && img_mounted && |img_blocks) begin
-		cd_msf_val <= img_blocks[21:2];   // lead-out LBA = total 2048-byte blocks
-		cd_msf_m   <= 7'd0;
-		cd_msf_s   <= 6'd0;
-		cd_msf_st  <= 2'd1;
-	end else if (CDROM != 0) begin
-		case (cd_msf_st)
-		2'd1: if ((cd_msf_val >= 20'd4500) && (cd_msf_m != 7'd99)) begin
-				cd_msf_val <= cd_msf_val - 20'd4500;   // minutes (saturate at BCD 99)
-				cd_msf_m   <= cd_msf_m + 1'd1;
-			end else cd_msf_st <= 2'd2;
-		2'd2: if (cd_msf_val >= 20'd75) begin
-				cd_msf_val <= cd_msf_val - 20'd75;     // seconds
-				cd_msf_s   <= cd_msf_s + 1'd1;
-			end else cd_msf_st <= 2'd3;
-		2'd3: begin
-				cd_lead_m <= cd_to_bcd(cd_msf_m);
-				cd_lead_s <= cd_to_bcd({1'b0, cd_msf_s});
-				cd_lead_f <= cd_to_bcd(cd_msf_val[6:0]);
-				cd_msf_st <= 2'd0;
-			end
-		default: ;
-		endcase
-	end
-end
-
-function [7:0] cd_toc_byte;
-	input [31:0] cnt;
-	begin
-		case (cmd[9][7:6])
-		2'b00:   cd_toc_byte = (cnt == 32'd0) ? 8'h01 :         // first track (BCD)
-		                       (cnt == 32'd1) ? 8'h01 : 8'h00;  // last track (BCD)
-		2'b01:   cd_toc_byte = (cnt == 32'd0) ? cd_lead_m :
-		                       (cnt == 32'd1) ? cd_lead_s :
-		                       (cnt == 32'd2) ? cd_lead_f : 8'h00;
-		2'b10:   cd_toc_byte = (cnt[1:0] == 2'd0) ? 8'h14 : 8'h00;
-		default: cd_toc_byte = 8'h00;
-		endcase
-	end
+// cd_audio interface wires (driven by the generate block near the io logic)
+wire        ca_io_active, ca_io_rd_w;
+wire [31:0] ca_io_lba;
+wire  [7:0] ca_ast_code, ca_cur_ctrl, ca_cur_trk;
+wire  [7:0] ca_abs_m, ca_abs_s, ca_abs_f, ca_rel_m, ca_rel_s, ca_rel_f;
+wire  [7:0] ca_t43_q0, ca_t43_q1, ca_t43_q2, ca_t43_q3;
+wire  [9:0] ca_t43_len;
+// 0x43 start-track filter (serve-time address transform; the table stays
+// full-from-track-1): header bytes 0-3 serve as-is, descriptor bytes are
+// offset so the FIRST served descriptor is the requested start track;
+// start 0xAA = the lead-out row (the driver's very first ask on HW was
+// {start=0xAA, alloc=12} = header + leadout only). The header's u16be
+// length field is overridden to the filtered length. nreal is recovered
+// from the table length: len = (nreal+1)*8 + 6 -> nreal = (len-14)>>3 +1;
+// simpler: rows_total = (ca_t43_len - 10'd6) >> 3 (tracks + leadout).
+wire [6:0]  ca_t43_nreal = (ca_t43_len >= 10'd14) ? ((ca_t43_len - 10'd14) >> 3) + 7'd1 : 7'd1;
+wire [7:0]  ca_t43_start = cmd[6];
+wire [6:0]  ca_t43_soff  =
+	(ca_t43_start == 8'h00 || ca_t43_start == 8'h01) ? 7'd0 :
+	(ca_t43_start == 8'hAA) ? ca_t43_nreal :
+	(ca_t43_start > {1'b0, ca_t43_nreal}) ? ca_t43_nreal :
+	ca_t43_start[6:0] - 7'd1;
+// filtered data length (u16-be field value = bytes after the field = rows*8 + 2)
+wire [9:0]  ca_t43_flen  = {(7'd1 + ca_t43_nreal - ca_t43_soff), 3'b000} + 10'd2;
+wire [9:0]  ca_t43_tot   = ca_t43_flen + 10'd2;      // total serveable bytes
+wire [8:0]  ca_t43_addr  = (data_cnt < 32'd4) ? data_cnt[8:0]
+                         : (9'd4 + {ca_t43_soff, 3'b000} + (data_cnt[8:0] - 9'd4));
+// standard audio-status codes ([PIONEER] 2-27C via Snow): 0x11 play,
+// 0x12 paused, 0x13 completed/stopped (engine ast_code 0/1/3/5).
+wire  [7:0] ca_ast_std = (ca_ast_code == 8'd0) ? 8'h11 :
+                         (ca_ast_code == 8'd1) ? 8'h12 : 8'h13;
+function [7:0] scsi_bin2bcd;           // 0..99 (vendor-dialect BCD serving)
+	input [7:0] v;
+	scsi_bin2bcd = {4'd0, (v / 8'd10)} << 4 | {4'd0, (v % 8'd10)};
 endfunction
+wire  [7:0] ca_toc_q0, ca_toc_q1, ca_toc_q2, ca_toc_q3;
+wire        ca_toc_ready;
+reg         ca_cmd_stb = 1'b0, ca_read_stb = 1'b0, ca_eject_stb = 1'b0;
 
-// READ Q SUBCODE (0xC2, 9 bytes): idle deck — track 01 (BCD), index 01,
-// relative and absolute position 00:00:00.
+// Apple 0xC1 serve addressing into the engine's response RAM:
+//   layout [0..3] header, [4..7] lead-out, [8+4k..] track k+1 descriptors.
+// Mode (CDB[9][7:6]) selects the base; track mode indexes by BCD CDB[5].
+// Reads past the 99 precomputed descriptors clamp to the last one
+// (byte-in-descriptor preserved) — MAME "keep returning the last track".
+wire [7:0] ca_toc_trk_bin = cd_bcd2bin(cmd[5]);
+wire [8:0] ca_toc_trk_k   = (ca_toc_trk_bin == 8'd0) ? 9'd0 :
+                            (ca_toc_trk_bin >  8'd99) ? 9'd98 :
+                            {1'b0, ca_toc_trk_bin} - 9'd1;
+wire [8:0] ca_toc_base =
+	(cmd[9][7:6] == 2'b01) ? 9'd4 :
+	(cmd[9][7:6] == 2'b10) ? (9'd8 + {ca_toc_trk_k[6:0], 2'b00}) :
+	                         9'd0;
+wire [8:0] ca_toc_raw  = ca_toc_base + data_cnt[8:0];
+wire [8:0] ca_toc_addr = (ca_toc_raw < 9'd404) ? ca_toc_raw
+                       : (9'd400 + {7'd0, ca_toc_raw[1:0]});
+
+wire [7:0] cd_toc_dout         = ca_toc_ready ? ca_toc_q0 : 8'h00;
+wire [7:0] cd_toc_dout_next    = ca_toc_ready ? ca_toc_q1 : 8'h00;
+wire [7:0] cd_toc_dout_next2   = ca_toc_ready ? ca_toc_q2 : 8'h00;
+wire [7:0] cd_toc_dout_next3   = ca_toc_ready ? ca_toc_q3 : 8'h00;
+
+// READ Q SUBCODE (0xC2, 9 bytes): control, track BCD, index 01, relative
+// M/S/F, absolute M/S/F — live registers from the engine.
 function [7:0] cd_subq_byte;
 	input [31:0] cnt;
 	begin
-		cd_subq_byte = ((cnt == 32'd1) || (cnt == 32'd2)) ? 8'h01 : 8'h00;
+		cd_subq_byte = (cnt == 32'd1) ? scsi_bin2bcd(ca_cur_trk) :
+		               (cnt == 32'd2) ? 8'h01 :
+		               (cnt == 32'd3) ? scsi_bin2bcd(ca_rel_m) :
+		               (cnt == 32'd4) ? scsi_bin2bcd(ca_rel_s) :
+		               (cnt == 32'd5) ? scsi_bin2bcd(ca_rel_f) :
+		               (cnt == 32'd6) ? scsi_bin2bcd(ca_abs_m) :
+		               (cnt == 32'd7) ? scsi_bin2bcd(ca_abs_s) :
+		               (cnt == 32'd8) ? scsi_bin2bcd(ca_abs_f) : 8'h00;
 	end
 endfunction
 
-// AUDIO STATUS (0xCC, 6 bytes): status 5 = VOID/idle (m_stopped reset state),
-// ADR/control of the current (data) track, position 00:00:00.
+// AUDIO STATUS (0xCC, 6 bytes): {status, 0, ADR/control, abs M, S, F};
+// type 1 (CDB[3]==1) reports channel volumes instead (0xFF = full).
 function [7:0] cd_astat_byte;
 	input [31:0] cnt;
 	begin
-		cd_astat_byte = (cnt == 32'd0) ? 8'h05 :
-		                (cnt == 32'd2) ? 8'h14 : 8'h00;
+		cd_astat_byte = (cnt == 32'd0) ? ((cmd[3] == 8'd1) ? 8'hFF : ca_ast_code) :
+		                (cnt == 32'd1) ? ((cmd[3] == 8'd1) ? 8'hFF : 8'h00) :
+		                (cnt == 32'd2) ? ca_cur_ctrl :
+		                (cnt == 32'd3) ? scsi_bin2bcd(ca_abs_m) :
+		                (cnt == 32'd4) ? scsi_bin2bcd(ca_abs_s) :
+		                (cnt == 32'd5) ? scsi_bin2bcd(ca_abs_f) : 8'h00;
 	end
 endfunction
 
-wire [7:0] cd_toc_dout         = cd_toc_byte(data_cnt);
-wire [7:0] cd_toc_dout_next    = cd_toc_byte(data_cnt_next);
-wire [7:0] cd_toc_dout_next2   = cd_toc_byte(data_cnt_next2);
-wire [7:0] cd_toc_dout_next3   = cd_toc_byte(data_cnt_next3);
 wire [7:0] cd_subq_dout        = cd_subq_byte(data_cnt);
 wire [7:0] cd_subq_dout_next   = cd_subq_byte(data_cnt_next);
 wire [7:0] cd_subq_dout_next2  = cd_subq_byte(data_cnt_next2);
 wire [7:0] cd_subq_dout_next3  = cd_subq_byte(data_cnt_next3);
+// standard 0x42 READ SUB-CHANNEL, format 1 (current position), MSF form,
+// 16 bytes: {00, status, u16be len=12, 01, adr_ctrl, track, index=1,
+// {0,M,S,F} abs, {0,M,S,F} rel} — binary values (Snow is the reference).
+function [7:0] cd_subq43_byte;
+	input [31:0] cnt;
+	begin
+		cd_subq43_byte = (cnt == 32'd1)  ? ca_ast_std :
+		                 (cnt == 32'd3)  ? 8'd12 :
+		                 (cnt == 32'd4)  ? 8'h01 :
+		                 (cnt == 32'd5)  ? ca_cur_ctrl :
+		                 (cnt == 32'd6)  ? ca_cur_trk :
+		                 (cnt == 32'd7)  ? 8'h01 :
+		                 (cnt == 32'd9)  ? ca_abs_m :
+		                 (cnt == 32'd10) ? ca_abs_s :
+		                 (cnt == 32'd11) ? ca_abs_f :
+		                 (cnt == 32'd13) ? ca_rel_m :
+		                 (cnt == 32'd14) ? ca_rel_s :
+		                 (cnt == 32'd15) ? ca_rel_f : 8'h00;
+	end
+endfunction
+wire [7:0] cd_subq43_dout       = cd_subq43_byte(data_cnt);
+wire [7:0] cd_subq43_dout_next  = cd_subq43_byte(data_cnt_next);
+wire [7:0] cd_subq43_dout_next2 = cd_subq43_byte(data_cnt_next2);
+wire [7:0] cd_subq43_dout_next3 = cd_subq43_byte(data_cnt_next3);
+function [7:0] t43_hdr_fix;      // filtered length in bytes 0/1; ZERO past the
+	input [31:0] cnt;            // real payload (serving pads to the armed
+	input [7:0]  raw;            // allocation length — see the data_len note)
+	begin
+		t43_hdr_fix = (cnt >= {22'd0, ca_t43_tot}) ? 8'h00 :
+		              (cnt == 32'd0) ? {6'd0, ca_t43_flen[9:8]} :
+		              (cnt == 32'd1) ? ca_t43_flen[7:0] : raw;
+	end
+endfunction
+wire [7:0] cd_toc43_dout        = ca_toc_ready ? t43_hdr_fix(data_cnt,       ca_t43_q0) : 8'h00;
+wire [7:0] cd_toc43_dout_next   = ca_toc_ready ? t43_hdr_fix(data_cnt_next,  ca_t43_q1) : 8'h00;
+wire [7:0] cd_toc43_dout_next2  = ca_toc_ready ? t43_hdr_fix(data_cnt_next2, ca_t43_q2) : 8'h00;
+wire [7:0] cd_toc43_dout_next3  = ca_toc_ready ? t43_hdr_fix(data_cnt_next3, ca_t43_q3) : 8'h00;
+
+// format-2 FULL TOC / format-1 SESSION INFO: pre-rendered T2 plane, linear
+// addressing (the plane IS the response image; session page at [496..507]).
+// Zero-fill past the real payload — serving pads to the armed allocation
+// per the serving law; the u16be length fields carry the true sizes.
+wire [7:0]  ca_t2_q0, ca_t2_q1, ca_t2_q2, ca_t2_q3;
+wire [9:0]  ca_t2_len;
+wire        ca_disc_audio;
+wire [8:0]  ca_t2_addr = (cmd_cd_t43f1 ? 9'd496 : 9'd0) + data_cnt[8:0];
+function [7:0] t2_fix;           // full TOC: zero past toc2_len
+	input [31:0] cnt;
+	input [7:0]  raw;
+	t2_fix = (cnt >= {22'd0, ca_t2_len}) ? 8'h00 : raw;
+endfunction
+function [7:0] sess_fix;         // session-info page: 12 real bytes
+	input [31:0] cnt;
+	input [7:0]  raw;
+	sess_fix = (cnt >= 32'd12) ? 8'h00 : raw;
+endfunction
+wire [7:0] cd_toc2_dout        = !ca_toc_ready ? 8'h00 :
+                                 cmd_cd_t43f1 ? sess_fix(data_cnt, ca_t2_q0) : t2_fix(data_cnt, ca_t2_q0);
+wire [7:0] cd_toc2_dout_next   = !ca_toc_ready ? 8'h00 :
+                                 cmd_cd_t43f1 ? sess_fix(data_cnt_next, ca_t2_q1) : t2_fix(data_cnt_next, ca_t2_q1);
+wire [7:0] cd_toc2_dout_next2  = !ca_toc_ready ? 8'h00 :
+                                 cmd_cd_t43f1 ? sess_fix(data_cnt_next2, ca_t2_q2) : t2_fix(data_cnt_next2, ca_t2_q2);
+wire [7:0] cd_toc2_dout_next3  = !ca_toc_ready ? 8'h00 :
+                                 cmd_cd_t43f1 ? sess_fix(data_cnt_next3, ca_t2_q3) : t2_fix(data_cnt_next3, ca_t2_q3);
+
 wire [7:0] cd_astat_dout       = cd_astat_byte(data_cnt);
 wire [7:0] cd_astat_dout_next  = cd_astat_byte(data_cnt_next);
 wire [7:0] cd_astat_dout_next2 = cd_astat_byte(data_cnt_next2);
@@ -617,12 +767,52 @@ wire [7:0] cd_astat_dout_next3 = cd_astat_byte(data_cnt_next3);
 // the length field reads exactly what we serve (it was 0, which told
 // length-honoring drivers "nothing follows the header" while we kept
 // serving — REQ-held wedge class).
+// BlueSCSI Toolbox detection page (docs/BLUESCSI_HANDOFF.md §2): when the
+// client requests vendor page 0x31 (CDB[2][5:0]==0x31) serve a 56-byte response
+// carrying the magic string it matches on, instead of the 12-byte default.
+// Page select is combinational on the latched CDB, stable through the data
+// phase; data_len switches 12<->56 on the same select. Other pages unchanged.
+// Gated on tb_ready: advertise the Toolbox detection page ONLY once the HPS
+// handler has mounted the slot. On a stock Main (no handler) tb_ready=0, so a
+// page-0x31 request falls through to the default mode page and the target looks
+// like a plain disk -> the Mac client never engages -> no app-close hang (§4a).
+wire       mode_sense_p31 = TOOLBOX_ENABLE && tb_ready && cmd_mode_sense && (cmd[2][5:0] == 6'h31);
+
+// 56-byte page-0x31 response (self-contained; block-descriptor #blocks=0 per the
+// spec example -- the client only validates the page string). 4 header + 8 block
+// descriptor + 2 page header + 42 string. DBD ignored (descriptor always
+// present, length byte = 8), matching the default response.
+function [7:0] mode_sense_p31_byte;
+	input [31:0] cnt;
+	begin
+		mode_sense_p31_byte =
+			(cnt == 32'd0 )?8'd55:   // mode data length = 56 - 1
+			(cnt == 32'd3 )?8'd8:    // block descriptor length
+			(cnt == 32'd10)?8'd2:    // block length 0x000200 (512); #blocks = 0
+			(cnt == 32'd12)?8'h31:   // page code 0x31
+			(cnt == 32'd13)?8'h2a:   // page length = 42
+			(cnt == 32'd14)?"B":(cnt == 32'd15)?"l":(cnt == 32'd16)?"u":(cnt == 32'd17)?"e":
+			(cnt == 32'd18)?"S":(cnt == 32'd19)?"C":(cnt == 32'd20)?"S":(cnt == 32'd21)?"I":
+			(cnt == 32'd22)?" ":(cnt == 32'd23)?"i":(cnt == 32'd24)?"s":(cnt == 32'd25)?" ":
+			(cnt == 32'd26)?"t":(cnt == 32'd27)?"h":(cnt == 32'd28)?"e":(cnt == 32'd29)?" ":
+			(cnt == 32'd30)?"B":(cnt == 32'd31)?"E":(cnt == 32'd32)?"S":(cnt == 32'd33)?"T":
+			(cnt == 32'd34)?" ":(cnt == 32'd35)?"S":(cnt == 32'd36)?"T":(cnt == 32'd37)?"O":
+			(cnt == 32'd38)?"L":(cnt == 32'd39)?"E":(cnt == 32'd40)?"N":(cnt == 32'd41)?" ":
+			(cnt == 32'd42)?"F":(cnt == 32'd43)?"R":(cnt == 32'd44)?"O":(cnt == 32'd45)?"M":
+			(cnt == 32'd46)?" ":(cnt == 32'd47)?"B":(cnt == 32'd48)?"L":(cnt == 32'd49)?"U":
+			(cnt == 32'd50)?"E":(cnt == 32'd51)?"S":(cnt == 32'd52)?"C":(cnt == 32'd53)?"S":
+			(cnt == 32'd54)?"I":     // byte 55 = NUL (falls through); rest = 0
+			8'h00;
+	end
+endfunction
+
 // CDROM MODE SENSE(6). Header + 8-byte block descriptor (12 bytes): device-
 // specific byte = 0x80 (write-protected), block length 0x000800 (2048),
-// #blocks = capacity (2048-block last LBA). Page 0x30 appends the 24-byte
-// "magic Apple page" (0x30, 0x00, "APPLE COMPUTER, INC   ") — byte-exact from
-// MAME apple_magic, which some Apple drivers probe even on CD drives. Other
-// pages: header+desc only (proven pattern of the disk response).
+// #blocks = capacity (2048-block last LBA, same byte slots as the disk
+// response). Page 0x30 appends the 24-byte "magic Apple page" (0x30, 0x00,
+// "APPLE COMPUTER, INC   ") — byte-exact from MAME apple_magic, which some
+// Apple drivers/utilities probe even on CD drives. Other pages: header+desc
+// only (proven pattern of the disk response).
 function [7:0] cd_mode_sense_byte;
 	input [31:0] cnt;
 	begin
@@ -650,7 +840,17 @@ function [7:0] cd_mode_sense_byte;
 	end
 endfunction
 
-// Disk default MODE SENSE(6) response (served for every non-CDROM case).
+// Page select: CDROM response, else 0x31 detection page vs. the default.
+wire [7:0] mode_sense_dout       = (CDROM != 0)   ? cd_mode_sense_byte(data_cnt)
+                                 : mode_sense_p31 ? mode_sense_p31_byte(data_cnt)       : mode_sense_def_dout;
+wire [7:0] mode_sense_dout_next  = (CDROM != 0)   ? cd_mode_sense_byte(data_cnt_next)
+                                 : mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next)  : mode_sense_def_dout_next;
+wire [7:0] mode_sense_dout_next2 = (CDROM != 0)   ? cd_mode_sense_byte(data_cnt_next2)
+                                 : mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next2) : mode_sense_def_dout_next2;
+wire [7:0] mode_sense_dout_next3 = (CDROM != 0)   ? cd_mode_sense_byte(data_cnt_next3)
+                                 : mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next3) : mode_sense_def_dout_next3;
+
+// Default MODE SENSE(6) response (unchanged; served for every page except 0x31).
 wire [7:0] mode_sense_def_dout =
 		(data_cnt == 32'd0 )?8'd11:
 		(data_cnt == 32'd3 )?8'd8:
@@ -684,19 +884,154 @@ wire [7:0] mode_sense_def_dout_next3 =
 		(data_cnt_next3 == 32'd10 )?8'd2:
 		8'h00;
 
-// Page select: CDROM response, else the disk default.
-wire [7:0] mode_sense_dout       = (CDROM != 0) ? cd_mode_sense_byte(data_cnt)       : mode_sense_def_dout;
-wire [7:0] mode_sense_dout_next  = (CDROM != 0) ? cd_mode_sense_byte(data_cnt_next)  : mode_sense_def_dout_next;
-wire [7:0] mode_sense_dout_next2 = (CDROM != 0) ? cd_mode_sense_byte(data_cnt_next2) : mode_sense_def_dout_next2;
-wire [7:0] mode_sense_dout_next3 = (CDROM != 0) ? cd_mode_sense_byte(data_cnt_next3) : mode_sense_def_dout_next3;
-
 // buffer to store incoming commands
 reg [3:0]  cmd_cnt;
 reg [7:0]  cmd [9:0];
 
+// ========================================================================
+// BlueSCSI Toolbox transport (TOOLBOX_ENABLE) — dedicated-slot HPS round-trip
+// for the DataIn filesystem ops 0xD0 LIST / 0xD1 GET / 0xD2 COUNT.
+// docs/BLUESCSI_CORE_HPS_CONTRACT.md. The disk read/write path is untouched.
+//
+//   load CDB into tb buffer -> tb_wr @LBA0 (HPS runs the handler) ->
+//   tb_rd @LBA0 (status + 0xB5 signature + length) ->
+//   tb_rd @LBA1 (one 512-byte data block) -> serve via PHASE_DATA_OUT.
+//
+// FIRST CUT (pending HW + Main co-test): the round-trip handshake, the buffer
+// byte-lane order and the status-latch settle are modelled on the proven disk
+// path but cannot be functionally validated until the Main handler exists; the
+// SERVE reuses the disk buffer machinery verbatim so its timing is inherited.
+// Single 512-byte response this stage; GET >512 (sequential fetch) and SEND
+// upload (0xD3-D5, needs a 2nd buffer sector) are the remaining stages.
+// ========================================================================
+localparam TBS_IDLE=3'd0, TBS_LOAD=3'd1, TBS_REQ=3'd2, TBS_STAT=3'd3,
+           TBS_LATCH=3'd4, TBS_DATA=3'd5, TBS_RDY=3'd6;
+reg [2:0]  tb_state = TBS_IDLE;
+reg        tb_rd_r, tb_wr_r;
+reg [31:0] tb_lba_r;
+reg [7:0]  tb_status;
+reg [15:0] tb_len;
+reg [3:0]  tb_load_w;
+reg [1:0]  tb_settle;
+reg        old_tb_ack;
+
+// Shared-folder availability: latches when the HPS mounts the Toolbox slot.
+// Until then (incl. a stock Main with no handler) fs ops return CHECK (§4a).
+reg tb_ready = 1'b0;
+always @(posedge clk) if (TOOLBOX_ENABLE && tb_mounted) tb_ready <= 1'b1;
+
+// Toolbox buffer: one 512-byte sector, byte-split (even->buf0, odd->buf1) with
+// the SAME HPS lane mapping as the disk buffer so bytes arrive in order.
+wire [7:0] tb_buf0_qa, tb_buf1_qa;     // HPS read-back (the CDB, during request)
+`ifdef VERILATOR
+wire [7:0] tb_buf0_da = sd_buff_dout[15:8];
+wire [7:0] tb_buf1_da = sd_buff_dout[7:0];
+assign tb_buff_din = {tb_buf0_qa, tb_buf1_qa};
+`else
+wire [7:0] tb_buf0_da = sd_buff_dout[7:0];
+wire [7:0] tb_buf1_da = sd_buff_dout[15:8];
+assign tb_buff_din = {tb_buf1_qa, tb_buf0_qa};
+`endif
+
+wire       tb_hps_wr  = sd_buff_wr & tb_ack;            // HPS fills the slot
+// SEND (upload) payload collection: during the DataOut phase the Mac's bytes are
+// written into the toolbox buffer at WORD offset 8 (byte 16), leaving words 0..4
+// (bytes 0..9) for the CDB that TBS_LOAD writes -- so one round-trip block carries
+// both (the contract's "payload at buffer[16..]" single-block layout). Even byte
+// -> buf0, odd -> buf1, mirroring the CDB/serve byte split.
+wire       tb_collect = (phase == PHASE_DATA_IN) && cmd_tb_send;
+wire       tb_col_wr0 = tb_collect && stb_ack && ~data_cnt[0];
+wire       tb_col_wr1 = tb_collect && stb_ack &&  data_cnt[0];
+wire [7:0] tb_b_addr  = (tb_state == TBS_LOAD) ? {4'd0, tb_load_w}
+                      : tb_collect            ? (8'd8 + data_cnt[8:1])
+                      :                          data_cnt[8:1];
+wire       tb_b_wr0   = (tb_state == TBS_LOAD) || tb_col_wr0;
+wire       tb_b_wr1   = (tb_state == TBS_LOAD) || tb_col_wr1;
+wire [7:0] tb_load_b0 = cmd[{tb_load_w[2:0], 1'b0}];   // even CDB byte
+wire [7:0] tb_load_b1 = cmd[{tb_load_w[2:0], 1'b1}];   // odd  CDB byte
+wire [7:0] tb_b_d0    = (tb_state == TBS_LOAD) ? tb_load_b0 : din;   // CDB even byte, else payload byte
+wire [7:0] tb_b_d1    = (tb_state == TBS_LOAD) ? tb_load_b1 : din;   // CDB odd  byte, else payload byte
+
+wire [7:0] tb0_dout, tb0_dout_next, tb0_dout_next2;
+wire [7:0] tb1_dout, tb1_dout_next, tb1_dout_next2;
+scsi_dpram #(.ADDRWIDTH(8)) tb_buf0 (
+	.clock(clk),
+	.address_a(sd_buff_addr), .data_a(tb_buf0_da), .wren_a(tb_hps_wr), .q_a(tb_buf0_qa),
+	.address_b(tb_b_addr), .data_b(tb_b_d0), .wren_b(tb_b_wr0), .q_b(tb0_dout),
+	.address_c(tb_b_addr + 1'b1), .q_c(tb0_dout_next),
+	.address_d(tb_b_addr + 2'd2), .q_d(tb0_dout_next2)
+);
+scsi_dpram #(.ADDRWIDTH(8)) tb_buf1 (
+	.clock(clk),
+	.address_a(sd_buff_addr), .data_a(tb_buf1_da), .wren_a(tb_hps_wr), .q_a(tb_buf1_qa),
+	.address_b(tb_b_addr), .data_b(tb_b_d1), .wren_b(tb_b_wr1), .q_b(tb1_dout),
+	.address_c(tb_b_addr + 1'b1), .q_c(tb1_dout_next),
+	.address_d(tb_b_addr + 2'd2), .q_d(tb1_dout_next2)
+);
+
+// Serve sources (mirror the disk read: even byte from buf0, odd from buf1).
+wire  [7:0] tb_serve           = data_cnt[0] ? tb1_dout : tb0_dout;
+wire [15:0] tb_serve_pair      = data_cnt[0] ? {tb1_dout, tb0_dout_next} : {tb0_dout, tb1_dout};
+wire [15:0] tb_serve_pair_next = data_cnt[0] ? {tb1_dout_next, tb0_dout_next2} : {tb0_dout_next, tb1_dout_next};
+
+// Round-trip FSM. Drives tb_state / tb_rd / tb_wr / tb_lba; the MAIN phase FSM
+// moves `phase` (CMD_IN -> PHASE_TB -> DATA_OUT/STATUS_OUT) by watching tb_state.
+always @(posedge clk) begin
+	old_tb_ack <= tb_ack;
+	if (rst) begin
+		tb_state <= TBS_IDLE; tb_rd_r <= 1'b0; tb_wr_r <= 1'b0; tb_lba_r <= 32'd0;
+		tb_status <= 8'h02; tb_len <= 16'd0; tb_load_w <= 4'd0; tb_settle <= 2'd0;
+	end else if (TOOLBOX_ENABLE) begin
+		case (tb_state)
+		TBS_IDLE: begin
+			tb_load_w <= 4'd0;
+			if (phase == PHASE_TB) tb_state <= TBS_LOAD;
+		end
+		// write the 10-byte CDB as 5 words (0..4) into the tb buffer
+		TBS_LOAD:
+			if (tb_load_w == 4'd4) begin
+				tb_wr_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_REQ;
+			end else tb_load_w <= tb_load_w + 1'b1;
+		// request: HPS reads the CDB and runs the handler
+		TBS_REQ: begin
+			if (tb_ack) tb_wr_r <= 1'b0;
+			if (old_tb_ack & ~tb_ack) begin
+				tb_rd_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_STAT;
+			end
+		end
+		// status: HPS returns {status, 0xB5, len_hi, len_lo} at buffer words 0/1
+		TBS_STAT: begin
+			if (tb_ack) tb_rd_r <= 1'b0;
+			if (old_tb_ack & ~tb_ack) begin tb_settle <= 2'd2; tb_state <= TBS_LATCH; end
+		end
+		// let the registered buffer reads (addr 0/1, data_cnt=0) settle, then latch
+		TBS_LATCH:
+			if (tb_settle != 2'd0) tb_settle <= tb_settle - 1'b1;
+			else if (tb1_dout == 8'hb5) begin            // signature ok (byte 1)
+				tb_status <= tb0_dout;                       // byte 0 = SCSI status
+				tb_len    <= {tb0_dout_next, tb1_dout_next}; // bytes 2,3 = length
+				if ({tb0_dout_next, tb1_dout_next} != 16'd0) begin
+					tb_rd_r <= 1'b1; tb_lba_r <= 32'd1; tb_state <= TBS_DATA;
+				end else tb_state <= TBS_RDY;                // status-only
+			end else begin                               // no real handler -> CHECK
+				tb_status <= 8'h02; tb_len <= 16'd0; tb_state <= TBS_RDY;
+			end
+		// data: HPS returns one 512-byte block at words 0..255
+		TBS_DATA: begin
+			if (tb_ack) tb_rd_r <= 1'b0;
+			if (old_tb_ack & ~tb_ack) tb_state <= TBS_RDY;
+		end
+		// round-trip done; the main FSM consumes tb_status/tb_len and leaves
+		TBS_RDY: if (phase != PHASE_TB) tb_state <= TBS_IDLE;
+		default: tb_state <= TBS_IDLE;
+		endcase
+	end
+end
+
 /* ----------------------- request data from/to io controller ----------------------- */
 
-assign io_lba = lba;
+// CD-audio/TOC fetches own the address bus while their request is live
+assign io_lba = ca_io_active ? ca_io_lba : lba;
 
 // READ prefetch (ring): keep issuing sequential sector fetches while sectors
 // remain (rd_hps_blk < tlen) and the ring has space (fetched no more than
@@ -719,6 +1054,14 @@ wire req_rd = (phase == PHASE_DATA_OUT) && cmd_read && (data_len != 32'd0) &&
 // sector-buffer block (the previous READ's data) to the command's LBA.
 wire req_wr = ((((phase == PHASE_DATA_IN) && (data_cnt[8:0] == 0) && (data_cnt != 0)) || (phase == PHASE_STATUS_OUT)) && cmd_write && (data_len != 32'd0));
 
+// Data-path io_rd (the ring engine's own request). The module output is the
+// OR with the CD-audio engine's request; the engine only runs while the
+// target is bus-idle with no data io pending (ca_grant below), so the two
+// requestors never overlap — and a pending req_rd naturally waits for the
+// audio block in flight via the !io_rd guard on the shared wire.
+reg io_rd_d;
+assign io_rd = io_rd_d | ca_io_rd_w;
+
 always @(posedge clk) begin
 	reg old_wr;
 	reg wr_pending;
@@ -731,7 +1074,7 @@ always @(posedge clk) begin
 	// command never transfers, the Mac times out and resets again -> the
 	// intermittent reset/re-scan loop observed on hardware.
 	if(rst) begin
-		io_rd <= 1'b0;
+		io_rd_d <= 1'b0;
 		io_wr <= 1'b0;
 		wr_pending <= 0;
 		old_wr <= 0;
@@ -745,8 +1088,10 @@ always @(posedge clk) begin
 		// the ring filled ahead of the Mac. rd_busy holds across a fetch until
 		// rd_hps_blk advances on the io_ack falling edge, so exactly one fetch
 		// is issued per sector and the next can start immediately after.
-		if(io_ack) io_rd <= 1'b0;
-		else if(req_rd && !io_rd && !rd_busy) begin io_rd <= 1'b1; rd_busy <= 1'b1; end
+		// (io_rd in the guard is the shared wire: a CD-audio block in flight
+		// defers the ring's next fetch by one HPS block, nothing more.)
+		if(io_ack) io_rd_d <= 1'b0;
+		else if(req_rd && !io_rd && !rd_busy) begin io_rd_d <= 1'b1; rd_busy <= 1'b1; end
 		if(old_io_ack & ~io_ack) rd_busy <= 1'b0;
 
 		// WRITE flush engine — unchanged two-slot double-buffer behavior.
@@ -754,6 +1099,79 @@ always @(posedge clk) begin
 		else if(wr_pending && !io_wr) begin io_wr <= 1'b1; wr_pending <= 0; end
 	end
 end
+
+// =====================================================================
+// CD audio engine (CDROM targets only; every ca_* wire folds to a constant
+// on disks). Owns the AppleCD playback state machine, the real TOC, and
+// the audio-frame streaming from the HPS windows. It may use the io
+// channel only while the target is bus-idle with no data io pending.
+// =====================================================================
+// CA grant: the audio/TOC engine's fetches are HPS-channel-only (they never
+// touch the SCSI bus), so they may interleave with an ACTIVE READ command's
+// serving phase — requiring full bus-idle starved the frame stream to ~42
+// of the required 75 frames/s whenever the guest streamed game data from
+// the same disc (HW capture 2026-07-18: pstate=PLAY, fetch delta 17/400ms,
+// audible crackle = sample-hold at every late frame). The io-free terms
+// still serialize the channel per-op, and the ~ca_io_active scoping keeps
+// CA acks out of the data-path accounting (that isolation was built for
+// exactly this concurrency). DATA_IN (writes) stays excluded: the CD is
+// read-only, so it never occurs; all other phases remain excluded.
+wire ca_grant = (phase == PHASE_IDLE || (cmd_read && phase == PHASE_DATA_OUT))
+                && !io_rd_d && !io_wr && !io_ack && mounted;
+
+generate if (CDROM != 0) begin : g_cd_audio
+	cd_audio #(.CLK_HZ(32'd32_500_000)) cd_audio_i (   // clk_sys rate; audio pitch verifies it
+		.clk(clk), .rst(sys_rst), .bus_rst(rst),
+		.mounted(mounted), .img_mounted(img_mounted), .img_blocks(img_blocks),
+		.cmd_stb(ca_cmd_stb), .cmd_op(cmd[0]),
+		.cdb1(cmd[1]), .cdb2(cmd[2]), .cdb3(cmd[3]), .cdb4(cmd[4]),
+		.cdb5(cmd[5]), .cdb6(cmd[6]), .cdb7(cmd[7]), .cdb8(cmd[8]), .cdb9(cmd[9]),
+		.read_stb(ca_read_stb), .eject_stb(ca_eject_stb),
+		.ch_grant(ca_grant),
+		.ca_io_active(ca_io_active), .ca_io_rd(ca_io_rd_w), .ca_io_lba(ca_io_lba),
+		.io_ack(io_ack),
+		.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout), .sd_buff_wr(sd_buff_wr),
+		.ast_code(ca_ast_code), .cur_ctrl(ca_cur_ctrl), .cur_trk(ca_cur_trk),
+		.abs_m(ca_abs_m), .abs_s(ca_abs_s), .abs_f(ca_abs_f),
+		.rel_m(ca_rel_m), .rel_s(ca_rel_s), .rel_f(ca_rel_f),
+		.toc_base(ca_toc_addr),
+		.toc_q0(ca_toc_q0), .toc_q1(ca_toc_q1), .toc_q2(ca_toc_q2), .toc_q3(ca_toc_q3),
+		.toc_ready(ca_toc_ready),
+		.toc43_base(ca_t43_addr),
+		.toc43_q0(ca_t43_q0), .toc43_q1(ca_t43_q1),
+		.toc43_q2(ca_t43_q2), .toc43_q3(ca_t43_q3),
+		.toc43_len(ca_t43_len),
+		.toc2_base(ca_t2_addr),
+		.toc2_q0(ca_t2_q0), .toc2_q1(ca_t2_q1),
+		.toc2_q2(ca_t2_q2), .toc2_q3(ca_t2_q3),
+		.toc2_len(ca_t2_len),
+		.disc_audio(ca_disc_audio),
+		.snd_l(cd_snd_l), .snd_r(cd_snd_r),
+		.dbg_cda0(dbg_cda0)
+	);
+end else begin : g_no_cd_audio
+	assign ca_io_active = 1'b0;
+	assign ca_io_rd_w   = 1'b0;
+	assign ca_io_lba    = 32'd0;
+	assign ca_ast_code  = 8'h05;
+	assign ca_cur_ctrl  = 8'h14;
+	assign ca_cur_trk   = 8'h01;
+	assign ca_abs_m = 8'h00; assign ca_abs_s = 8'h00; assign ca_abs_f = 8'h00;
+	assign ca_rel_m = 8'h00; assign ca_rel_s = 8'h00; assign ca_rel_f = 8'h00;
+	assign ca_toc_q0 = 8'h00; assign ca_toc_q1 = 8'h00;
+	assign ca_toc_q2 = 8'h00; assign ca_toc_q3 = 8'h00;
+	assign ca_t43_q0 = 8'h00; assign ca_t43_q1 = 8'h00;
+	assign ca_t43_q2 = 8'h00; assign ca_t43_q3 = 8'h00;
+	assign ca_t43_len = 10'd0;
+	assign ca_t2_q0 = 8'h00; assign ca_t2_q1 = 8'h00;
+	assign ca_t2_q2 = 8'h00; assign ca_t2_q3 = 8'h00;
+	assign ca_t2_len = 10'd0;
+	assign ca_disc_audio = 1'b0;
+	assign ca_toc_ready = 1'b0;
+	assign cd_snd_l = 16'sd0;
+	assign cd_snd_r = 16'sd0;
+	assign dbg_cda0 = 32'd0;
+end endgenerate
 
 reg  stb_ack;
 reg  stb_adv;
@@ -810,9 +1228,9 @@ wire [31:0] sense_len = (tlen == 16'd256) ? 32'd4 : {16'd0, tlen};
 // are <<2-scaled at latch time.
 localparam [31:0] INQUIRY_LEN = (CDROM != 0) ? 32'd54 : 32'd36;
 wire        cd_ms30    = (CDROM != 0) && cmd_mode_sense && (cmd[2][5:0] == 6'h30);
-// ops 00/01: MAME serves a fixed 4; clamp to the allocation as well so a short
-// alloc can never leave unserved bytes holding REQ (the 2026-06-10 alloc-
-// overserve wedge class). Identical to MAME for the observed alloc=4.
+// ops 00/01: MAME serves a fixed 4; clamp to the allocation as well so a
+// short alloc can never leave unserved bytes holding REQ (the 2026-06-10
+// alloc-overserve wedge class). Identical to MAME for the observed alloc=4.
 wire [31:0] cd_toc_len = (cmd[9][7:6] == 2'b10) ? {16'd0, tlen[15:2], 2'b00}
                        : (tlen < 16'd4)         ? {16'd0, tlen}
                        :                          32'd4;
@@ -832,15 +1250,38 @@ wire [31:0] data_len =
 		 cmd_read?{ 7'd0, tlen, 9'd0 }:   // read command length is in 512 bytes blocks
 		 cmd_write?{ 7'd0, tlen, 9'd0 }:  // write command length is in 512 bytes blocks
 		 cmd_cd_toc?cd_toc_len:           // Apple READ TOC (see cd_toc_len)
+		 // 0x43/0x42 serve EXACTLY the allocation length (zero-filled past the
+		 // real payload; header length fields still carry the true size). The
+		 // under-serve direction deadlocks too (2026-07-19, deterministic at
+		 // boot): the Mac's blind-transfer primitive arms the FULL allocation
+		 // and pumps DACK for it; a target that goes early-STATUS after
+		 // min(alloc,actual) leaves the host armed with no DREQ ever coming —
+		 // 250 ms BERR beats, SCSI Mgr retry, boot wedge ("host-armed/
+		 // target-idle"). Discovered via the 0x43 start-track filter: it was
+		 // the first command whose actual size (20 B for the {start=22,
+		 // alloc=48} duration ask) dropped BELOW the allocation. Caps: 512 =
+		 // T43 plane, 64 > the 16-byte 0x42 payload (its serve function
+		 // zero-fills past byte 15 by construction).
+		 cmd_cd_toc43?(({16'd0, cmd[7], cmd[8]} < 32'd512) ?
+		               {16'd0, cmd[7], cmd[8]} : 32'd512):   // all formats: f0/f2 tables + f1 page
+		 cmd_cd_subq43?(({16'd0, cmd[7], cmd[8]} < 32'd64) ?
+		                {16'd0, cmd[7], cmd[8]} : 32'd64):
 		 cmd_cd_subq?32'd9:               // READ Q SUBCODE: fixed 9 bytes
 		 cmd_cd_astat?32'd6:              // AUDIO STATUS: fixed 6 bytes
 		 cmd_cd_actl?{24'd0, cmd[8]}:     // AUDIO CONTROL: DataOut of CDB[8] bytes (discarded)
 		 cmd_inquiry?((alloc_len < INQUIRY_LEN) ? alloc_len : INQUIRY_LEN):
 		 cmd_mode_sense?((CDROM != 0) ? (cd_ms30 ? ((alloc_len < 32'd36) ? alloc_len : 32'd36)
 		                                         : ((alloc_len < 32'd12) ? alloc_len : 32'd12))
-		                              : ((alloc_len < 32'd12) ? alloc_len : 32'd12)):
+		                              : (mode_sense_p31 ? ((alloc_len < 32'd56) ? alloc_len : 32'd56)
+		                                                : ((alloc_len < 32'd12) ? alloc_len : 32'd12))):
 		 ((CDROM != 0) && cmd_mode_select)?alloc_len:  // MODE SELECT alloc 0 = no data (not 256)
 		 cmd_request_sense?((sense_len < 32'd18) ? sense_len : 32'd18):
+		 cmd_tb_devinfo?tb_devinfo_len:                       // 0xD9 DEVICE INFO
+		 cmd_tb_debug_get?32'd1:                              // 0xD6 get = one flag byte
+		 cmd_tb_fs_in?{16'd0, tb_len}:                        // 0xD0/D1/D2 toolbox DataIn (HPS length)
+		 cmd_tb_send_prep?32'd33:                             // 0xD3 SEND PREP: 33-byte filename
+		 cmd_tb_send_data?(cmd[6] ? {15'd0, cmd[6], 9'd0}     // 0xD4 SEND DATA: CDB[6]*512 (block enc),
+		                          : {16'd0, cmd[1], cmd[2]}): //   else legacy u16(CDB[1..2]) byte count
 		 { 16'd0, tlen };                 // mode select etc have length in bytes
 
 always @(posedge clk) begin
@@ -943,10 +1384,16 @@ wire [2:0] cmd_group = op_code[7:5];
 // check if a complete command has been received
 wire       cmd_cpl = cmd6_cpl || cmd10_cpl;
 wire       cmd6_cpl = (cmd_group == 3'b000) && (cmd_cnt == 6);
+// BlueSCSI Toolbox vendor commands (0xD0-0xD9, group 110) are 10-byte CDBs.
+// Decode ONLY this exact range as 10-byte (not the whole vendor group 110) so
+// other group-110 opcodes aren't mis-lengthed (0xC0 EJECT is a 6-byte CDB).
+// docs/BLUESCSI_MISTER_MAIN_PLAN.md, docs/BLUESCSI_HANDOFF.md §1.
+wire       cmd_toolbox_op = (op_code >= 8'hd0) && (op_code <= 8'hd9);
 // Apple CD vendor commands 0xC0-0xCE are ALL 10-byte CDBs (MAME
 // nscsi_cdrom_apple_device::scsi_command_done: command&0xf0==0xc0 -> 10).
 wire       cmd_apple_cd_op = (CDROM != 0) && (op_code[7:4] == 4'hc);
 wire       cmd10_cpl = (((cmd_group == 3'b010) || (cmd_group == 3'b001)) && (cmd_cnt == 10))
+                       || (cmd_toolbox_op && (cmd_cnt == 10))
                        || (cmd_apple_cd_op && (cmd_cnt == 10));
 
 // https://en.wikipedia.org/wiki/SCSI_command
@@ -974,25 +1421,105 @@ wire       cmd_verify10 = (op_code == 8'h2f); // fake
 wire       cmd_request_sense = (op_code == 8'h03);
 
 // ----- Apple CD-ROM command set (CDROM targets only; all fold to 0 on disks).
-// Oracle: MAME nscsi_cdrom_apple_device.
+// Oracle: MAME nscsi_cdrom_apple_device (docs/plan_scsi_cdrom.md Appendix A).
 wire       cmd_cd_eject     = (CDROM != 0) && (op_code == 8'hc0);  // EJECT DISC
 wire       cmd_cd_toc       = (CDROM != 0) && (op_code == 8'hc1);  // READ TOC (BCD/MSF)
 wire       cmd_cd_subq      = (CDROM != 0) && (op_code == 8'hc2);  // READ Q SUBCODE (9 B)
 wire       cmd_cd_astat     = (CDROM != 0) && (op_code == 8'hcc);  // AUDIO STATUS (6 B)
 wire       cmd_cd_actl      = (CDROM != 0) && (op_code == 8'hce);  // AUDIO CONTROL (DataOut cmd[8] B, discarded)
-// Audio transport commands: v1 = data CDs only, accept as no-op GOOD (they
-// only matter for CD-DA which has no PCM path yet).
+// Audio transport commands: v1 = data CDs only, accept as no-op GOOD (deferred
+// per plan §5.1; they only matter for CD-DA which has no PCM path yet).
 wire       cmd_cd_audio_nop = (CDROM != 0) && ((op_code == 8'hc8) || (op_code == 8'hc9) ||
                                                (op_code == 8'hca) || (op_code == 8'hcb) ||
-                                               (op_code == 8'hcd));
+                                               (op_code == 8'hcd) ||
+                                               // standard set (dialect switch):
+                                               (op_code == 8'h47) || (op_code == 8'h48) ||
+                                               (op_code == 8'h4b) || (op_code == 8'h4e) ||
+                                               // 0x01 REZERO = the AppleCD player's
+                                               // STOP button ("nonstandard stop audio
+                                               // playback", BlueSCSI) — rejecting it
+                                               // raised the error dialog with music
+                                               // still playing (sense 5/0x20 latched,
+                                               // 2026-07-20). SEEK(6)/(10) carry the
+                                               // same Annex-C stop-audio semantics.
+                                               (op_code == 8'h01) ||
+                                               (op_code == 8'h0b) || (op_code == 8'h2b));
+wire       cmd_cd_toc43  = (CDROM != 0) && (op_code == 8'h43);  // standard READ TOC (any format)
+// old-style format select in the CONTROL byte (cmd[9][7:6]) — the AppleCD
+// driver's actual dialect on the 8004 identity (2026-07-19 capture: 0x80).
+// Oracles: BlueSCSI apple-quirks (0x80=full TOC, 0x40=session info) + Snow.
+// Unknown format 2'b11 falls back to format 0 (benign, never observed).
+wire       cmd_cd_t43f2  = cmd_cd_toc43 && (cmd[9][7:6] == 2'b10);  // FULL TOC (format 2)
+wire       cmd_cd_t43f1  = cmd_cd_toc43 && (cmd[9][7:6] == 2'b01);  // SESSION INFO (format 1)
+wire       cmd_cd_t43f0  = cmd_cd_toc43 && !cmd_cd_t43f2 && !cmd_cd_t43f1;
+wire       cmd_cd_subq43 = (CDROM != 0) && (op_code == 8'h42);  // standard READ SUB-CHANNEL
 wire       cmd_cd_prevent   = (CDROM != 0) && (op_code == 8'h1e);  // PREVENT/ALLOW MEDIUM REMOVAL
 wire       cmd_cd_startstop = (CDROM != 0) && (op_code == 8'h1b);  // START/STOP UNIT
+
+// ----- BlueSCSI Toolbox vendor commands (0xD0-0xD9) ----------------------
+// M0 = the RTL-serviceable subset that needs NO host filesystem, so the Mac
+// "BlueSCSI SD Transfer" client can DETECT the device:
+//   * 0xD9 DEVICE INFO  - static device-list / capabilities (like INQUIRY)
+//   * 0xD6 TOGGLE DEBUG - a stored flag (get/set), no side effects
+// Detection (MODE SENSE page 0x31 + 0xD9/0xD6) AND the filesystem opcodes
+// (0xD0/D1/D2) are ALL gated on tb_ready, so the target advertises Toolbox
+// capability only when the HPS handler is present and the slot is mounted. On a
+// stock Main (no handler) tb_ready=0: every Toolbox response degrades to a plain
+// disk, so the Mac client never engages. (The earlier "detection works
+// standalone, fs ops degrade to empty folder" plan hung the client on app-close
+// -- the page-0x31 advert is what makes it engage, so it must be gated too.)
+// docs/BLUESCSI_MISTER_MAIN_PLAN.md
+wire       cmd_tb_devinfo   = TOOLBOX_ENABLE && tb_ready && (op_code == 8'hd9);      // DEVICE INFO
+wire       cmd_tb_fs_in     = TOOLBOX_ENABLE && (op_code == 8'hd0 || op_code == 8'hd1 || op_code == 8'hd2); // LIST/GET/COUNT (HPS round-trip, DataIn)
+// SEND/upload (Mac -> host), DataOut. FIRST CUT = single-block: the CDB and the
+// payload ride one round-trip block (CDB at [0..9], payload at [16..]), so a
+// chunk is capped at 512-16 = 496 B (fine for the small co-test files; >496 B
+// chunks / CAP_LARGE_SEND are future multi-block work). 0xD5 has no data phase.
+wire       cmd_tb_send_prep = TOOLBOX_ENABLE && (op_code == 8'hd3);   // SEND FILE PREP (33-B name)
+wire       cmd_tb_send_data = TOOLBOX_ENABLE && (op_code == 8'hd4);   // SEND FILE DATA (chunk)
+wire       cmd_tb_send_end  = TOOLBOX_ENABLE && (op_code == 8'hd5);   // SEND FILE END (no payload)
+wire       cmd_tb_send      = cmd_tb_send_prep || cmd_tb_send_data || cmd_tb_send_end;
+wire       cmd_tb_send_pay  = cmd_tb_send_prep || cmd_tb_send_data;   // has a DataOut payload
+wire       cmd_tb_debug     = TOOLBOX_ENABLE && tb_ready && (op_code == 8'hd6);      // TOGGLE DEBUG
+wire       cmd_tb_debug_get = cmd_tb_debug && (cmd[1] != 8'd0);    // CDB[1]!=0 -> read flag
+wire       tb_devinfo_caps  = cmd_tb_devinfo && (cmd[1] == 8'h01); // subcmd 1 = capabilities
+// 0xD9 allocation length is CDB[8] (0 -> 8 bytes; otherwise min(CDB[8],8)).
+wire [31:0] tb_devinfo_alloc = (cmd[8] == 8'd0) ? 32'd8 : {24'd0, cmd[8]};
+wire [31:0] tb_devinfo_len   = (tb_devinfo_alloc < 32'd8) ? tb_devinfo_alloc : 32'd8;
+
+// DEVICE INFO data (docs/BLUESCSI_HANDOFF.md §4.8): subcmd 0x00 LIST DEVICES ->
+// 8 bytes; this target's own ID = 0x00 (fixed disk present), every other ID =
+// 0xFF (absent). subcmd 0x01 GET CAPABILITIES -> API version 0 + cap flags; M0
+// has no host transfer path so advertise 0x00 (force v0 paths) -> all zero.
+// Bump caps when the HPS round trip lands (M2/M3).
+wire [7:0] tb_devinfo_dout       = tb_devinfo_caps ? 8'h00 : (data_cnt       == {29'd0, ID}) ? 8'h00 : 8'hff;
+wire [7:0] tb_devinfo_dout_next  = tb_devinfo_caps ? 8'h00 : (data_cnt_next  == {29'd0, ID}) ? 8'h00 : 8'hff;
+wire [7:0] tb_devinfo_dout_next2 = tb_devinfo_caps ? 8'h00 : (data_cnt_next2 == {29'd0, ID}) ? 8'h00 : 8'hff;
+wire [7:0] tb_devinfo_dout_next3 = tb_devinfo_caps ? 8'h00 : (data_cnt_next3 == {29'd0, ID}) ? 8'h00 : 8'hff;
+
+// TOGGLE DEBUG (0xD6): a stored flag with no side effects, so the client's
+// get/set round-trips succeed. get (CDB[1]!=0) returns the flag byte.
+reg        tb_debug_flag;
+wire [7:0] tb_debug_dout       = (data_cnt       == 32'd0) ? {7'd0, tb_debug_flag} : 8'h00;
+wire [7:0] tb_debug_dout_next  = (data_cnt_next  == 32'd0) ? {7'd0, tb_debug_flag} : 8'h00;
+wire [7:0] tb_debug_dout_next2 = (data_cnt_next2 == 32'd0) ? {7'd0, tb_debug_flag} : 8'h00;
+wire [7:0] tb_debug_dout_next3 = (data_cnt_next3 == 32'd0) ? {7'd0, tb_debug_flag} : 8'h00;
+
+// set (CDB[1]==0): latch CDB[2]!=0 at command completion. Single-driver always
+// block (Quartus-clean); the flag is observable only via the 0xD6 get path.
+always @(posedge clk) begin
+	if (rst) tb_debug_flag <= 1'b0;
+	else if (cmd_cpl && (phase == PHASE_CMD_IN) && cmd_tb_debug && (cmd[1] == 8'd0))
+		tb_debug_flag <= (cmd[2] != 8'd0);
+end
 
 // valid command in buffer? TODO: check for valid command parameters
 wire  cmd_ok_hd = cmd_read || cmd_write || cmd_inquiry || cmd_test_unit_ready ||
 		  cmd_read_capacity || cmd_mode_select || cmd_format || cmd_mode_sense ||
 		  cmd_read_buffer || cmd_write_buffer || cmd_verify6 || cmd_verify10 ||
-		  cmd_request_sense;
+		  cmd_request_sense || cmd_tb_devinfo || cmd_tb_debug ||
+		  (cmd_tb_fs_in && tb_ready) ||  // fs DataIn ops valid only with a shared folder (else CHECK)
+		  (cmd_tb_send  && tb_ready);    // fs DataOut (upload) ops, likewise
 
 // CD-ROM command set: read-only — WRITE/FORMAT/buffer/verify are NOT accepted
 // (CHECK CONDITION + ILLEGAL REQUEST), matching a real AppleCD drive.
@@ -1000,6 +1527,7 @@ wire  cmd_ok_cd = cmd_read || cmd_inquiry || cmd_test_unit_ready ||
 		  cmd_read_capacity || cmd_mode_select || cmd_mode_sense ||
 		  cmd_request_sense || cmd_cd_eject || cmd_cd_toc || cmd_cd_subq ||
 		  cmd_cd_astat || cmd_cd_actl || cmd_cd_audio_nop ||
+		  cmd_cd_toc43 || cmd_cd_subq43 ||
 		  cmd_cd_prevent || cmd_cd_startstop;
 
 wire  cmd_ok = (CDROM != 0) ? cmd_ok_cd : cmd_ok_hd;
@@ -1009,8 +1537,16 @@ wire  cmd_ok = (CDROM != 0) ? cmd_ok_cd : cmd_ok_hd;
 // MacOS "hammer the drive asking the user to format it", cd.cpp:1214).
 wire  cd_needs_media = cmd_test_unit_ready || cmd_read || cmd_read_capacity ||
 		  cmd_cd_toc || cmd_cd_subq || cmd_cd_astat || cmd_cd_actl ||
+		  cmd_cd_toc43 || cmd_cd_subq43 ||
 		  cmd_cd_audio_nop;
 wire  cd_no_media = (CDROM != 0) && !mounted && cd_needs_media;
+
+// Data READs against a disc with no data track (pure audio CD) must CHECK
+// with ILLEGAL REQUEST + ASC 0x64 "illegal mode for this track" — real
+// AppleCD behavior (BlueSCSI/Snow). The Audio CD Access extension RELIES on
+// this failure to classify the disc; serving audio bytes as data sends the
+// Finder through garbage (2026-07-20 system error 10 at desktop mount).
+wire  cd_audio_read_rej = (CDROM != 0) && mounted && cmd_read && ca_disc_audio;
 
 // New-command strobe (one clk on the CDB completing). Used by the CD sense /
 // eject logic; folds away on disk targets.
@@ -1023,6 +1559,37 @@ wire  cd_eject_pulse = cd_new_cmd && cmd_cd_eject && !cd_prevent;
 // cleared by the next successful non-REQUEST-SENSE command (SCSI-1 semantics).
 reg [3:0] cd_sense_key = 4'd0;
 reg [7:0] cd_sense_asc = 8'd0;
+// JTAG CDA1 probe regs: every dispatched command latches its opcode; the
+// accept/reject flag tells whether cmd_ok took it (a rejected PLAY is the
+// interesting datum). Driven from the main phase FSM block only.
+reg [7:0] dbg_last_op = 8'd0;
+// CDA2: the exact 0xC1 READ TOC request the guest last issued —
+// {cdb9 (operation bits), cdb5 (start track BCD), cdb7:cdb8 (allocation)}.
+// The served bytes are fully determined by these + the resp plane, so this
+// pins down the "player shows 2 tracks" divergence (2026-07-18).
+reg [31:0] dbg_toc_cdb = 32'd0;
+// CDA3/CDA4: full CDB of the last PLAY-CLASS command (0x47/48/4B/4E and the
+// vendor C8..CD set) — the 0x42 position-poll flood (4/s during playback)
+// overwrites dbg_last_op within 250 ms, so the skip-failure ask (2026-07-20:
+// skip during playback lands the engine idle, player shows track 0) is
+// unrecoverable from CDA1 alone. {op,cdb3,cdb4,cdb5} + {cdb1,cdb6,cdb7,cdb8}
+// reconstruct every play form (MSF, TRACK/INDEX, pause/resume flag).
+reg [31:0] dbg_play_cdb  = 32'd0;
+reg [31:0] dbg_play_cdb2 = 32'd0;
+wire cmd_play_class = (op_code == 8'h47) || (op_code == 8'h48) ||
+                      (op_code == 8'h4b) || (op_code == 8'h4e) ||
+                      (op_code == 8'hc8) || (op_code == 8'hc9) ||
+                      (op_code == 8'hca) || (op_code == 8'hcb) ||
+                      (op_code == 8'hcd) ||
+                      (op_code == 8'h01) ||
+                      (op_code == 8'h0b) || (op_code == 8'h2b);
+reg [7:0] dbg_cmd_cnt = 8'd0;
+reg       dbg_last_ok = 1'b0;
+assign dbg_cda2 = dbg_toc_cdb;
+assign dbg_cda3 = dbg_play_cdb;
+assign dbg_cda4 = dbg_play_cdb2;
+assign dbg_cda1 = { ca_toc_ready, cd_no_media, mounted, dbg_last_ok,
+                    cd_sense_asc, cd_sense_key, dbg_cmd_cnt, dbg_last_op };
 reg       cd_prevent   = 1'b0;
 always @(posedge clk) begin
 	if (rst) begin
@@ -1030,12 +1597,19 @@ always @(posedge clk) begin
 		cd_sense_asc <= 8'd0;
 		cd_prevent   <= 1'b0;
 	end else if ((CDROM != 0) && cd_new_cmd) begin
+		if (cmd_play_class) begin
+			dbg_play_cdb  <= {op_code, cmd[3], cmd[4], cmd[5]};
+			dbg_play_cdb2 <= {cmd[1], cmd[6], cmd[7], cmd[8]};
+		end
 		if (!cmd_ok) begin
 			cd_sense_key <= 4'h5;  // ILLEGAL REQUEST
 			cd_sense_asc <= 8'h20; // invalid operation code
 		end else if (cd_no_media) begin
 			cd_sense_key <= 4'h2;  // NOT READY
 			cd_sense_asc <= 8'hb0; // AppleCD vendor "no disc"
+		end else if (cd_audio_read_rej) begin
+			cd_sense_key <= 4'h5;  // ILLEGAL REQUEST
+			cd_sense_asc <= 8'h64; // illegal mode for this track
 		end else if (cmd_cd_eject) begin
 			if (cd_prevent) begin
 				cd_sense_key <= 4'h5; // ILLEGAL REQUEST
@@ -1062,11 +1636,11 @@ reg [15:0] tlen;
 always @(posedge clk) begin
 	if (old_io_ack & ~io_ack) lba <= lba + 1'd1;
 	if(cmd_cpl && (phase == PHASE_CMD_IN)) begin
-		// CDROM READs address 2048-byte logical blocks; the HPS block device is
-		// 512-byte sectors, so scale lba/tlen by 4 AT LATCH TIME and the whole
-		// downstream ring/flush/data_len machinery runs unmodified in 512-byte
-		// units. Non-READ commands keep raw CDB values (their lengths are byte
-		// counts, e.g. MODE SELECT / AUDIO CONTROL).
+		// CDROM READs address 2048-byte logical blocks; the HPS block device
+		// is 512-byte sectors, so scale lba/tlen by 4 AT LATCH TIME and the
+		// whole downstream ring/flush/data_len machinery runs unmodified in
+		// 512-byte units. Non-READ commands keep raw CDB values (their
+		// lengths are byte counts, e.g. MODE SELECT / AUDIO CONTROL).
 		if ((CDROM != 0) && cmd_read) begin
 			lba  <= (cmd6_cpl?{11'd0, lba6}:lba10) << 2;
 			tlen <= (cmd6_cpl?{7'd0, tlen6}:tlen10) << 2;
@@ -1093,7 +1667,10 @@ wire [15:0] tlen10 = { cmd[7], cmd[8] };
 always @(posedge clk) begin
 	if(rst) begin
 		phase <= PHASE_IDLE;
+		ca_cmd_stb <= 1'b0; ca_read_stb <= 1'b0; ca_eject_stb <= 1'b0;
 	end else begin
+		// CD-audio engine strobes: 1-clk pulses on command acceptance below
+		ca_cmd_stb <= 1'b0; ca_read_stb <= 1'b0; ca_eject_stb <= 1'b0;
 		if(phase == PHASE_IDLE) begin
 			// Own id on bus during selection? Real SCSI selection requires a
 			// FREE bus (SEL asserted, BSY false): while another device holds
@@ -1113,25 +1690,53 @@ always @(posedge clk) begin
 			if(cmd_cpl) begin
 				$display("New command on target %d: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", ID, cmd[0], cmd[1], cmd[2], cmd[3], cmd[4], cmd[5], cmd[6], cmd[7], cmd[8], cmd[9]);
 				// is this a supported and valid command?
-				// (CDROM: media-dependent commands CHECK with the no-disc sense
-				// while unmounted; a prevent-blocked EJECT CHECKs too.)
-				if(cmd_ok && !cd_no_media) begin
+				// (CDROM: media-dependent commands CHECK with the no-disc
+				// sense while unmounted; a prevent-blocked EJECT CHECKs too.)
+				if(cmd_ok && !cd_no_media && !cd_audio_read_rej) begin
 					// yes, continue
 					status <= (cmd_cd_eject && cd_prevent) ? `STATUS_CHECK_CONDITION : `STATUS_OK;
+
+					// notify the CD-audio engine (all constant 0 on disks)
+					ca_cmd_stb   <= cmd_cd_audio_nop;
+					dbg_last_op <= op_code;
+					// latch ONLY op-0x80 (per-track descriptor) asks: the player's
+					// launch-time track walk is the datum; the periodic op00/op40
+					// refresh was overwriting it before we could read (2026-07-19).
+					if (cmd_cd_toc43) dbg_toc_cdb <= {cmd[9], cmd[6], cmd[7], cmd[8]};
+					dbg_cmd_cnt <= dbg_cmd_cnt + 8'd1;
+					dbg_last_ok <= 1'b1;
+					ca_read_stb  <= cmd_read && (CDROM != 0);
+					ca_eject_stb <= (cmd_cd_eject ||
+					                 (cmd_cd_startstop && cmd[4][1] && !cmd[4][0]))
+					                && !cd_prevent;
 
 					// continue according to command
 
 					// these commands return data
-					if(cmd_read || cmd_inquiry || cmd_read_capacity || cmd_mode_sense || cmd_read_buffer || cmd_request_sense || cmd_cd_toc || cmd_cd_subq || cmd_cd_astat) phase <= PHASE_DATA_OUT;
+					if(cmd_tb_fs_in) phase <= PHASE_TB;   // toolbox DataIn fs op: HPS round-trip, then serve
+						else if(cmd_tb_send_end) phase <= PHASE_TB;       // SEND END: no payload, straight to round-trip
+						else if(cmd_tb_send_pay) phase <= PHASE_DATA_IN;  // SEND PREP/DATA: collect the DataOut payload first
+						else if(cmd_read || cmd_inquiry || cmd_read_capacity || cmd_mode_sense || cmd_read_buffer || cmd_request_sense || cmd_tb_devinfo || cmd_tb_debug_get || cmd_cd_toc || cmd_cd_subq || cmd_cd_astat || cmd_cd_toc43 || cmd_cd_subq43) phase <= PHASE_DATA_OUT;
 					// these commands receive dataa
 					else if(cmd_write || cmd_mode_select || cmd_write_buffer || cmd_cd_actl) phase <= PHASE_DATA_IN;
 					// and all other valid commands are just "ok"
 					else phase <= PHASE_STATUS_OUT;
 				end else begin
 					// no, report failure
+					dbg_last_op <= op_code;
+					dbg_cmd_cnt <= dbg_cmd_cnt + 8'd1;
+					dbg_last_ok <= 1'b0;
 					status <= `STATUS_CHECK_CONDITION;
 					phase <= PHASE_STATUS_OUT;
 				end
+			end
+		end
+
+		else if(phase == PHASE_TB) begin
+			// round-trip done: adopt the HPS status, then serve DataIn or finish.
+			if(tb_state == TBS_RDY) begin
+				status <= tb_status;
+				phase  <= (tb_len != 16'd0) ? PHASE_DATA_OUT : PHASE_STATUS_OUT;
 			end
 		end
 
@@ -1140,7 +1745,10 @@ always @(posedge clk) begin
 		end
 
 		else if(phase == PHASE_DATA_IN) begin
-			if(data_done) phase <= PHASE_STATUS_OUT;
+			// SEND (upload): once the DataOut payload has landed in the toolbox
+			// buffer, run the HPS round-trip (write CDB+payload, read status).
+			// Disk writes still go straight to STATUS.
+			if(data_done) phase <= cmd_tb_send ? PHASE_TB : PHASE_STATUS_OUT;
 		end
 
 		else if(phase == PHASE_STATUS_OUT) begin
@@ -1248,9 +1856,60 @@ end
 assign dbg_wrsnap = { 4'd0, dbg_b1_seen, dbg_b0_seen, dbg_long_l, dbg_word_l,
                       dbg_low_l, dbg_b1, dbg_b0 };
 
-// Multi-block WRITE stall snapshot (2026-06-10). Live data-transfer state.
-assign dbg_wrstall = { req, tlen[5:0], cmd_write, sd_buff_sel, io_busy,
-                       io_ack, io_wr, data_complete, phase, data_cnt[15:0] };
+// ---- Bus-reset snapshot (PSCW probe, repurposed for selection/reset forensics) ----
+// The read-abort probe returned valid=0 — reads do NOT die mid-transfer; the wedge
+// and the bus resets cluster in the selection/scan path. So capture, at the FIRST
+// SCSI bus reset (rst = the Mac asserting ICR.RST), HOW FAR the transaction that
+// triggered it actually got: the high-water phase this window (IDLE => target never
+// left IDLE = selection never succeeded; CMD_IN => command failed; DATA/STATUS/MSG
+// => transaction progressed), whether a cmd_read COMPLETED, whether SEL was ever
+// asserted, and the last full command opcode. win_* accumulate per window (since the
+// previous reset) and snapshot into the sticky brst_* at the reset edge. brst_*
+// survive rst (initial only). Phase encoding is monotonic with progress (IDLE0 <
+// CMD_IN1 < DATA2/3 < STATUS4 < MSG5), so the numeric max IS the furthest phase.
+reg  [2:0] win_maxphase;   // high-water phase since the last bus reset
+reg        win_read_done;  // a cmd_read DATA_OUT reached data_complete this window
+reg  [7:0] win_lastop;     // last full command opcode assembled
+reg        win_sel_seen;   // SEL asserted this window
+reg        brst_rst_d;
+reg        brst_valid;
+reg  [2:0] brst_maxphase;
+reg        brst_read_done;
+reg        brst_sel_seen;
+reg  [6:0] brst_count;
+reg  [7:0] brst_lastop;
+initial begin
+	win_maxphase = 0; win_read_done = 0; win_lastop = 0; win_sel_seen = 0;
+	brst_rst_d = 0; brst_valid = 0; brst_maxphase = 0; brst_read_done = 0;
+	brst_sel_seen = 0; brst_count = 0; brst_lastop = 0;
+end
+always @(posedge clk) begin
+	brst_rst_d <= rst;
+	// per-window accumulation
+	if (phase > win_maxphase)                                   win_maxphase  <= phase;
+	if (cmd_read && (phase == PHASE_DATA_OUT) && data_complete) win_read_done <= 1'b1;
+	if (cmd_cpl && (phase == PHASE_CMD_IN))                     win_lastop    <= cmd[0];
+	if (sel)                                                    win_sel_seen  <= 1'b1;
+	// bus-reset rising edge: snapshot this window, then clear for the next
+	if (rst && !brst_rst_d) begin
+		if (brst_count != 7'h7F) brst_count <= brst_count + 7'd1;
+		if (!brst_valid) begin
+			brst_valid     <= 1'b1;
+			brst_maxphase  <= win_maxphase;
+			brst_read_done <= win_read_done;
+			brst_sel_seen  <= win_sel_seen;
+			brst_lastop    <= win_lastop;
+		end
+		win_maxphase  <= 3'd0;
+		win_read_done <= 1'b0;
+		win_sel_seen  <= 1'b0;
+	end
+end
+//  PSCW layout: [31]=valid [30:28]=brst_maxphase [27]=read_done [26]=sel_seen
+//               [25:19]=reset_count(7) [18:11]=last_opcode(8)
+//               [10:8]=live win_maxphase [7]=live win_read_done [6:0]=0
+assign dbg_wrstall = { brst_valid, brst_maxphase, brst_read_done, brst_sel_seen,
+                       brst_count, brst_lastop, win_maxphase, win_read_done, 7'd0 };
 
 // ---- Selection/command handshake observability (PSEL probe) -----------
 // Live state {phase,sel,bsy,req,ack} plus sticky high-water/counters that
@@ -1581,15 +2240,13 @@ module scsi_dpram #(parameter DATAWIDTH=8, ADDRWIDTH=9)
 	output reg [DATAWIDTH-1:0] q_d
 );
 
-// ram_ab is the ONLY storage array (pdma-prefetch redesign, ported from
-// MacLC a2ae04d on 2026-07-18; HW-validated there incl. heavy-read + CD).
+// ram_ab is the ONLY storage array (pdma-prefetch redesign, 2026-07-17).
 // The former ram_c/ram_d arrays were full mirror COPIES of the buffer whose
 // only job was serving same-cycle look-ahead reads at address_c/address_d
-// (mac_addr+1/+2 for the pseudo-DMA word/longword assembly). Across this
-// core's six ring instances they cost 39 M10K blocks (543/553 device
-// near-saturation). They are replaced by a prefetch controller that reads
-// the look-ahead bytes through IDLE port-B cycles into q_c/q_d holding
-// registers.
+// (mac_addr+1/+2 for the pseudo-DMA word/longword assembly). Across the six
+// ring instances they cost ~48 M10K blocks and drove the device to 553/553
+// saturation. They are replaced by a prefetch controller that reads the
+// look-ahead bytes through IDLE port-B cycles into q_c/q_d holding registers.
 //
 // TIMING CONTRACT (what makes this legal): ncr5380 samples dout/dout_pair/
 // dout_pair_next ONLY at DREQ-gated instants, and holds DREQ down for
@@ -1605,10 +2262,11 @@ module scsi_dpram #(parameter DATAWIDTH=8, ADDRWIDTH=9)
 // in-flight) look-ahead address marks the prefetch stale; the controller
 // refetches, and the post-write read returns the fresh data. No forwarding
 // paths — the RAM is always the single source of truth.
-// M10K pin per the migrating fabric-fallback lore (MacLC bae8fd8; the
-// original a2ae04d redesign shipped unpinned, MacLC re-added it in
-// effb436). ram_ab has never flipped (TDP shape infers reliably) —
-// insurance, not a bug fix; expect zero delta in the map audit.
+// M10K pin per the migrating fabric-fallback law (bae8fd8 on add-cd-audio;
+// this redesign was authored from master and the 2544a1f merge took it
+// wholesale, silently dropping the pin — found 2026-07-18 by the MacIIvi
+// port review). ram_ab has never flipped (TDP shape infers reliably), so
+// this is insurance, not a bug fix; expect zero delta in the map audit.
 (* ramstyle = "M10K,no_rw_check" *) reg [DATAWIDTH-1:0] ram_ab[0:(1<<ADDRWIDTH)-1];
 
 // ---- port A: HPS side (behavior unchanged) -------------------------------

@@ -99,6 +99,7 @@ V_SRC = \
 	$(RTL)/floppy_track_encoder.v \
 	$(RTL)/mfm_track_encoder.v \
 	$(RTL)/scsi.v \
+	$(RTL)/cd_audio.sv \
 	$(RTL)/ncr5380.sv \
 	$(RTL)/scc.v \
 	$(RTL)/nubus/nubus_video_mdc824.sv \

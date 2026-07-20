@@ -168,7 +168,8 @@ module emu
 	localparam SCSI_DEVS = 2;          // SCSI block devices -> hps_io slots 0,1
 	localparam VD_PRAM   = 2;          // PRAM NVRAM save image -> hps_io slot 2
 	localparam VD_CDROM  = 3;          // CD-ROM image (SCSI ID 3) -> hps_io slot 3
-	localparam VDNUM     = 4;          // total hps_io block devices
+	localparam VD_TOOLBOX = 4;         // BlueSCSI Toolbox shared folder -> hps_io slot 4
+	localparam VDNUM     = 5;          // total hps_io block devices
 
 	// the status register is controlled by the on screen display (OSD)
 	wire [31:0] status;
@@ -228,6 +229,24 @@ module emu
 	// ID 3 vanish from the bus entirely — the pre-CD baseline, kept as a
 	// hardware A/B lever given the SCSI wedge history.
 	wire        cd_enable  = ~status[18];
+
+	// BlueSCSI Toolbox dedicated slot (4): isolated block device driven by the
+	// primary SCSI target (ID 0) through dataController. There is deliberately
+	// NO OSD "SC4" file-picker entry — the Toolbox shared folder is exposed by
+	// the HPS (Main_MiSTer) handler, not user-mounted, matching MacLC. Inert
+	// (graceful degradation) until a MacIIvi Main build mounts a shared folder
+	// here (tb_mounted) and answers the round-trips; see the BlueSCSI core/HPS
+	// contract. SLOT-INDEX CONTRACT: the Main Toolbox handler for MacIIvi MUST
+	// use slot 4 (MacLC uses slot 3 there — CD-ROM already owns slot 3 here).
+	wire [31:0] tb_lba;
+	wire        tb_rd, tb_wr;
+	wire [15:0] tb_buff_din;
+	assign sd_lba[VD_TOOLBOX]      = tb_lba;
+	assign sd_rd [VD_TOOLBOX]      = tb_rd;
+	assign sd_wr [VD_TOOLBOX]      = tb_wr;
+	assign sd_buff_din[VD_TOOLBOX] = tb_buff_din;
+	wire        tb_ack     = sd_ack[VD_TOOLBOX];
+	wire        tb_mounted = img_mounted[VD_TOOLBOX];
 	wire        ioctl_write;
 	reg         ioctl_wait = 0;
 	wire [10:0] ps2_key;
@@ -630,8 +649,18 @@ module emu
 	end
 
 	// ASC samples drive AUDIO_L/R directly (Commit C). Legacy DMA gone.
-	assign AUDIO_L = asc_sample_l;
-	assign AUDIO_R = asc_sample_r;
+	// ASC samples drive AUDIO_L/R, with CD audio (SCSI CD-ROM playback engine)
+	// mixed in at half gain, saturating. cd_snd_* are exact zeros whenever the
+	// drive isn't playing, so this is transparent to the existing ASC path.
+	wire signed [15:0] cd_snd_l, cd_snd_r;
+	wire signed [16:0] audio_mix_l = {asc_sample_l[15], asc_sample_l}
+	                               + {{2{cd_snd_l[15]}}, cd_snd_l[15:1]};
+	wire signed [16:0] audio_mix_r = {asc_sample_r[15], asc_sample_r}
+	                               + {{2{cd_snd_r[15]}}, cd_snd_r[15:1]};
+	assign AUDIO_L = (audio_mix_l > 17'sd32767)  ? 16'sd32767 :
+	                 (audio_mix_l < -17'sd32768) ? -16'sd32768 : audio_mix_l[15:0];
+	assign AUDIO_R = (audio_mix_r > 17'sd32767)  ? 16'sd32767 :
+	                 (audio_mix_r < -17'sd32768) ? -16'sd32768 : audio_mix_r[15:0];
 	assign AUDIO_S = 1;
 	assign AUDIO_MIX = 0;
 
@@ -1846,6 +1875,28 @@ module emu
 		.cd_io_wr(),           // read-only target: never writes
 		.cd_io_ack(cd_ack),
 		.cd_sd_buff_din(cd_buff_din),
+
+		// BlueSCSI Toolbox dedicated slot (4) — Main-managed shared folder.
+		.tb_mounted(tb_mounted),
+		.tb_lba(tb_lba),
+		.tb_rd(tb_rd),
+		.tb_wr(tb_wr),
+		.tb_ack(tb_ack),
+		.tb_buff_din(tb_buff_din),
+
+		// CD audio PCM -> AUDIO_L/R mixer (declared near the audio assigns above)
+		.cd_snd_l(cd_snd_l),
+		.cd_snd_r(cd_snd_r),
+
+		// CD-audio engine JTAG visibility (CDA0..CDA4). Left unconnected here:
+		// the MacIIvi JTAG hub is near its node ceiling and altsource_probe is
+		// FPGA-only. For HW CD-audio bring-up, wire these to altsource_probe
+		// blocks if the hub budget allows (cp_cda0..4 in MacLC MacLC.sv).
+		.dbg_cda0(),
+		.dbg_cda1(),
+		.dbg_cda2(),
+		.dbg_cda3(),
+		.dbg_cda4(),
 
 		// PRAM persistence (NVRAM) — driven by the FSM above
 		.pram_load_wr(pram_load_wr),

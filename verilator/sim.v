@@ -1090,6 +1090,14 @@ module emu
 		.cd_io_ack(sd_ack[2]),
 		.cd_sd_buff_din(cd_buff_din),
 
+		// dataController's CD-audio/Toolbox ports (cd_snd_l/r, tb_*, dbg_cda*)
+		// are intentionally left UNCONNECTED here: the headless sim mixes no
+		// audio and has no Toolbox shared folder, so the tb_ inputs default to 0
+		// (Toolbox disabled) and the outputs dangle. Do NOT tie tb_mounted/tb_ack
+		// to constants — Verilator 5.020 internal-faults on that specific
+		// constant-to-input in this netlist; the unconnected form is equivalent
+		// and is also what MacLC's sim.v does. (FPGA top MacIIvi.sv wires them.)
+
 		// PRAM persistence — tied off (step 1); FSM wired in step 2
 		.pram_load_wr(1'b0),
 		.pram_load_addr(8'd0),

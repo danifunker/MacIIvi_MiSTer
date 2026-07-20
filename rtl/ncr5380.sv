@@ -80,17 +80,29 @@ module ncr5380
 	output      [15:0] sd_buff_din[DEVS],
 	input              sd_buff_wr,
 
+	// ---- BlueSCSI Toolbox dedicated block interface (primary target / ID 6) --
+	input         tb_mounted,
+	output [31:0] tb_lba,
+	output        tb_rd,
+	output        tb_wr,
+	input         tb_ack,
+	output [15:0] tb_buff_din,
+
+	// CD audio PCM from the CDROM target's playback engine
+	output signed [15:0] cd_snd_l,
+	output signed [15:0] cd_snd_r,
+
 	// ---- CD-ROM target (SCSI ID 3) dedicated block interface ----------------
 	// Own hps_io slot; read-only. cd_enable = OSD "CD-ROM Drive" option: when
 	// off the target never answers selection (bus looks exactly like pre-CD
 	// builds — the A/B lever if the new target ever misbehaves on HW).
-	input              cd_enable,
-	input              cd_img_mounted,
-	output      [31:0] cd_io_lba,
-	output             cd_io_rd,
-	output             cd_io_wr,
-	input              cd_io_ack,
-	output      [15:0] cd_sd_buff_din,
+	input         cd_enable,
+	input         cd_img_mounted,
+	output [31:0] cd_io_lba,
+	output        cd_io_rd,
+	output        cd_io_wr,
+	input         cd_io_ack,
+	output [15:0] cd_sd_buff_din,
 
 	// JTAG debug: selection/arbitration state for the hardware hang
 	output      [15:0] dbg_scsi,
@@ -125,14 +137,21 @@ module ncr5380
 	// OSD-mounted disk usually lands there). Layout = scsi.v dbg_wrstall:
 	//   [15:0]=data_cnt [18:16]=phase [19]=data_complete [20]=io_wr [21]=io_ack
 	//   [22]=io_busy [23]=sd_buff_sel [24]=cmd_write [30:25]=tlen [31]=req
-	output      [31:0] dbg_wr
+	output      [31:0] dbg_wr,
+	// JTAG CDA0/CDA1: CD-audio engine + CD target command visibility
+	output      [31:0] dbg_cda0,
+	output      [31:0] dbg_cda1,
+	output      [31:0] dbg_cda2,
+	output      [31:0] dbg_cda3,
+	output      [31:0] dbg_cda4
 );
 	parameter DEVS = 2;
 	// Read-prefetch ring depth for the CD target. 2 => 4 sectors / 2KB = one
 	// 2048-byte CD block buffered. Kept minimal because MacIIvi's M10K is full
 	// (mdc824 card VRAM); the freed block comes from the 2nd disk's ring above.
 	// The CD is read-only, low-bandwidth, and never the boot device, so a
-	// shallow ring is fine.
+	// shallow ring is fine. (Even tighter now that cd_audio.sv adds its own
+	// TOC/frame RAMs — do NOT bump this without an M10K fit check.)
 	parameter CD_RING_LOG = 2;
 
 	reg  [7:0] mr;        /* Mode Register */
@@ -184,7 +203,52 @@ module ncr5380
 	 * host sampling alignment. (verilator/scsi_bench reproduces all three.)
 	 */
 	wire dma_ack_busy = dma_ack | (dma_ack_holdoff != 3'd0) | (dma_settle != 4'd0);
-	assign dreq = scsi_req & dma_en & !dma_ack_busy;
+
+	/* PDMA host-face pipeline registers — fit hardening (2026-07-19).
+	 *
+	 * dreq and the presented read data used to leave this module as raw
+	 * combinational cones: target FSM / serve-lane muxes (incl. the CD
+	 * target's TOC/T43 readback with its serve-time address transform)
+	 * -> device-select mux -> across the chip to CPU DTACK/din, timed
+	 * single-cycle at full clk_sys rate. STA-met builds still wedged on
+	 * hardware whenever the fitter placed that cone thin (berr-climb OS
+	 * wedges, PSWL req_drop saturation — the #3 "STA-met-but-HW-fails"
+	 * family; 2026-07-19 lottery closed 0-for-4 on exactly this). One
+	 * clk_sys register at the module boundary makes every CPU-facing net
+	 * flop-sourced and route-short, independent of placement luck:
+	 *
+	 *  - dreq_r: DTACK rises one clk_sys later; the CPU bus cycle is a
+	 *    level-sensitive wait, and the 250 ms sdma watchdog dwarfs it.
+	 *  - din_pair_r/din_pair_next_r: lag the bus wires by the SAME one
+	 *    cycle as dreq_r, so the settle-window invariant ("DREQ up =>
+	 *    presented pair valid") is preserved with the dma_settle count
+	 *    unchanged: DREQ_r up at t => wire DREQ up at t-1 => wire pair
+	 *    valid at t-1 => registered pair valid at t. The longword
+	 *    second-word capture below reads din_pair_next_r at the END of
+	 *    a completed (DREQ-gated) cycle, when the wire had been stable
+	 *    for the whole cycle — the register holds the same value.
+	 *  - host_bus_r: host-read copy of scsi_bus_data (CDR/IDR/DACK byte
+	 *    reads). The targets keep consuming the combinational original —
+	 *    selection/command handshake timing is untouched.
+	 */
+	reg        dreq_r;
+	reg [15:0] din_pair_r;
+	reg [15:0] din_pair_next_r;
+	reg  [7:0] host_bus_r;
+	always @(posedge clk or posedge reset) begin
+		if (reset) begin
+			dreq_r          <= 1'b0;
+			din_pair_r      <= 16'h0000;
+			din_pair_next_r <= 16'h0000;
+			host_bus_r      <= 8'h00;
+		end else begin
+			dreq_r          <= scsi_req & dma_en & !dma_ack_busy;
+			din_pair_r      <= din_pair;
+			din_pair_next_r <= din_pair_next;
+			host_bus_r      <= scsi_bus_data;
+		end
+	end
+	assign dreq = dreq_r;
 
 	wire i_dma_rd = bus_cs &  dack & ior;
 	wire i_dma_wr = bus_cs &  dack & iow;
@@ -273,7 +337,7 @@ module ncr5380
 				 */
 				if (old_dma_rd & ~i_dma_rd &
 				    dma_longword_latched & dma_word_latched & !dma_second_word_latched)
-					dma_second_word_data <= din_pair_next;
+					dma_second_word_data <= din_pair_next_r;
 				dma_ack <= dma_en & bsr_pmatch;
 				if (dma_en & bsr_pmatch)
 					dma_ack_holdoff <= (old_dma_rd & ~i_dma_rd) ?
@@ -309,8 +373,12 @@ module ncr5380
 	wire       out_en = icr[`ICR_A_DATA] | mr[`MR_ARB];
 	wire [7:0] dma_write_data = (dma_ack_holdoff == 3'd1 && dma_word_latched) ? dma_write_low_byte : dout;
 	wire [7:0] scsi_bus_data = (out_en ? dma_write_data : 8'h00) | din;
-	wire [7:0] cur_data = scsi_bus_data;
-	wire [15:0] cur_data_pair = out_en ? { dout, dout } : (dma_suppress_ack_latched ? dma_second_word_data : din_pair);
+	/* Host-read face: registered copies (see the PDMA pipeline block above).
+	 * cur_data's CDR/IDR consumers are VPA-paced (microsecond-stable values);
+	 * the DACK byte leg and cur_data_pair are DREQ-gated — both tolerate the
+	 * one-cycle lag by the invariant argued there. */
+	wire [7:0] cur_data = host_bus_r;
+	wire [15:0] cur_data_pair = out_en ? { dout, dout } : (dma_suppress_ack_latched ? dma_second_word_data : din_pair_r);
 
 	/* ICR read wires */
 	wire [7:0] icr_read = { icr[`ICR_A_RST],
@@ -336,7 +404,19 @@ module ncr5380
 	/* MR write */
 	always@(posedge clk or posedge reset) begin
 		if (reset) mr <= 8'b0;
-		else if (reg_wr && (bus_rs == `WREG_MR)) mr <= wdata;
+		else if (scsi_rst)
+			/* 5380 datasheet: asserting/observing RST clears MR's DMA MODE bit.
+			 * Without this, dma_en stays armed through the driver's recovery
+			 * bus reset: target returns to IDLE but the host pseudo-DMA keeps
+			 * DREQ/DACK machinery live, and every CPU DACK access stalls to
+			 * the 250ms watchdog ceiling forever (HW capture 2026-07-18:
+			 * berr_fires=255, CPU pinned at $F06408, target phase IDLE,
+			 * PSNC dma_en=1, rst_count=1). BlueSCSI survives the same Mac
+			 * recovery resets precisely because its reset path clears all
+			 * transfer state; MAME's ncr5380 clears the bit too. This turns
+			 * an eternal wedge back into a transient the driver can retry. */
+			mr[`MR_DMA_MODE] <= 1'b0;
+			else if (reg_wr && (bus_rs == `WREG_MR)) mr <= wdata;
 	end
 
 	/* Minimal initiator arbitration. The Mac II ROM writes MR.ARB and then
@@ -587,6 +667,12 @@ module ncr5380
 	wire      [7:0] target_dout[DEVS];
 	wire     [15:0] target_dout_pair[DEVS];
 	wire     [15:0] target_dout_pair_next[DEVS];
+
+	// BlueSCSI Toolbox per-target transport wires; only index 0 (the primary
+	// ID-6 target, TOOLBOX_ENABLE) drives real values — others tie off to 0.
+	wire     [31:0] tb_lba_g[DEVS];
+	wire [DEVS-1:0] tb_rd_g, tb_wr_g;
+	wire     [15:0] tb_buff_din_g[DEVS];
 	reg      [15:0] din_pair;
 	reg      [15:0] din_pair_next;
 
@@ -603,14 +689,22 @@ module ncr5380
 	// CD-ROM target (SCSI ID 3, MAME maciivx.cpp attaches NSCSI_CDROM_APPLE
 	// there). Same wedge-hardened scsi.v target as the disks, in CDROM mode:
 	// read-only, 2048-byte logical blocks over hps_io slot VD_CDROM, AppleCD
-	// command set. Supersedes the scsi_empty_cd stub (kept in scsi.v, no longer
-	// instantiated). Responds to selection whenever cd_enable — media-less
-	// selection returns the AppleCD no-disc sense, which is how the driver's
-	// insertion poll works.
+	// command set. Supersedes the scsi_empty_cd stub (kept in scsi.v,
+	// no longer instantiated). Responds to selection whenever cd_enable —
+	// media-less selection returns the AppleCD no-disc sense, which is how
+	// the driver's insertion poll works.
 	scsi #(.ID(3'd3), .CDROM(1), .RING_LOG(CD_RING_LOG)) cdrom_target
 	(
 		.clk    ( clk ),
 		.rst    ( scsi_rst ),
+		.sys_rst( reset ),
+		.cd_snd_l ( cd_snd_l ),
+		.cd_snd_r ( cd_snd_r ),
+		.dbg_cda0 ( dbg_cda0 ),
+		.dbg_cda1 ( dbg_cda1 ),
+		.dbg_cda2 ( dbg_cda2 ),
+		.dbg_cda3 ( dbg_cda3 ),
+		.dbg_cda4 ( dbg_cda4 ),
 		.sel    ( scsi_sel ),
 		.cd_enable ( cd_enable ),
 		// Selection requires a free bus — a wedged-BUSY device must not let a
@@ -640,12 +734,28 @@ module ncr5380
 		.io_lba ( cd_io_lba ),
 		.io_rd  ( cd_io_rd ),
 		.io_wr  ( cd_io_wr ),
-		.io_ack ( cd_io_ack & cd_bsy ),
+		// io_ack/sd_buff_wr are framed by the SLOT's HPS session (cd_io_ack),
+		// NOT the SCSI bus state: the CD-audio TOC/frame fetches run while the
+		// target is bus-IDLE (cd_bsy=0 is the CA grant condition), so the old
+		// '& cd_bsy' gates starved the blob capture of every write strobe —
+		// blob RAM stayed zeros, MCDA magic never matched (HW 2026-07-17;
+		// fill() provably served 4D 43 44 41). Harmless for data ops: ack
+		// frames those transfers too. scsi.v's idle-phase consumers are safe
+		// (sd_buff_sel held in PHASE_IDLE; rd_hps_blk cmd_read-guarded).
+		.io_ack ( cd_io_ack ),
 
 		.sd_buff_addr( sd_buff_addr ),
 		.sd_buff_dout( sd_buff_dout ),
 		.sd_buff_din( cd_sd_buff_din ),
-		.sd_buff_wr( sd_buff_wr & cd_bsy ),
+		.sd_buff_wr( sd_buff_wr & cd_io_ack ),
+
+		// No Toolbox on the CD target.
+		.tb_mounted ( 1'b0 ),
+		.tb_lba     ( ),
+		.tb_rd      ( ),
+		.tb_wr      ( ),
+		.tb_ack     ( 1'b0 ),
+		.tb_buff_din( ),
 
 		.dbg_mounted( ),
 		.dbg_phase( ),
@@ -670,13 +780,19 @@ module ncr5380
 			// would not boot from it (6.0.8's older SCSI Manager did). CD-ROM
 			// target is at ID 3 (cdrom_target above). Slot i -> SCSI ID i.
 			//
-			// M10K budget: the mdc824 card VRAM fills block RAM (553/553), so
-			// adding the CD read-ring means freeing M10K here. The BOOT disk (ID 0)
-			// keeps RING_LOG=5 — that depth fixed the #2 heavy-read stall on cold
-			// 7.5.5 extension loading. The 2nd disk (ID 1, not the boot path) drops
-			// to 4 (16-sector / 8KB ring, still 2x the old stall-prone 8), which
-			// frees the M10K the CD's CD_RING_LOG=2 ring needs. Net M10K decreases.
-			scsi #(.ID(i[2:0]), .RING_LOG(i == 0 ? 5 : 4)) target
+			// M10K budget: the mdc824 card VRAM fills block RAM, so adding the CD
+			// read-ring means freeing M10K here. The BOOT disk (ID 0) keeps
+			// RING_LOG=5 — that depth fixed the #2 heavy-read stall on cold 7.5.5
+			// extension loading. The 2nd disk (ID 1, not the boot path) drops to 4
+			// (16-sector / 8KB ring, still 2x the old stall-prone 8), which frees
+			// the M10K the CD's CD_RING_LOG=2 ring needs. Net M10K decreases.
+			//
+			// TOOLBOX_ENABLE(i==0): the BlueSCSI Toolbox vendor command set is
+			// answered by the boot disk (ID 0) here — MacLC serves it from ID 6,
+			// but the Toolbox driver locates the drive by INQUIRY page 0x31, not
+			// by ID, so the boot target is fine. Inert until the HPS mounts the
+			// Toolbox shared folder (tb_mounted) and the Main handler answers.
+			scsi #(.ID(i[2:0]), .RING_LOG(i == 0 ? 5 : 4), .TOOLBOX_ENABLE(i == 0)) target
 			(
 				.clk    ( clk ),
 				.rst    ( scsi_rst ),
@@ -716,6 +832,15 @@ module ncr5380
 				.sd_buff_dout( sd_buff_dout ),
 				.sd_buff_din( sd_buff_din[i] ),
 				.sd_buff_wr( sd_buff_wr & target_bsy[i] ),
+
+				// Toolbox transport: only target 0 (ID 6) is wired to the slot.
+				.tb_mounted ( (i == 0) ? tb_mounted : 1'b0 ),
+				.tb_lba     ( tb_lba_g[i] ),
+				.tb_rd      ( tb_rd_g[i] ),
+				.tb_wr      ( tb_wr_g[i] ),
+				.tb_ack     ( (i == 0) ? tb_ack : 1'b0 ),
+				.tb_buff_din( tb_buff_din_g[i] ),
+
 				.dbg_mounted( target_mounted[i] ),
 				.dbg_phase( target_phase[i] ),
 				.dbg_hs( target_hs[i] ),
@@ -730,6 +855,12 @@ module ncr5380
 			);
 		end
 	endgenerate
+
+	// BlueSCSI Toolbox: surface the primary target's transport to the module port.
+	assign tb_lba      = tb_lba_g[0];
+	assign tb_rd       = tb_rd_g[0];
+	assign tb_wr       = tb_wr_g[0];
+	assign tb_buff_din = tb_buff_din_g[0];
 
 	// JTAG debug: capture the selection/arbitration handshake state.
 	//  [15]    out_en       (initiator driving the data bus?)
