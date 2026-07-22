@@ -46,7 +46,7 @@ set_global_assignment -name ECO_OPTIMIZE_TIMING ON
 set_global_assignment -name PERIPHERY_TO_CORE_PLACEMENT_AND_ROUTING_OPTIMIZATION ON
 set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT LOW
-set_global_assignment -name SEED 5
+set_global_assignment -name SEED 2
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -368,6 +368,9 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 # 2026-07-16 onesec-retune netlist rolled the HDMI divclk to -0.441 on it;
 # sweep on that netlist: 4 -> -0.060 (HDMI divclk), 5 -> +0.081 all met. The
 # violations were always HDMI-scaler-only; clk_sys/egret stayed >= +1.2.
+# cd-changer netlist (1bebe75): 5 -> -0.200 (ascal o_hcpt, HDMI-only again;
+# clk_sys +1.65); sweep hit first roll: 2 -> +0.109 all met, 522/553 M10K.
+# Per-fit law: every netlist change is a fresh roll — re-sweep, don't assume.
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION OFF
 set_global_assignment -name ROUTER_LCELL_INSERTION_AND_LOGIC_DUPLICATION OFF
