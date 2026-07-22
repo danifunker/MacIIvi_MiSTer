@@ -80,13 +80,23 @@ module ncr5380
 	output      [15:0] sd_buff_din[DEVS],
 	input              sd_buff_wr,
 
-	// ---- BlueSCSI Toolbox dedicated block interface (primary target / ID 6) --
+	// ---- BlueSCSI Toolbox dedicated block interface (primary target / ID 0) --
 	input         tb_mounted,
 	output [31:0] tb_lba,
 	output        tb_rd,
 	output        tb_wr,
 	input         tb_ack,
 	output [15:0] tb_buff_din,
+
+	// ---- BlueSCSI Toolbox CD Changer block interface (CD target / ID 3) ------
+	// Same transport shape as tb_* above, dedicated to the cdrom_target so it can
+	// enumerate/switch CD images. docs/BLUESCSI_CD_CHANGER_CONTRACT.md
+	input         cdtb_mounted,
+	output [31:0] cdtb_lba,
+	output        cdtb_rd,
+	output        cdtb_wr,
+	input         cdtb_ack,
+	output [15:0] cdtb_buff_din,
 
 	// CD audio PCM from the CDROM target's playback engine
 	output signed [15:0] cd_snd_l,
@@ -693,7 +703,9 @@ module ncr5380
 	// no longer instantiated). Responds to selection whenever cd_enable —
 	// media-less selection returns the AppleCD no-disc sense, which is how
 	// the driver's insertion poll works.
-	scsi #(.ID(3'd3), .CDROM(1), .RING_LOG(CD_RING_LOG)) cdrom_target
+	// TB_ADDRW(11) = 4 KB tb buffer (8 sectors) so LIST CDS holds the full
+	// 100-entry list in one fetch-all-then-serve pass (§4/§10 of the contract).
+	scsi #(.ID(3'd3), .CDROM(1), .CDCHANGER_ENABLE(1), .TB_ADDRW(11), .RING_LOG(CD_RING_LOG)) cdrom_target
 	(
 		.clk    ( clk ),
 		.rst    ( scsi_rst ),
@@ -747,15 +759,22 @@ module ncr5380
 		.sd_buff_addr( sd_buff_addr ),
 		.sd_buff_dout( sd_buff_dout ),
 		.sd_buff_din( cd_sd_buff_din ),
-		.sd_buff_wr( sd_buff_wr & cd_io_ack ),
+		// Frame sd_buff_wr by EITHER slot session that fills a buffer inside this
+		// target: cd_io_ack (CD-ROM/CD-audio, slot VD_CDROM) OR cdtb_ack (CD Changer
+		// tb round-trip, slot VD_CD_TOOLBOX). Without the cdtb_ack term every slot-5
+		// fill strobe was blanked, so the tb buffer (tb_hps_wr = sd_buff_wr & tb_ack)
+		// never captured the HPS status/data block -> the core read back its own CDB
+		// -> signature 0x00 != 0xB5 -> boxes. The two slots are serviced disjointly
+		// (one HPS session at a time), so the OR never double-frames. (2026-07-21)
+		.sd_buff_wr( sd_buff_wr & (cd_io_ack | cdtb_ack) ),
 
-		// No Toolbox on the CD target.
-		.tb_mounted ( 1'b0 ),
-		.tb_lba     ( ),
-		.tb_rd      ( ),
-		.tb_wr      ( ),
-		.tb_ack     ( 1'b0 ),
-		.tb_buff_din( ),
+		// BlueSCSI Toolbox CD Changer transport (0xD7/D8/DA) -> slot VD_CD_TOOLBOX.
+		.tb_mounted ( cdtb_mounted ),
+		.tb_lba     ( cdtb_lba ),
+		.tb_rd      ( cdtb_rd ),
+		.tb_wr      ( cdtb_wr ),
+		.tb_ack     ( cdtb_ack ),
+		.tb_buff_din( cdtb_buff_din ),
 
 		.dbg_mounted( ),
 		.dbg_phase( ),
@@ -788,9 +807,9 @@ module ncr5380
 			// the M10K the CD's CD_RING_LOG=2 ring needs. Net M10K decreases.
 			//
 			// TOOLBOX_ENABLE(i==0): the BlueSCSI Toolbox vendor command set is
-			// answered by the boot disk (ID 0) here — MacLC serves it from ID 6,
-			// but the Toolbox driver locates the drive by INQUIRY page 0x31, not
-			// by ID, so the boot target is fine. Inert until the HPS mounts the
+			// answered by the boot disk (ID 0) here — MacLC standardized to the
+			// same IDs 0/1 on 2026-07-20; the Toolbox driver locates the drive by
+			// INQUIRY page 0x31, not by ID. Inert until the HPS mounts the
 			// Toolbox shared folder (tb_mounted) and the Main handler answers.
 			scsi #(.ID(i[2:0]), .RING_LOG(i == 0 ? 5 : 4), .TOOLBOX_ENABLE(i == 0)) target
 			(
@@ -833,7 +852,7 @@ module ncr5380
 				.sd_buff_din( sd_buff_din[i] ),
 				.sd_buff_wr( sd_buff_wr & target_bsy[i] ),
 
-				// Toolbox transport: only target 0 (ID 6) is wired to the slot.
+				// Toolbox transport: only target 0 (ID 0) is wired to the slot.
 				.tb_mounted ( (i == 0) ? tb_mounted : 1'b0 ),
 				.tb_lba     ( tb_lba_g[i] ),
 				.tb_rd      ( tb_rd_g[i] ),
