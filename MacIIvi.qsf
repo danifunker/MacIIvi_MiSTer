@@ -370,6 +370,8 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 # violations were always HDMI-scaler-only; clk_sys/egret stayed >= +1.2.
 # cd-changer netlist (1bebe75): 5 -> -0.200 (ascal o_hcpt, HDMI-only again;
 # clk_sys +1.65); sweep hit first roll: 2 -> +0.109 all met, 522/553 M10K.
+# family-sync netlist (ae54950): 2 -> +0.205 worst all met FIRST ROLL (HDMI
+# setup +0.313, clk_sys +1.77); ALM 94%->97% (vol LUT + interp + anchor).
 # Per-fit law: every netlist change is a fresh roll — re-sweep, don't assume.
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION OFF
