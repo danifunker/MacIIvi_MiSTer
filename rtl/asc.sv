@@ -25,7 +25,7 @@ module asc(
 	// CPU Interface
 	input         cs,      // Chip Select (selectASC)
 	input  [11:0] addr,    // Offset within ASC window (4 KB), real A0 in addr[0]
-	input   [7:0] data_in,
+	input  [15:0] data_in, // full CPU write bus: [15:8]=UDS lane, [7:0]=LDS lane
 	output  [7:0] data_out,
 	input         we,      // Write Enable (!_cpuRW && cpuBusControl)
 	input         cpu_as_n,// 68k _AS: low during a bus cycle, high between
@@ -52,14 +52,14 @@ module asc(
 	// Sample rate: MAME streams the ASC at 22257 Hz. 32.5 MHz / 22257 ≈ 1460.
 	localparam SAMPLE_DIV = 16'd1460;
 
-	// FIFO A storage. M10K-shaped on purpose: dedicated write process and a
-	// dedicated registered-read process (fifo_a_q, below the main block). The
-	// old code read fifo_a[rptr_a] combinationally inside the same always
-	// block that wrote it, which kept the whole 1KB array in ALM registers
-	// (~4.5K ALMs of the 118% first-fit overflow). fifo_a_q lags an rptr_a
-	// change by one clk — harmless, pops are SAMPLE_DIV (1460) clocks apart.
-	(* ramstyle = "M10K,no_rw_check" *) reg [7:0] fifo_a [0:1023];
-	reg [7:0]  fifo_a_q;
+	// FIFO A storage in forced-M10K BRAM (cd_sdp, rtl/cd_audio.sv). As a plain
+	// register array Quartus 17's small-RAM heuristic silently built it from
+	// ~8K registers + mux fabric (discovered in the 2026-07-16 LAB-overflow
+	// hunt). Read side: fifo_a_q continuously tracks fifo_a[rptr_a] with a
+	// 1-cycle lag — invisible at the 22 kHz pop cadence (1460 idle clocks
+	// between pops), and a push can only land on the read slot when the FIFO
+	// is empty (sample path skipped) or full (push blocked), both guarded.
+	wire [7:0] fifo_a_q;
 	reg [9:0]  wptr_a, rptr_a;
 	reg [10:0] count_a;          // 0..1024
 	reg [15:0] sample_div;
@@ -87,6 +87,12 @@ module asc(
 		else if (we_stb)   asc_armed <= 1'b0; // captured this cycle's write
 	end
 
+	cd_sdp #(.DW(8), .AW(10)) fifo_a_ram (
+		.clock(clk),
+		.waddr(wptr_a), .wdata(fifo_a_byte), .wr(fifo_a_push),
+		.raddr(rptr_a), .q(fifo_a_q)
+	);
+
 	wire fifo_a_write = we_stb && (addr < 12'h400);
 	// FIFO B ($400-$7FF) writes are ignored on the V8.
 	wire reg_write    = we_stb && (addr >= 12'h800) && (addr <= 12'h80F);
@@ -95,9 +101,32 @@ module asc(
 	// FIFOMODE ($803) bit7 clears the FIFO.
 	wire fifo_clear   = reg_write && (addr[3:0] == 4'h3) && data_in[7];
 
+	// The FIFO takes EVERY byte lane of a write: a MOVE.W/MOVE.L fill (both
+	// strobes, two byte lanes per bus cycle) must land both bytes, in memory
+	// order (even byte = UDS lane = D15:8 first). MAME gets this from its bus
+	// layer, which calls the 8-bit device handler once per lane; feeding only
+	// cpuDataOut[7:0] here dropped every other sample of word-filled audio —
+	// playback at exactly 2x speed (Reader Rabbit 2 class). The single write
+	// port pushes the UDS lane in the strobe cycle and drains the latched LDS
+	// lane one clock later; the next CPU access is several clocks out, so the
+	// pend slot never collides. Byte writes push only their strobed lane (the
+	// 68k mirrors the byte on both lanes, so the mux value is right either way).
+	reg        fifo_pend_v;
+	reg  [7:0] fifo_pend_b;
+	wire       fifo_a_word = fifo_a_write && !uds_n && !lds_n;
+	wire [7:0] fifo_a_byte = fifo_pend_v ? fifo_pend_b :
+	                         (!uds_n ? data_in[15:8] : data_in[7:0]);
+	always @(posedge clk) begin
+		if (reset) fifo_pend_v <= 1'b0;
+		else begin
+			fifo_pend_v <= fifo_a_word;
+			if (fifo_a_word) fifo_pend_b <= data_in[7:0];
+		end
+	end
+
 	wire pop_tick     = (sample_div == SAMPLE_DIV - 1);
 	wire pop_a        = pop_tick && (count_a != 0);
-	wire fifo_a_push  = fifo_a_write && (count_a < 1024) && !fifo_clear;
+	wire fifo_a_push  = (fifo_a_write || fifo_pend_v) && (count_a < 1024) && !fifo_clear;
 
 	// Live FIFO A status byte ($804): bit0 = STAT_HALF_FULL_A (half-empty),
 	// bit1 = STAT_EMPTY_OR_FULL_A. Per MAME asc_v8, bit1 is set when the FIFO is
@@ -121,8 +150,6 @@ module asc(
 			regs[0] <= 8'hE8; // Version (RO)
 		end else begin
 			// Sample-rate divider + FIFO A pop (MONO: same sample to L and R).
-			// Sample comes from the registered read port fifo_a_q (see the
-			// dedicated read/write processes below the main block).
 			if (pop_tick) begin
 				sample_div  <= 0;
 				sample_tick <= 1'b1;
@@ -157,7 +184,7 @@ module asc(
 				case (addr[3:0])
 					4'h0: ; // Version RO
 					4'h4: ; // FIFOSTAT RO
-					default: regs[addr[3:0]] <= data_in;
+					default: regs[addr[3:0]] <= data_in[7:0];
 				endcase
 			end
 
@@ -173,14 +200,6 @@ module asc(
 				irq <= 1'b1;
 		end
 	end
-
-	// FIFO A block-RAM ports (M10K-shaped; see the array declaration note).
-	// Write: one dedicated process. Read: registered, continuously tracking
-	// rptr_a — settled long before the next pop uses fifo_a_q.
-	always @(posedge clk)
-		if (fifo_a_push) fifo_a[wptr_a] <= data_in;
-	always @(posedge clk)
-		fifo_a_q <= fifo_a[rptr_a];
 
 	reg [7:0] data_out_reg;
 	always @(*) begin
@@ -251,12 +270,12 @@ module asc(
 						case (addr[3:0])
 							4'h0: ;
 							4'h1: begin
-								regs[1] <= data_in;
-								if (data_in == 1 && fifo_count == 0) irq <= 1;
+								regs[1] <= data_in[7:0];
+								if (data_in[7:0] == 8'h01 && fifo_count == 0) irq <= 1;
 								else irq <= 0;
 							end
 							4'h4: ;
-							default: regs[addr[3:0]] <= data_in;
+							default: regs[addr[3:0]] <= data_in[7:0];
 						endcase
 					end
 				end else begin
@@ -314,10 +333,10 @@ module asc(
 					dbg_fifo_b_cnt <= dbg_fifo_b_cnt + 1'b1;
 				else if (addr <= 12'h80F) begin
 					$display("ASC-WR off=%03h reg=%0d data=%02h  [fifoA_wr=%0d fifoB_wr=%0d] @%0t",
-						addr, addr[3:0], data_in, dbg_fifo_a_cnt, dbg_fifo_b_cnt, $time);
+						addr, addr[3:0], data_in[7:0], dbg_fifo_a_cnt, dbg_fifo_b_cnt, $time);
 					if (addr[3:0] == 4'h1) $display("ASC-MODE = %0d  (V8 ignores; always FIFO)", data_in[1:0]);
-					if (addr[3:0] == 4'h3) $display("ASC-FIFOMODE = %02h  (bit7=clear FIFO)", data_in);
-					if (addr[3:0] == 4'h7) $display("ASC-CLOCK = %0d  (0=22257 2=22050 3=44100)", data_in);
+					if (addr[3:0] == 4'h3) $display("ASC-FIFOMODE = %02h  (bit7=clear FIFO)", data_in[7:0]);
+					if (addr[3:0] == 4'h7) $display("ASC-CLOCK = %0d  (0=22257 2=22050 3=44100)", data_in[7:0]);
 				end
 			end
 			if (sample_tick) begin

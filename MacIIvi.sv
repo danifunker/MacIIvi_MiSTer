@@ -194,7 +194,9 @@ module emu
 	wire  [VDNUM-1:0] sd_rd;
 	wire  [VDNUM-1:0] sd_wr;
 	wire  [VDNUM-1:0] sd_ack;
-	wire            [7:0] sd_buff_addr;
+	// hps_io drives [12:0] (AW=12 in WIDE mode); [7:0] serves every 512-byte
+	// consumer, [12:8] reach the CD whole-frame burst path (2352 B/txn).
+	wire           [12:0] sd_buff_addr;
 	wire           [15:0] sd_buff_dout;
 	wire           [15:0] sd_buff_din[VDNUM];
 	wire                  sd_buff_wr;
@@ -666,11 +668,17 @@ module emu
 	// ASC samples drive AUDIO_L/R, with CD audio (SCSI CD-ROM playback engine)
 	// mixed in at half gain, saturating. cd_snd_* are exact zeros whenever the
 	// drive isn't playing, so this is transparent to the existing ASC path.
+	// CD audio mixed at FULL gain, saturating — the real machine sums the
+	// drive's line out with the DAC at unity; the previous half-gain mix was
+	// the "CD sounds half as loud" report (MacLC 07-28). cd_snd_* are silent
+	// (exact zeros) whenever the drive isn't playing, and are linearly
+	// interpolated inside cd_audio.sv so the sys/audio_out 48 kHz pickup
+	// doesn't add stair-step imaging.
 	wire signed [15:0] cd_snd_l, cd_snd_r;
 	wire signed [16:0] audio_mix_l = {asc_sample_l[15], asc_sample_l}
-	                               + {{2{cd_snd_l[15]}}, cd_snd_l[15:1]};
+	                               + {cd_snd_l[15], cd_snd_l};
 	wire signed [16:0] audio_mix_r = {asc_sample_r[15], asc_sample_r}
-	                               + {{2{cd_snd_r[15]}}, cd_snd_r[15:1]};
+	                               + {cd_snd_r[15], cd_snd_r};
 	assign AUDIO_L = (audio_mix_l > 17'sd32767)  ? 16'sd32767 :
 	                 (audio_mix_l < -17'sd32768) ? -16'sd32768 : audio_mix_l[15:0];
 	assign AUDIO_R = (audio_mix_r > 17'sd32767)  ? 16'sd32767 :
@@ -918,6 +926,39 @@ module emu
 			sdma_snap_wr    <= dbg_wr_w;      // data_cnt/phase/io_busy/sd_buff_sel/data_complete
 			sdma_snapped    <= 1'b1;
 		end
+	end
+
+	// ── Always-on marginality anchor (ported from MacLC 4dfb463, 2026-07-30) ──
+	// On MacLC, probes-OFF fits of the cd-audio-era netlist deterministically
+	// corrupted the SCSI read path on hardware (Finder colour-icon noise →
+	// error-11 / F-Line bombs) while every probe-bearing fit passed; STA met
+	// either way and did not predict it (MacLC docs/resume_probes_off_hunt_
+	// 2026-07-29.md §5). Their two-way bisect isolated the protective effect to
+	// the fanout of the top-level ISSP probes — these sink registers keep the
+	// SAME nets loaded in every build, with no JTAG hub, so the fitter treats
+	// the SCSI capture/status cones as live logic. MacIIvi ships probe-less
+	// (no CDA/PSDT ISSP deck at all), i.e. it is permanently in MacLC's failing
+	// build class — carry the anchor. preserve+noprune = no merging, no
+	// retiming, no sweeping. Do NOT remove, ifdef, or XOR-fold (a reduction
+	// lets synthesis restructure the cones); ~352 FFs is the entire cost.
+	wire [31:0] dbg_cda0_w, dbg_cda1_w, dbg_cda2_w, dbg_cda3_w, dbg_cda4_w;
+	wire [31:0] dbg_cdur_w, dbg_wrfb_w;
+	(* preserve, noprune *) reg [31:0] anchor_cda0, anchor_cda1, anchor_cda2,
+	                                   anchor_cda3, anchor_cda4, anchor_cdur;
+	(* preserve, noprune *) reg [31:0] anchor_psdt, anchor_psds, anchor_psd2,
+	                                   anchor_psd3, anchor_wrfb;
+	always @(posedge clk_sys) begin
+		anchor_cda0 <= dbg_cda0_w;
+		anchor_cda1 <= dbg_cda1_w;
+		anchor_cda2 <= dbg_cda2_w;
+		anchor_cda3 <= dbg_cda3_w;
+		anchor_cda4 <= dbg_cda4_w;
+		anchor_cdur <= dbg_cdur_w;
+		anchor_psdt <= {sdma_berr_cnt, 1'b0, sdma_stall_max};
+		anchor_psds <= {15'd0, sdma_snapped, sdma_snap_scsi2};
+		anchor_psd2 <= sdma_snap_ncr;
+		anchor_psd3 <= sdma_snap_wr;
+		anchor_wrfb <= dbg_wrfb_w;
 	end
 
 	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space) ? 1'b1 : ~(!_cpuAS && io_space && !selectSCSIDMA));
@@ -1715,7 +1756,10 @@ module emu
 		// odd regs alias onto the even reg below them. Reconstruct the real A0
 		// from tg68_a[0], exactly like the SWIM/IWM instance does.
 		.addr({cpuAddr[11:1], tg68_a[0]}),
-		.data_in(cpuDataOut[7:0]),
+		// Full 16-bit write bus: the FIFO must see BOTH byte lanes so MOVE.W/
+		// MOVE.L fills land every sample (see the fifo_pend note in rtl/asc.sv;
+		// [7:0]-only here was the "game audio at 2x speed" bug class).
+		.data_in(cpuDataOut),
 		.data_out(asc_data_out),
 		.we(!_cpuRW && cpuBusControl),
 		.cpu_as_n(_cpuAS),
@@ -1876,7 +1920,8 @@ module emu
 		.io_wr(scsi_wr),
 		.io_ack(scsi_ack),
 
-		.sd_buff_addr(sd_buff_addr),
+		.sd_buff_addr(sd_buff_addr[7:0]),
+		.sd_buff_addr_hi(sd_buff_addr[12:8]),
 		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(scsi_buff_din),
 		.sd_buff_wr(sd_buff_wr),
@@ -1910,15 +1955,19 @@ module emu
 		.cd_snd_l(cd_snd_l),
 		.cd_snd_r(cd_snd_r),
 
-		// CD-audio engine JTAG visibility (CDA0..CDA4). Left unconnected here:
-		// the MacIIvi JTAG hub is near its node ceiling and altsource_probe is
-		// FPGA-only. For HW CD-audio bring-up, wire these to altsource_probe
-		// blocks if the hub budget allows (cp_cda0..4 in MacLC MacLC.sv).
-		.dbg_cda0(),
-		.dbg_cda1(),
-		.dbg_cda2(),
-		.dbg_cda3(),
-		.dbg_cda4(),
+		// CD-audio engine JTAG visibility (CDA0..CDA4/CDUR) + write forensics
+		// (WRFB). No ISSP deck on MacIIvi (JTAG hub near its node ceiling) —
+		// these feed the always-on marginality anchor above instead, which
+		// keeps the same cones loaded that MacLC's probe deck accidentally
+		// protected. For HW bring-up probes, see cp_cda0..4/cp_cdur/cp_wrfb
+		// in MacLC MacLC.sv (hub budget permitting).
+		.dbg_cda0(dbg_cda0_w),
+		.dbg_cda1(dbg_cda1_w),
+		.dbg_cda2(dbg_cda2_w),
+		.dbg_cda3(dbg_cda3_w),
+		.dbg_cda4(dbg_cda4_w),
+		.dbg_cdur(dbg_cdur_w),
+		.dbg_wrfb(dbg_wrfb_w),
 
 		// PRAM persistence (NVRAM) — driven by the FSM above
 		.pram_load_wr(pram_load_wr),

@@ -1,7 +1,7 @@
 V       = verilator
 TOP     = --top-module scsi_bench_top
 RTL     = ../../rtl
-V_DEFINE = +define+SIMULATION=1 \
+V_DEFINE = +define+SIMULATION=1 +incdir+../../rtl \
            --timescale-override 1ps/1ps \
            -Wno-TIMESCALEMOD -Wno-fatal \
            -Wno-WIDTH -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-IMPLICIT \

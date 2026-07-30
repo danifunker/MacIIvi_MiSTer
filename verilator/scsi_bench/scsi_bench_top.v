@@ -70,6 +70,10 @@ ncr5380 #(.DEVS(2)) ncr
 (
 	.clk(clk),
 	.reset(reset),
+	.cd_enable(1'b1),      // CD target (ID 3) selectable — cdvol mode pokes it
+	.cd_img_mounted(1'b1), // virtual disc present: media-gated CD commands
+	                       // (0x42 subqfmt mode) reach their own sense paths
+	                       // instead of CHECKing NOT READY/no-disc first
 	.bus_cs(bus_cs),
 	.bus_rs(bus_rs),
 	.ior(ior),
@@ -93,15 +97,6 @@ ncr5380 #(.DEVS(2)) ncr
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(sd_buff_din),
 	.sd_buff_wr(sd_buff_wr),
-
-	// CD-ROM target (SCSI ID 3) disabled for this disk-only bench.
-	.cd_enable(1'b0),
-	.cd_img_mounted(1'b0),
-	.cd_io_lba(),
-	.cd_io_rd(),
-	.cd_io_wr(),
-	.cd_io_ack(1'b0),
-	.cd_sd_buff_din(),
 
 	.dbg_scsi(),
 	.dbg_scsi2(),

@@ -54,6 +54,35 @@ Key references:
 - Work happens on feature branches, merged to `main` once validated (policy
   changed 2026-07-15 by the project owner; was direct-to-main).
 
+## SCSI/CD family sync (MacLC lineage — laws adopted 2026-07-30)
+
+The SCSI subsystem (`rtl/scsi.v`, `rtl/cd_audio.sv`, `rtl/cd_vol_lut.vh`,
+`rtl/asc.sv`) syncs WHOLESALE from `../MacLC_MiSTer` master (they are kept
+byte-identical modulo one comment); `rtl/ncr5380.sv` + `rtl/dataController_
+top.sv` sync 3-way preserving the documented MacIIvi fixups (CD_RING_LOG=2,
+disk RING_LOG i==0?5:4, local comments). The HPS contract is the Main_MiSTer
+fork `add-bluescsi-toolbox-for-MacLC` — hps_io slots: disks 0/1, PRAM 2,
+Toolbox 3, CD 4, CD-changer 5; CD-DA is served as ONE 2352-byte transaction
+per frame (sd_buff_addr[12:8] carries the burst word address), so core and
+Main MUST move together.
+
+- **Always-on marginality anchor** (MacIIvi.sv, from MacLC `4dfb463`):
+  probe-less fits corrupt the SCSI read path on HW while STA is met — the
+  preserve+noprune anchor registers keep those cones loaded. Do NOT remove,
+  ifdef, or fold them. Gate every new fit in the Finder on icon integrity.
+- **CD-detach gating law** (MacLC 2026-07-30): a CUE/CHD attached AT BOOT can
+  hang intermittently on ANY build, including known-good ones — never treat a
+  boot-attach hang as a build verdict. For gating: detach the CD from the boot
+  config (`mv /media/fat/config/MacIIvi.s4` aside), boot, judge, then remount.
+  One boot is never a verdict; two boots of the same RBF can differ.
+- SCSI writes + CD reads are validated upstream (word-pairing lane-slip fix +
+  look-ahead boundary REQ stall, MacLC 2026-07-29, byte-identical copies on
+  HW). `verilator/scsi_bench` full sweep + `--mode gapcmds/cdvol/wbyte/wword`
+  is the fast regression gate for all of it.
+- The ASC takes the FULL 16-bit write bus (both byte lanes per strobe) — the
+  old [7:0]-only hookup dropped every other sample of word-filled audio
+  (game audio at exactly 2x speed). Applies to MacIIvi.sv AND sim.v.
+
 ## Build Commands
 
 ### Verilator simulation (primary workflow — runs in WSL)
