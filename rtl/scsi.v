@@ -1159,15 +1159,7 @@ reg [3:0]  tb_settle;   // status-latch settle for the registered port-B (q_b) r
 reg [17:0] tb_to;       // tb read-completion watchdog (~8-17 ms); see TBS_STAT.
 reg        old_tb_ack;
 reg [3:0]  tb_fetch_sec;    // which 512B sector the HPS fill is landing (multi-block LIST; TB_ADDRW>8)
-reg        tb_wdog;         // last STAT exit was the watchdog, not a real completion
-// tb_ack rose for the transfer currently in flight. Completing a fetch on
-// tb_fill_done leaves the HPS still holding tb_ack high for a few cycles; that
-// trailing fall would otherwise be consumed as completion of the NEXT transfer
-// and skip it (symptom: every other GET sector serves stale buffer). Requiring
-// a fresh RISE per transfer makes each ack belong to exactly one transfer.
-reg        tb_ack_seen;
-reg  [6:0] tb_retry;        // status-block re-looks taken on the watchdog path
-reg  [8:0] tb_fill_cnt;     // HPS fill strobes for the block in flight (256 words = one block)
+reg  [6:0] tb_retry;        // status-block re-looks (re-issued reads) this round trip
 // A slow HPS answer must not read as "no handler". The SD is mounted
 // sync,dirsync, so one SEND chunk is a synchronous card write; when the card
 // hits an erase cycle it stalls far past one watchdog period. Re-look up to
@@ -1193,11 +1185,6 @@ assign tb_buff_din = {tb_buf1_qa, tb_buf0_qa};
 `endif
 
 wire       tb_hps_wr  = sd_buff_wr & tb_ack;            // HPS fills the slot
-// Positive completion evidence for an HPS->core block: hps_io pulses sd_buff_wr
-// once per word (256 per 512-byte block) while streaming the fill in. Counting
-// those says "the buffer is fresh" without depending on catching the ack fall,
-// which the HW transport does not reliably present (see TBS_STAT).
-wire       tb_fill_done = tb_fill_cnt[8];
 // SEND (upload) payload collection: during the DataOut phase the Mac's bytes are
 // written into the toolbox buffer at WORD offset 8 (byte 16), leaving words 0..4
 // (bytes 0..9) for the CDB that TBS_LOAD writes -- so one round-trip block carries
@@ -1268,19 +1255,13 @@ always @(posedge clk) begin
 	if (rst) begin
 		tb_state <= TBS_IDLE; tb_rd_r <= 1'b0; tb_wr_r <= 1'b0; tb_lba_r <= 32'd0;
 		tb_status <= 8'h02; tb_len <= 16'd0; tb_load_w <= 4'd0; tb_settle <= 4'd0; tb_to <= 18'd0;
-		tb_fetch_sec <= 4'd0; tb_wdog <= 1'b0; tb_retry <= 7'd0; tb_fill_cnt <= 9'd0;
-		tb_ack_seen <= 1'b0;
+		tb_fetch_sec <= 4'd0; tb_retry <= 7'd0;
 	end else if (TOOLBOX_ENABLE || CDCHANGER_ENABLE) begin
-		// Fill-strobe count and ack-rise latch for the transfer in flight. The
-		// request-issuing arms below re-arm both to 0; a later assignment in this
-		// block wins, so ordering here is deliberate.
-		if (tb_hps_wr && !tb_fill_cnt[8]) tb_fill_cnt <= tb_fill_cnt + 1'b1;
-		if (~old_tb_ack & tb_ack)         tb_ack_seen <= 1'b1;
 		case (tb_state)
 		TBS_IDLE: begin
 			tb_load_w <= 4'd0;
 			tb_fetch_sec <= 4'd0;   // sector-0 addressing for the next LOAD/REQ/STAT
-			tb_wdog <= 1'b0; tb_retry <= 7'd0;   // per-round-trip
+			tb_retry <= 7'd0;                    // per-round-trip
 			if (phase == PHASE_TB) tb_state <= TBS_LOAD;
 		end
 		// write the 10-byte CDB as 5 words (0..4) into the tb buffer
@@ -1292,11 +1273,9 @@ always @(posedge clk) begin
 					// Ship that tail FIRST (LBA 1) — the handler then has the
 					// whole payload when the CDB block (LBA 0) runs it.
 					tb_fetch_sec <= 4'd1;
-					tb_wr_r <= 1'b1; tb_lba_r <= 32'd1; tb_to <= 18'd0;
-					tb_ack_seen <= 1'b0; tb_state <= TBS_REQ2;
+					tb_wr_r <= 1'b1; tb_lba_r <= 32'd1; tb_to <= 18'd0; tb_state <= TBS_REQ2;
 				end else begin
-					tb_wr_r <= 1'b1; tb_lba_r <= 32'd0;
-					tb_ack_seen <= 1'b0; tb_state <= TBS_REQ;
+					tb_wr_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_REQ;
 				end
 			end else tb_load_w <= tb_load_w + 1'b1;
 		// tail block written; fall through to the CDB request block. Same ~8 ms
@@ -1305,19 +1284,17 @@ always @(posedge clk) begin
 		// just corrupt 16 bytes.
 		TBS_REQ2: begin
 			if (tb_ack) tb_wr_r <= 1'b0;
-			tb_to <= tb_ack ? 18'd0 : (tb_to + 1'b1);
-			if ((tb_ack_seen & old_tb_ack & ~tb_ack) || (&tb_to)) begin
+			tb_to <= tb_to + 1'b1;
+			if ((old_tb_ack & ~tb_ack) || (&tb_to)) begin
 				tb_fetch_sec <= 4'd0;   // sector-0 addressing for the CDB/status block
-				tb_wr_r <= 1'b1; tb_lba_r <= 32'd0;
-				tb_ack_seen <= 1'b0; tb_state <= TBS_REQ;
+				tb_wr_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_REQ;
 			end
 		end
 		// request: HPS reads the CDB and runs the handler
 		TBS_REQ: begin
 			if (tb_ack) tb_wr_r <= 1'b0;
-			if (tb_ack_seen & old_tb_ack & ~tb_ack) begin
-				tb_rd_r <= 1'b1; tb_lba_r <= 32'd0; tb_to <= 18'd0;
-				tb_fill_cnt <= 9'd0; tb_ack_seen <= 1'b0; tb_state <= TBS_STAT;
+			if (old_tb_ack & ~tb_ack) begin
+				tb_rd_r <= 1'b1; tb_lba_r <= 32'd0; tb_to <= 18'd0; tb_state <= TBS_STAT;
 			end
 		end
 		// status: HPS returns {status, 0xB5, len_hi, len_lo} at buffer words 0/1.
@@ -1326,22 +1303,16 @@ always @(posedge clk) begin
 		// code; and the file-Toolbox transport this rides on was never HW-validated).
 		// The HPS has already filled the buffer by the timeout, so force-latch the
 		// status block. Same watchdog on TBS_DATA. (2026-07-21)
-		// Completion is taken from the ack fall OR the 256-word fill count
-		// (tb_fill_done), whichever lands first; the watchdog is only the
-		// backstop, and an exit taken on it is flagged so TBS_LATCH can tell
-		// "the HPS answered something" from "the HPS has not answered yet".
+		//
+		// The watchdog counts UNCONDITIONALLY. A 2026-07-31 attempt to hold it
+		// in reset while tb_ack was high broke every Toolbox command on HW: the
+		// force-latch is the only mechanism this transport actually runs on, and
+		// suppressing it removed the one thing that worked. Do not gate it.
 		TBS_STAT: begin
 			if (tb_ack) tb_rd_r <= 1'b0;
-			// The watchdog measures time with NO service, so it is held in reset
-			// while tb_ack is high. Letting it fire mid-fill was fatal: the core
-			// walked on to TBS_DATA and raised tb_rd, the still-high stale ack
-			// cleared it again on the next cycle, and the HPS never saw the
-			// request -> the round trip wedged.
-			tb_to <= tb_ack ? 18'd0 : (tb_to + 1'b1);
-			if ((tb_ack_seen & old_tb_ack & ~tb_ack) || tb_fill_done) begin
-				tb_wdog <= 1'b0; tb_settle <= 4'd8; tb_state <= TBS_LATCH;
-			end else if (&tb_to) begin
-				tb_wdog <= 1'b1; tb_settle <= 4'd8; tb_state <= TBS_LATCH;
+			tb_to <= tb_to + 1'b1;
+			if ((old_tb_ack & ~tb_ack) || (&tb_to)) begin
+				tb_settle <= 4'd8; tb_state <= TBS_LATCH;
 			end
 		end
 		// buffer reads for addr 0/1 are registered; let them settle after the
@@ -1355,16 +1326,22 @@ always @(posedge clk) begin
 				tb_len    <= {tb0_dout_next, tb1_dout_next}; // bytes 2,3 = length
 				if ({tb0_dout_next, tb1_dout_next} != 16'd0) begin
 					tb_rd_r <= 1'b1; tb_lba_r <= 32'd1; tb_fetch_sec <= 4'd0; tb_to <= 18'd0;
-					tb_fill_cnt <= 9'd0; tb_ack_seen <= 1'b0; tb_state <= TBS_DATA;
+					tb_state <= TBS_DATA;
 				end else tb_state <= TBS_RDY;                // status-only
-			end else if (tb_wdog && (tb_retry != TB_RETRY_MAX)) begin
-				// Watchdog exit and the buffer still holds the CDB we wrote, not
-				// a status block: the HPS has not answered YET. The read request
-				// is still asserted (no ack was seen), so just re-arm the timer
-				// and look again rather than reporting CHECK CONDITION, which
-				// surfaces at the client as "the SD card refused the transfer"
-				// and aborts a copy mid-file. (2026-07-31)
+			end else if (tb_retry != TB_RETRY_MAX) begin
+				// No signature: the buffer still holds the CDB we wrote, so the HPS
+				// has not answered YET — a SEND chunk is a synchronous write to a
+				// sync,dirsync-mounted SD, and a card erase cycle stalls it well
+				// past one watchdog period. Re-ISSUE the read and look again.
+				//
+				// Re-issuing is the whole point: TBS_STAT clears tb_rd_r as soon as
+				// tb_ack is seen (and it always is — tb_hps_wr = sd_buff_wr & tb_ack
+				// is what fills the buffer), so by here no request is outstanding.
+				// A retry that only re-armed the timer would re-read the same stale
+				// bytes every time and still end in CHECK. (2026-07-31)
 				tb_retry <= tb_retry + 1'b1;
+				tb_rd_r  <= 1'b1;
+				tb_lba_r <= 32'd0;
 				tb_to    <= 18'd0;
 				tb_state <= TBS_STAT;
 			end else begin                               // no real handler -> CHECK
@@ -1373,29 +1350,24 @@ always @(posedge clk) begin
 		// data: HPS returns tb_len bytes across ceil(tb_len/512) sectors, one per
 		// LBA (1..N). Each lands at buffer offset tb_fetch_sec*256; fetch the next
 		// until all N are in, then serve linearly. Same read-ack watchdog as TBS_STAT.
-		// A data block carries no signature, so there is nothing in its content
-		// to validate — tb_fill_done (256 fill strobes) is the only positive
-		// evidence that the sector actually landed. Advancing on the bare
-		// watchdog would serve the PREVIOUS sector's bytes, silently corrupting
-		// a GET; wait out a stalled HPS instead, and keep the watchdog only as
-		// the escape hatch once the retry budget is spent. (2026-07-31)
+		// KNOWN GAP (2026-07-31): a data block carries no signature, so a stalled
+		// HPS here cannot be detected and this serves the previous sector's
+		// bytes — a silently corrupt GET. Only SEND (which has no data phase)
+		// and the status block are protected by the TBS_LATCH retry above. Fixing
+		// it needs positive fill evidence, which is exactly what the reverted
+		// attempt got wrong; do not retry that without HW-faithful bench coverage
+		// of the watchdog-primary path first.
 		TBS_DATA: begin
 			if (tb_ack) tb_rd_r <= 1'b0;
-			tb_to <= tb_ack ? 18'd0 : (tb_to + 1'b1);   // see TBS_STAT
-			if ((tb_ack_seen & old_tb_ack & ~tb_ack) || tb_fill_done ||
-			    (&tb_to && (tb_retry == TB_RETRY_MAX))) begin
+			tb_to <= tb_to + 1'b1;
+			if ((old_tb_ack & ~tb_ack) || (&tb_to)) begin
 				if ((tb_fetch_sec + 4'd1) >= tb_nsec) tb_state <= TBS_RDY;
 				else begin
 					tb_fetch_sec <= tb_fetch_sec + 4'd1;
 					tb_lba_r     <= tb_lba_r + 32'd1;
 					tb_rd_r      <= 1'b1;
 					tb_to        <= 18'd0;
-					tb_fill_cnt  <= 9'd0;
-					tb_ack_seen  <= 1'b0;
 				end
-			end else if (&tb_to) begin
-				tb_retry <= tb_retry + 1'b1;   // still waiting on the HPS
-				tb_to    <= 18'd0;
 			end
 		end
 		// round-trip done; the main FSM consumes tb_status/tb_len and leaves
@@ -1411,9 +1383,9 @@ reg [2:0] tb_state_dbg;
 always @(posedge clk) begin
 	tb_state_dbg <= tb_state;
 	if ((tb_state != tb_state_dbg) && $test$plusargs("tb_debug"))
-		$display("TB ID=%0d %0d->%0d lba=%0d rd=%b wr=%b ack=%b seen=%b fill=%0d to=%0d retry=%0d wdog=%b len=%0d sec=%0d nsec=%0d",
-		         ID, tb_state_dbg, tb_state, tb_lba_r, tb_rd_r, tb_wr_r, tb_ack, tb_ack_seen,
-		         tb_fill_cnt, tb_to, tb_retry, tb_wdog, tb_len, tb_fetch_sec, tb_nsec);
+		$display("TB ID=%0d %0d->%0d lba=%0d rd=%b wr=%b ack=%b to=%0d retry=%0d len=%0d sec=%0d nsec=%0d",
+		         ID, tb_state_dbg, tb_state, tb_lba_r, tb_rd_r, tb_wr_r, tb_ack,
+		         tb_to, tb_retry, tb_len, tb_fetch_sec, tb_nsec);
 end
 `endif
 
