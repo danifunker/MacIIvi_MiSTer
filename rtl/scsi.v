@@ -469,8 +469,13 @@ wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted &&
 	// only sets on an ACK edge, which never comes when the initiator expects
 	// no data — REQ would be held forever (same deadlock class as the
 	// allocation-length over-serve).
-	wire data_done = data_complete || (data_len == 32'd0);
+	wire data_done = data_complete || (data_len == 32'd0) || tb_out_stalled;
 	wire data_phase_complete = ((phase == PHASE_DATA_OUT) || (phase == PHASE_DATA_IN)) && data_done;
+	// Toolbox DataIn serve-settle (driven near the tb FSM, declared here because
+	// REQ consumes it). Zero outside a Toolbox/CD-changer DataIn serve.
+	wire tb_srv_hold;
+	// 0xD4 SEND DATA inter-byte watchdog; zero outside that DataOut phase.
+	wire tb_out_stalled;
 	// REQ assertion. Previously this was gated on !sel ("wait for the initiator
 	// to drop SEL before the first REQ"). But the reference implementations
 	// (Snow's NCR5380, MAME) assert REQ as soon as the target is selected and
@@ -482,7 +487,8 @@ wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted &&
 	// loop seen on the FPGA (but not on real HW or MAME). Drop the !sel gate;
 	// `phase != PHASE_IDLE` already prevents REQ during the IDLE->selection
 	// sampling window, so REQ now comes up on selection like the references.
-	assign req = (phase != PHASE_IDLE) && (phase != PHASE_TB) && !ack && !io_busy && !data_phase_complete;
+	assign req = (phase != PHASE_IDLE) && (phase != PHASE_TB) && !ack && !io_busy && !data_phase_complete &&
+	             !tb_srv_hold;
 
 	// Bus-VISIBLE REQ (CSR bit 5 / BSR DRQ): stays asserted across the HPS
 	// 512-byte block-boundary fetches in the data phases. Real drives never
@@ -498,7 +504,8 @@ wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted &&
 	// be offered while a flush/fetch is still in flight).
 	// (LBMacTwo 5adc2e1, HW-validated with 2d025c5 in round 6.)
 	assign req_bus = (phase != PHASE_IDLE) && (phase != PHASE_TB) && !ack && !data_phase_complete &&
-	                 ((phase == PHASE_DATA_OUT) || (phase == PHASE_DATA_IN) || !io_busy);
+	                 ((phase == PHASE_DATA_OUT) || (phase == PHASE_DATA_IN) || !io_busy) &&
+	                 !tb_srv_hold;   // ~250 ns per byte, not the ~ms fetch stall above
 
 assign bsy = (phase != PHASE_IDLE);
 
@@ -1127,19 +1134,20 @@ reg [7:0]  cmd [9:0];
 // for the DataIn filesystem ops 0xD0 LIST / 0xD1 GET / 0xD2 COUNT.
 // docs/BLUESCSI_CORE_HPS_CONTRACT.md. The disk read/write path is untouched.
 //
+//   [SEND DATA only] collect the 512-byte DataOut payload at buffer byte 16,
+//                    then tb_wr @LBA1 (its 16-byte tail, buffer sector 1) ->
 //   load CDB into tb buffer -> tb_wr @LBA0 (HPS runs the handler) ->
 //   tb_rd @LBA0 (status + 0xB5 signature + length) ->
-//   tb_rd @LBA1 (one 512-byte data block) -> serve via PHASE_DATA_OUT.
+//   tb_rd @LBA1+k (ceil(len/512) data blocks) -> serve via PHASE_DATA_OUT.
 //
-// FIRST CUT (pending HW + Main co-test): the round-trip handshake, the buffer
-// byte-lane order and the status-latch settle are modelled on the proven disk
-// path but cannot be functionally validated until the Main handler exists; the
-// SERVE reuses the disk buffer machinery verbatim so its timing is inherited.
-// Single 512-byte response this stage; GET >512 (sequential fetch) and SEND
-// upload (0xD3-D5, needs a 2nd buffer sector) are the remaining stages.
+// The round-trip handshake, the buffer byte-lane order and the status-latch
+// settle are modelled on the proven disk path; the SERVE reuses the disk buffer
+// machinery verbatim so its timing is inherited. Desk coverage:
+// `verilator/scsi_bench --mode toolbox` (COUNT/LIST/SEND/GET round trips
+// against a mirror of Main's handler).
 // ========================================================================
 localparam TBS_IDLE=3'd0, TBS_LOAD=3'd1, TBS_REQ=3'd2, TBS_STAT=3'd3,
-           TBS_LATCH=3'd4, TBS_DATA=3'd5, TBS_RDY=3'd6;
+           TBS_LATCH=3'd4, TBS_DATA=3'd5, TBS_RDY=3'd6, TBS_REQ2=3'd7;
 reg [2:0]  tb_state = TBS_IDLE;
 reg        tb_rd_r, tb_wr_r;
 reg [31:0] tb_lba_r;
@@ -1227,6 +1235,12 @@ wire [6:0] tb_nsec_raw = tb_len[15:9] + {6'd0, |tb_len[8:0]};  // ceil(tb_len/51
 wire [3:0] tb_nsec = (tb_nsec_raw == 7'd0)         ? 4'd1
                    : (tb_nsec_raw > {3'd0,TB_MAXSEC}) ? TB_MAXSEC
                    :                                  tb_nsec_raw[3:0];
+// Never SERVE more than the buffer actually holds. tb_nsec clamps the FETCH at
+// TB_MAXSEC sectors; without the matching clamp on the served length an HPS
+// response longer than the buffer is served from wrapped/stale words (the
+// alloc-overserve wedge class), silently corrupting the tail of a GET.
+localparam [15:0] TB_SRV_MAX = {3'd0, TB_MAXSEC, 9'd0};        // TB_MAXSEC * 512
+wire [15:0] tb_srv_len = (tb_len > TB_SRV_MAX) ? TB_SRV_MAX : tb_len;
 
 // Round-trip FSM. Drives tb_state / tb_rd / tb_wr / tb_lba; the MAIN phase FSM
 // moves `phase` (CMD_IN -> PHASE_TB -> DATA_OUT/STATUS_OUT) by watching tb_state.
@@ -1246,8 +1260,25 @@ always @(posedge clk) begin
 		// write the 10-byte CDB as 5 words (0..4) into the tb buffer
 		TBS_LOAD:
 			if (tb_load_w == 4'd4) begin
-				tb_wr_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_REQ;
+				if (tb_send_tail) begin
+					// SEND DATA: the 512-byte payload sits at buffer bytes
+					// 16..527, so its last 16 bytes are in buffer sector 1.
+					// Ship that tail FIRST (LBA 1) — the handler then has the
+					// whole payload when the CDB block (LBA 0) runs it.
+					tb_fetch_sec <= 4'd1;
+					tb_wr_r <= 1'b1; tb_lba_r <= 32'd1; tb_state <= TBS_REQ2;
+				end else begin
+					tb_wr_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_REQ;
+				end
 			end else tb_load_w <= tb_load_w + 1'b1;
+		// tail block written; fall through to the CDB request block
+		TBS_REQ2: begin
+			if (tb_ack) tb_wr_r <= 1'b0;
+			if (old_tb_ack & ~tb_ack) begin
+				tb_fetch_sec <= 4'd0;   // sector-0 addressing for the CDB/status block
+				tb_wr_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_REQ;
+			end
+		end
 		// request: HPS reads the CDB and runs the handler
 		TBS_REQ: begin
 			if (tb_ack) tb_wr_r <= 1'b0;
@@ -1582,10 +1613,18 @@ wire [31:0] data_len =
 		 cmd_request_sense?((sense_len < 32'd18) ? sense_len : 32'd18):
 		 cmd_tb_devinfo?tb_devinfo_len:                       // 0xD9 DEVICE INFO
 		 cmd_tb_debug_get?32'd1:                              // 0xD6 get = one flag byte
-		 (cmd_tb_fs_in || cmd_cdc_in)?{16'd0, tb_len}:        // 0xD0/D1/D2 fs + 0xD7/DA CD-changer DataIn (HPS length)
+		 (cmd_tb_fs_in || cmd_cdc_in)?{16'd0, tb_srv_len}:    // 0xD0/D1/D2 fs + 0xD7/DA CD-changer DataIn (HPS length)
 		 cmd_tb_send_prep?32'd33:                             // 0xD3 SEND PREP: 33-byte filename
-		 cmd_tb_send_data?(cmd[6] ? {15'd0, cmd[6], 9'd0}     // 0xD4 SEND DATA: CDB[6]*512 (block enc),
-		                          : {16'd0, cmd[1], cmd[2]}): //   else legacy u16(CDB[1..2]) byte count
+		 // 0xD4 SEND DATA: the DataOut phase is ALWAYS one full 512-byte block.
+		 // CDB[6] (512-blocks) / CDB[1..2] (legacy byte count) say how many of
+		 // those bytes are VALID — they are not the transfer size. Deriving the
+		 // phase length from them made the target end the data phase early on the
+		 // short final chunk of every file whose size is not a multiple of 512,
+		 // which the Mac client reports as a failed copy ("errors copying from
+		 // the Mac to the SD card", HW 2026-07-30; scsi_bench --mode toolbox
+		 // stalls at byte 386 of 512 without this). The HPS trims to the CDB
+		 // count when it writes.
+		 cmd_tb_send_data?32'd512:
 		 { 16'd0, tlen };                 // mode select etc have length in bytes
 
 always @(posedge clk) begin
@@ -1818,21 +1857,62 @@ wire [7:0] cd_hdr_dout_next3 = cd_hdr_byte(data_cnt_next3);
 // docs/BLUESCSI_MISTER_MAIN_PLAN.md
 wire       cmd_tb_devinfo   = TOOLBOX_ENABLE && tb_ready && (op_code == 8'hd9);      // DEVICE INFO
 wire       cmd_tb_fs_in     = TOOLBOX_ENABLE && (op_code == 8'hd0 || op_code == 8'hd1 || op_code == 8'hd2); // LIST/GET/COUNT (HPS round-trip, DataIn)
-// SEND/upload (Mac -> host), DataOut. FIRST CUT = single-block: the CDB and the
-// payload ride one round-trip block (CDB at [0..9], payload at [16..]), so a
-// chunk is capped at 512-16 = 496 B (fine for the small co-test files; >496 B
-// chunks / CAP_LARGE_SEND are future multi-block work). 0xD5 has no data phase.
+// SEND/upload (Mac -> host), DataOut. The CDB and the payload ride the round-trip
+// block layout CDB at [0..9], payload at [16..] — so a full 512-byte SEND DATA
+// chunk runs to buffer byte 527 and its last 16 bytes land in buffer SECTOR 1,
+// shipped as a second request block (TBS_REQ2). That needs TB_ADDRW > 8; on a
+// 512-byte buffer the payload wraps onto the CDB words instead and those 16
+// bytes are lost (holes every 512 B in the uploaded file, HW 2026-07-30).
+// 0xD5 has no data phase.
 wire       cmd_tb_send_prep = TOOLBOX_ENABLE && (op_code == 8'hd3);   // SEND FILE PREP (33-B name)
 wire       cmd_tb_send_data = TOOLBOX_ENABLE && (op_code == 8'hd4);   // SEND FILE DATA (chunk)
 wire       cmd_tb_send_end  = TOOLBOX_ENABLE && (op_code == 8'hd5);   // SEND FILE END (no payload)
 wire       cmd_tb_send      = cmd_tb_send_prep || cmd_tb_send_data || cmd_tb_send_end;
 wire       cmd_tb_send_pay  = cmd_tb_send_prep || cmd_tb_send_data;   // has a DataOut payload
+wire       tb_send_tail     = cmd_tb_send_data && (TB_ADDRW > 8);     // ship buffer sector 1 too
 wire       cmd_tb_debug     = TOOLBOX_ENABLE && tb_ready && (op_code == 8'hd6);      // TOGGLE DEBUG
 wire       cmd_tb_debug_get = cmd_tb_debug && (cmd[1] != 8'd0);    // CDB[1]!=0 -> read flag
 wire       tb_devinfo_caps  = cmd_tb_devinfo && (cmd[1] == 8'h01); // subcmd 1 = capabilities
 // 0xD9 allocation length is CDB[8] (0 -> 8 bytes; otherwise min(CDB[8],8)).
 wire [31:0] tb_devinfo_alloc = (cmd[8] == 8'd0) ? 32'd8 : {24'd0, cmd[8]};
 wire [31:0] tb_devinfo_len   = (tb_devinfo_alloc < 32'd8) ? tb_devinfo_alloc : 32'd8;
+
+// 0xD4 SEND DATA inter-byte watchdog. The DataOut phase is a fixed 512-byte
+// block (see data_len). If a client ever transferred only the CDB's valid-byte
+// count instead, the phase would never complete and the target would hold REQ
+// until the Mac reset the bus — so close the phase after ~2 ms of no ACK and
+// let the HPS write the count the CDB gave it. Never fires on a client that
+// sends the full block.
+wire      tb_out_active = (phase == PHASE_DATA_IN) && cmd_tb_send_data;
+reg [15:0] tb_out_to    = 16'd0;
+reg        tb_out_stall_r = 1'b0;
+always @(posedge clk) begin
+	if (!tb_out_active)     begin tb_out_to <= 16'd0; tb_out_stall_r <= 1'b0; end
+	else if (stb_adv)             tb_out_to <= 16'd0;
+	else if (!(&tb_out_to))       tb_out_to <= tb_out_to + 1'b1;
+	else                          tb_out_stall_r <= 1'b1;
+end
+assign tb_out_stalled = tb_out_active && tb_out_stall_r;
+
+// Toolbox DataIn serve-settle. These responses come straight out of the tb
+// dpram, whose port-B read register (q_b) is time-shared with the look-ahead
+// prefetch controller: for ~3 cycles after every word-address change q_b holds
+// ram[addr+1]/ram[addr+2] instead of ram[addr]. The pseudo-DMA read path covers
+// that with ncr5380's dma_settle; the Toolbox path is PIO byte-at-a-time and had
+// no equivalent — a host that samples CDR within a few cycles of REQ rising gets
+// the byte from two words ahead on every EVEN byte (the word address only
+// changes on even->odd boundaries). Real Mac PIO is slow enough to have hidden
+// this; scsi_bench --mode toolbox hits it on every LIST/GET. Hold REQ down for
+// a few cycles after each advance. Scoped to the tb serve: tb_srv_hold is 0
+// everywhere else regardless of the counter.
+wire      tb_srv_active = (phase == PHASE_DATA_OUT) && (cmd_tb_fs_in || cmd_cdc_in);
+reg [3:0] tb_srv_settle = 4'd0;
+always @(posedge clk) begin
+	if (!tb_srv_active)                tb_srv_settle <= 4'd12;  // armed for the first byte
+	else if (stb_adv)                  tb_srv_settle <= 4'd8;
+	else if (tb_srv_settle != 4'd0)    tb_srv_settle <= tb_srv_settle - 1'b1;
+end
+assign tb_srv_hold = tb_srv_active && (tb_srv_settle != 4'd0);
 
 // DEVICE INFO data (docs/BLUESCSI_HANDOFF.md §4.8): subcmd 0x00 LIST DEVICES ->
 // 8 bytes; this target's own ID = 0x00 (fixed disk present), every other ID =

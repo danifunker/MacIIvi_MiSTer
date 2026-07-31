@@ -29,6 +29,7 @@
 #include <vector>
 #include <string>
 #include <deque>
+#include <algorithm>
 
 #include "Vscsi_bench_top.h"
 #include "verilated.h"
@@ -60,6 +61,122 @@ static uint8_t ramp(uint64_t off) {
 	return (uint8_t)((off & 0xff) ^ ((off >> 8) & 0xff) ^ ((off >> 16) & 0xff));
 }
 
+// ---------------- HPS BlueSCSI Toolbox model ----------------
+// Faithful mirror of ../Main_MiSTer/toolbox.cpp, so the desk bench exercises the
+// exact wire contract the box runs:
+//   request  (tb_wr @LBA0) : CDB at [0..9], SEND payload at [16..]
+//   request  (tb_wr @LBA1) : the SEND payload bytes that do not fit under the
+//                            CDB (payload[496..511]) — the 2026-07-30 tail block
+//   status   (tb_rd @LBA0) : {status, 0xB5, len_hi, len_lo}
+//   data     (tb_rd @LBA1+k): DataIn payload, 512 bytes per block
+// The upload store uses fseek/fwrite semantics (a write past the end leaves a
+// zero-filled hole) so transport byte-slip shows up as it does on the SD card.
+static const uint8_t TB_SIG = 0xB5;    // status-block signature (Main: toolbox.cpp)
+struct TbFile { std::string name; std::vector<uint8_t> data; };
+struct TbHps {
+	std::vector<TbFile>  files;
+	std::vector<uint8_t> resp;
+	uint8_t              status = 0x02;
+	int                  get_idx = -1;         // file open for GET
+	std::vector<uint8_t> upload;               // SEND destination bytes
+	std::string          upload_name;
+	bool                 upload_open = false;
+	uint8_t              tail[512];            // last LBA-1 request block
+	uint64_t             reqs = 0, fills = 0;
+
+	TbHps() { memset(tail, 0, sizeof(tail)); }
+
+	void reset() {
+		resp.clear(); status = 0x02; get_idx = -1;
+		upload.clear(); upload_name.clear(); upload_open = false;
+		memset(tail, 0, sizeof(tail)); reqs = fills = 0;
+	}
+
+	// ---- 0xD2 COUNT / 0xD0 LIST ----
+	void op_count() { resp.push_back((uint8_t)files.size()); status = 0x00; }
+	void op_list() {
+		for (size_t i = 0; i < files.size(); i++) {
+			uint8_t fe[40] = {};
+			fe[0] = (uint8_t)i; fe[1] = 0x01;                 // index, type=file
+			for (size_t c = 0; c < files[i].name.size() && c < 32; c++) fe[2+c] = (uint8_t)files[i].name[c];
+			uint32_t sz = (uint32_t)files[i].data.size();
+			fe[36] = sz >> 24; fe[37] = sz >> 16; fe[38] = sz >> 8; fe[39] = sz;
+			resp.insert(resp.end(), fe, fe + 40);
+		}
+		status = 0x00;
+	}
+	// ---- 0xD1 GET (host -> Mac), 4096-byte blocks ----
+	void op_get(const uint8_t* cdb) {
+		const uint32_t BLOCK = 4096;
+		uint32_t offset = ((uint32_t)cdb[2]<<24)|((uint32_t)cdb[3]<<16)|((uint32_t)cdb[4]<<8)|cdb[5];
+		uint32_t blocks = cdb[6] ? cdb[6] : 1;
+		uint32_t want   = blocks * BLOCK;
+		if (want > 4096) want = 4096;                          // core tb buffer bound
+		if (offset == 0) get_idx = (cdb[1] < files.size()) ? cdb[1] : -1;
+		if (get_idx < 0) { status = 0x02; return; }
+		const std::vector<uint8_t>& d = files[get_idx].data;
+		uint64_t base = (uint64_t)offset * BLOCK;
+		uint32_t got  = (base >= d.size()) ? 0 : (uint32_t)std::min<uint64_t>(want, d.size() - base);
+		resp.assign(d.begin() + (size_t)base, d.begin() + (size_t)base + got);
+		if (!got) get_idx = -1;
+		status = 0x00;
+	}
+	// ---- 0xD3/D4/D5 SEND (Mac -> host) ----
+	void op_send_prep(const uint8_t* buf) {
+		char name[33]; int n = 0;
+		for (int i = 0; i < 32; i++) { uint8_t c = buf[16+i]; if (!c) break; name[n++] = (char)c; }
+		name[n] = 0;
+		if (!n) { status = 0x02; return; }
+		upload_name = name; upload.clear(); upload_open = true; status = 0x00;
+	}
+	void op_send_data(const uint8_t* buf) {
+		if (!upload_open) { status = 0x02; return; }
+		uint32_t off   = ((uint32_t)buf[3]<<16)|((uint32_t)buf[4]<<8)|buf[5];        // 512-blocks
+		uint32_t bytes = buf[6] ? (uint32_t)buf[6]*512 : (((uint32_t)buf[1]<<8)|buf[2]);
+		if (bytes > 512) bytes = 512;
+		uint8_t chunk[512];
+		uint32_t head = bytes < 496 ? bytes : 496;
+		memcpy(chunk, buf + 16, head);
+		if (bytes > 496) memcpy(chunk + 496, tail, bytes - 496);   // tail block
+		size_t pos = (size_t)off * 512;
+		if (upload.size() < pos + bytes) upload.resize(pos + bytes, 0);  // fseek hole = zeros
+		memcpy(&upload[pos], chunk, bytes);
+		status = 0x00;
+	}
+	void op_send_end() {
+		if (!upload_open) { status = 0x02; return; }
+		upload_open = false; status = 0x00;
+	}
+
+	void request(uint32_t lba, const uint8_t* buf) {
+		reqs++;
+		if (lba == 1) { memcpy(tail, buf, 512); return; }   // SEND payload tail block
+		if (lba != 0) return;
+		resp.clear(); status = 0x02;
+		switch (buf[0]) {
+		case 0xD2: op_count();         break;
+		case 0xD0: op_list();          break;
+		case 0xD1: op_get(buf);        break;
+		case 0xD3: op_send_prep(buf);  break;
+		case 0xD4: op_send_data(buf);  break;
+		case 0xD5: op_send_end();      break;
+		default:   status = 0x02;      break;
+		}
+	}
+	void fill(uint32_t lba, uint8_t* buf) {
+		fills++;
+		memset(buf, 0, 512);
+		if (lba == 0) {
+			uint16_t len = (resp.size() > 0xFFFF) ? 0xFFFF : (uint16_t)resp.size();
+			buf[0] = status; buf[1] = TB_SIG; buf[2] = len >> 8; buf[3] = len & 0xFF;
+		} else {
+			size_t off = (size_t)(lba - 1) * 512;
+			if (off < resp.size()) memcpy(buf, resp.data() + off, std::min<size_t>(512, resp.size() - off));
+		}
+	}
+};
+static TbHps tbx;
+
 // ---------------- HPS block-device model ----------------
 // READ fetch (io_rd): (latency) -> io_ack=1, stream 256 words into the target
 // (1 word / 2 cycles, sim byte-packing: disk byte0 in sd_buff_dout[15:8]),
@@ -67,13 +184,15 @@ static uint8_t ramp(uint64_t off) {
 // capture sd_buff_din_N into the written-image store, io_ack=0.
 // scsi.v bumps lba / rd_hps_blk / sd_buff_sel on the io_ack falling edge.
 struct Hps {
-	enum St { IDLE, WAIT, STREAM, WWAIT, WCAP, FINISH } st = IDLE;
+	enum St { IDLE, WAIT, STREAM, WWAIT, WCAP, FINISH,
+	          TBWWAIT, TBWCAP, TBRWAIT, TBRSTREAM, TBFINISH } st = IDLE;
 	int t = 0, wi = 0, tgt = 0;
 	bool was_write = false;
 	uint32_t lba = 0;
 	int latency = 600;
 	uint64_t fetches = 0, flushes = 0;
 	std::vector<uint8_t> written;   // captured write-flush image (lba*512 indexed)
+	uint8_t tbblk[512] = {};        // in-flight Toolbox request/response block
 
 	void reset() { st = IDLE; t = wi = tgt = 0; was_write = false; fetches = flushes = 0; written.clear(); }
 
@@ -82,6 +201,7 @@ struct Hps {
 		case IDLE:
 			top->sd_buff_wr = 0;
 			top->io_ack = 0;
+			top->tb_ack = 0;
 			for (int i = 0; i < 2; i++) {
 				if ((top->io_rd >> i) & 1) {
 					tgt = i;
@@ -97,6 +217,14 @@ struct Hps {
 					st = WWAIT; t = 0;
 					break;
 				}
+			}
+			// Toolbox slot (target 0). Disk io and tb round-trips never overlap:
+			// the target is mid-command in PHASE_TB while the tb transfer runs.
+			if (st == IDLE && top->tb_wr) { lba = top->tb_lba; st = TBWWAIT; t = 0; }
+			else if (st == IDLE && top->tb_rd) {
+				lba = top->tb_lba;
+				tbx.fill(lba, tbblk);
+				st = TBRWAIT; t = 0;
 			}
 			break;
 		case WAIT:
@@ -135,6 +263,42 @@ struct Hps {
 			top->sd_buff_wr = 0;
 			top->io_ack = 0;
 			if (was_write) flushes++; else fetches++;
+			st = IDLE;
+			break;
+
+		// ---- Toolbox request: core -> HPS (tb_wr). Same registered-q_a capture
+		// cadence as WCAP; the block is handed to the handler once complete.
+		case TBWWAIT:
+			if (++t >= latency) { top->tb_ack = 1; st = TBWCAP; wi = 0; t = 0; }
+			break;
+		case TBWCAP:
+			if ((t % 3) == 0) top->sd_buff_addr = wi;
+			else if ((t % 3) == 2) {
+				uint16_t w = top->tb_buff_din;
+				tbblk[wi*2]   = (uint8_t)(w >> 8);     // sim packing: even byte HIGH
+				tbblk[wi*2+1] = (uint8_t)(w & 0xff);
+				if (++wi == 256) { tbx.request(lba, tbblk); st = TBFINISH; }
+			}
+			t++;
+			break;
+		// ---- Toolbox response: HPS -> core (tb_rd), block already staged ----
+		case TBRWAIT:
+			if (++t >= latency) { top->tb_ack = 1; st = TBRSTREAM; wi = 0; t = 0; }
+			break;
+		case TBRSTREAM:
+			if ((t & 1) == 0) {
+				top->sd_buff_addr = wi;
+				top->sd_buff_dout = ((uint16_t)tbblk[wi*2] << 8) | tbblk[wi*2+1];
+				top->sd_buff_wr = 1;
+			} else {
+				top->sd_buff_wr = 0;
+				if (++wi == 256) st = TBFINISH;
+			}
+			t++;
+			break;
+		case TBFINISH:
+			top->sd_buff_wr = 0;
+			top->tb_ack = 0;
 			st = IDLE;
 			break;
 		}
@@ -301,6 +465,7 @@ static void reset_dut(int id_slot) {
 	bus_release();
 	top->img_mounted = 0; top->img_size = 0;
 	top->io_ack = 0; top->sd_buff_wr = 0; top->sd_buff_addr = 0; top->sd_buff_dout = 0;
+	top->tb_ack = 0; top->tb_mounted = 0;
 	hps.reset();
 	top->reset = 1;
 	for (int i = 0; i < 8; i++) tick();
@@ -874,6 +1039,220 @@ static int run_gapcmds() {
 	return fails ? 1 : 0;
 }
 
+// ---------------- BlueSCSI Toolbox transport test (toolbox) ----------------
+// Desk reproduction of the 2026-07-30 hardware failure "a lot of errors copying
+// from the Mac to the SD card". Drives target 0 (TOOLBOX_ENABLE) through the
+// real client sequence against the TbHps mirror of Main's handler:
+//
+//   0xD2 COUNT -> 0xD0 LIST (>512 B: multi-sector DataIn)
+//   0xD3 SEND PREP / 0xD4 SEND DATA x3 / 0xD5 SEND END, then byte-compare the
+//        uploaded image against the source
+//   0xD1 GET  (4096-byte block: multi-sector DataIn)
+//
+// Client model for 0xD4 (BlueSCSI SEND_FILE_10): the DataOut phase is ALWAYS a
+// full 512-byte block; CDB[6] (512-blocks) or CDB[1..2] (legacy byte count) says
+// how many of those bytes are valid. The last chunk of a file is therefore a
+// full block carrying a short valid count.
+static bool tb_select() {
+	reg_write(WREG_ODR, 0x01);                   // target SCSI ID 0
+	reg_write(WREG_ICR, ICR_DATA | ICR_SEL);
+	if (!wait_csr(CSR_BSY, CSR_BSY, 20000)) return false;
+	reg_write(WREG_ICR, ICR_DATA);
+	return true;
+}
+
+// One command: 10-byte CDB, optional DataOut payload, optional DataIn read,
+// then status + message. Returns status, or -1 on any stall.
+static int tb_cmd(const uint8_t* cdb, const uint8_t* payload, int paylen,
+                  uint8_t* din, int dinlen, const char* what) {
+	if (!tb_select()) { printf("toolbox: %s select failed\n", what); return -1; }
+	for (int i = 0; i < 10; i++)
+		if (!pio_put(cdb[i])) { printf("toolbox: %s CDB stalled at %d\n", what, i); return -1; }
+	for (int i = 0; i < paylen; i++)
+		if (!pio_put(payload[i])) {
+			printf("toolbox: %s DataOut stalled at byte %d of %d "
+			       "(target ended the data phase early)\n", what, i, paylen);
+			return -1;
+		}
+	reg_write(WREG_ICR, 0);                       // release the data bus
+	for (int i = 0; i < dinlen; i++) {
+		int v = pio_get();
+		if (v < 0) { printf("toolbox: %s DataIn stalled at %d of %d\n", what, i, dinlen); return -1; }
+		din[i] = (uint8_t)v;
+	}
+	int st = pio_get(), msg = pio_get();
+	if (msg != 0x00) { printf("toolbox: %s message %02x\n", what, msg); return -1; }
+	return st;
+}
+
+static int run_toolbox() {
+	reset_dut(0);
+	tbx.reset();
+	top->tb_mounted = 1;                          // HPS mounted the shared folder
+	for (int i = 0; i < 8; i++) tick();
+
+	// virtual shared folder: 14 entries -> LIST is 560 B (2 sectors)
+	tbx.files.clear();
+	for (int i = 0; i < 13; i++) {
+		char nm[32]; snprintf(nm, sizeof(nm), "file_%02d.bin", i);
+		tbx.files.push_back({ nm, std::vector<uint8_t>((size_t)(i * 37), (uint8_t)i) });
+	}
+	std::vector<uint8_t> big(9000);
+	for (size_t i = 0; i < big.size(); i++) big[i] = ramp(0x50000 + i);
+	tbx.files.push_back({ "big.bin", big });
+
+	int fails = 0;
+	uint8_t buf[8192];
+
+	// ---- 0xD2 COUNT FILES: 1 byte ----
+	{
+		uint8_t cdb[10] = { 0xD2, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		int st = tb_cmd(cdb, nullptr, 0, buf, 1, "COUNT");
+		if (st != 0x00) { printf("toolbox: COUNT status %02x\n", st); return 1; }
+		if (buf[0] != tbx.files.size()) {
+			printf("toolbox: COUNT = %u, want %zu\n", buf[0], tbx.files.size()); fails++;
+		}
+	}
+
+	// ---- 0xD0 LIST FILES: 14 x 40 = 560 bytes (crosses the 512-byte sector) ----
+	{
+		int want = (int)tbx.files.size() * 40;
+		uint8_t cdb[10] = { 0xD0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		int st = tb_cmd(cdb, nullptr, 0, buf, want, "LIST");
+		if (st != 0x00) { printf("toolbox: LIST status %02x\n", st); return 1; }
+		if ((int)tbx.resp.size() != want) {
+			printf("toolbox: LIST staged %zu bytes, want %d\n", tbx.resp.size(), want); fails++;
+		} else {
+			int bad = -1, nbad = 0;
+			for (int i = 0; i < want; i++) if (buf[i] != tbx.resp[i]) { if (bad < 0) bad = i; nbad++; }
+			if (bad >= 0) {
+				printf("toolbox: LIST %d/%d bytes wrong, first at %d\n", nbad, want, bad);
+				int w0 = bad > 8 ? bad - 8 : 0;
+				printf("   got :"); for (int i = w0; i < w0 + 24 && i < want; i++) printf(" %02x", buf[i]);
+				printf("\n   want:"); for (int i = w0; i < w0 + 24 && i < want; i++) printf(" %02x", tbx.resp[i]);
+				printf("\n");
+				fails++;
+			}
+		}
+	}
+
+	// ---- 0xD3/D4/D5 SEND FILE: 1408 bytes = 2 full blocks + a 384-byte tail ----
+	{
+		const int SRC = 1408;
+		std::vector<uint8_t> src(SRC);
+		for (int i = 0; i < SRC; i++) src[i] = ramp(0x90000 + i);
+
+		uint8_t name[33] = {};
+		memcpy(name, "upload.bin", 10);
+		uint8_t cdb_prep[10] = { 0xD3, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		int st = tb_cmd(cdb_prep, name, 33, nullptr, 0, "SEND PREP");
+		if (st != 0x00) { printf("toolbox: SEND PREP status %02x\n", st); return 1; }
+
+		for (int blk = 0; blk * 512 < SRC; blk++) {
+			int valid = SRC - blk * 512; if (valid > 512) valid = 512;
+			uint8_t chunk[512];
+			memset(chunk, 0xFF, sizeof(chunk));            // client sends a full block
+			memcpy(chunk, &src[blk * 512], valid);
+			uint8_t cdb[10] = { 0xD4, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+			if (valid == 512) cdb[6] = 1;                   // block encoding
+			else { cdb[1] = (uint8_t)(valid >> 8); cdb[2] = (uint8_t)valid; }  // legacy count
+			cdb[3] = (uint8_t)(blk >> 16); cdb[4] = (uint8_t)(blk >> 8); cdb[5] = (uint8_t)blk;
+			char what[32]; snprintf(what, sizeof(what), "SEND DATA blk%d", blk);
+			st = tb_cmd(cdb, chunk, 512, nullptr, 0, what);
+			if (st != 0x00) { printf("toolbox: %s status %02x\n", what, st); return 1; }
+		}
+
+		uint8_t cdb_end[10] = { 0xD5, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		st = tb_cmd(cdb_end, nullptr, 0, nullptr, 0, "SEND END");
+		if (st != 0x00) { printf("toolbox: SEND END status %02x\n", st); return 1; }
+
+		if (tbx.upload.size() != (size_t)SRC) {
+			printf("toolbox: uploaded %zu bytes, want %d (%+d)\n",
+			       tbx.upload.size(), SRC, (int)tbx.upload.size() - SRC);
+			fails++;
+		}
+		int bad = 0, first = -1;
+		for (size_t i = 0; i < src.size() && i < tbx.upload.size(); i++)
+			if (tbx.upload[i] != src[i]) { if (first < 0) first = (int)i; bad++; }
+		if (bad) {
+			printf("toolbox: upload %d/%d bytes wrong, first at %d (got %02x want %02x)\n",
+			       bad, SRC, first, tbx.upload[first], src[first]);
+			fails++;
+		}
+	}
+
+	// ---- SEND with a SHORT final DataOut: the alternate client model, where the
+	// initiator transfers only the CDB's valid-byte count instead of a full
+	// block. The fixed 512-byte phase length would hang the bus without the
+	// inter-byte watchdog; check it closes the phase and the file still lands.
+	{
+		const int SRC = 700;                       // 1 full block + 188 bytes
+		std::vector<uint8_t> src(SRC);
+		for (int i = 0; i < SRC; i++) src[i] = ramp(0xA1000 + i);
+
+		uint8_t name[33] = {};
+		memcpy(name, "short.bin", 9);
+		uint8_t cdb_prep[10] = { 0xD3, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		int st = tb_cmd(cdb_prep, name, 33, nullptr, 0, "SHORT PREP");
+		if (st != 0x00) { printf("toolbox: SHORT PREP status %02x\n", st); return 1; }
+
+		for (int blk = 0; blk * 512 < SRC; blk++) {
+			int valid = SRC - blk * 512; if (valid > 512) valid = 512;
+			uint8_t cdb[10] = { 0xD4, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+			if (valid == 512) cdb[6] = 1;
+			else { cdb[1] = (uint8_t)(valid >> 8); cdb[2] = (uint8_t)valid; }
+			cdb[3] = (uint8_t)(blk >> 16); cdb[4] = (uint8_t)(blk >> 8); cdb[5] = (uint8_t)blk;
+			if (!tb_select()) { printf("toolbox: SHORT blk%d select failed\n", blk); return 1; }
+			for (int i = 0; i < 10; i++)
+				if (!pio_put(cdb[i])) { printf("toolbox: SHORT blk%d CDB stalled %d\n", blk, i); return 1; }
+			for (int i = 0; i < valid; i++)
+				if (!pio_put(src[blk*512 + i])) { printf("toolbox: SHORT blk%d stalled at %d\n", blk, i); return 1; }
+			reg_write(WREG_ICR, 0);
+			// wait out the watchdog: phase flips to STATUS (IO=1) on its own
+			if (!wait_csr(CSR_IO, CSR_IO, 200000)) {
+				printf("toolbox: SHORT blk%d wedged in DataOut (watchdog did not fire)\n", blk);
+				return 1;
+			}
+			int s2 = pio_get(), m2 = pio_get();
+			if (s2 != 0x00 || m2 != 0x00) { printf("toolbox: SHORT blk%d status %02x msg %02x\n", blk, s2, m2); fails++; }
+		}
+		uint8_t cdb_end[10] = { 0xD5, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		st = tb_cmd(cdb_end, nullptr, 0, nullptr, 0, "SHORT END");
+		if (st != 0x00) { printf("toolbox: SHORT END status %02x\n", st); fails++; }
+
+		if (tbx.upload.size() != (size_t)SRC || memcmp(tbx.upload.data(), src.data(), SRC)) {
+			printf("toolbox: short-send upload %zu bytes (want %d), content %s\n",
+			       tbx.upload.size(), SRC,
+			       (tbx.upload.size() == (size_t)SRC && !memcmp(tbx.upload.data(), src.data(), SRC))
+			         ? "ok" : "MISMATCH");
+			fails++;
+		}
+	}
+
+	// ---- 0xD1 GET FILE: one 4096-byte block out of big.bin (8 sectors) ----
+	{
+		uint8_t cdb[10] = { 0xD1, 13, 0, 0, 0, 0, 1, 0, 0, 0 };   // index 13 = big.bin, offset 0, 1 block
+		int st = tb_cmd(cdb, nullptr, 0, buf, 4096, "GET");
+		if (st != 0x00) { printf("toolbox: GET status %02x\n", st); return 1; }
+		if (tbx.resp.size() != 4096) {
+			printf("toolbox: GET staged %zu bytes, want 4096\n", tbx.resp.size()); fails++;
+		} else {
+			int bad = 0, first = -1;
+			for (int i = 0; i < 4096; i++)
+				if (buf[i] != tbx.resp[i]) { if (first < 0) first = i; bad++; }
+			if (bad) {
+				printf("toolbox: GET %d/4096 bytes wrong, first at %d (got %02x want %02x)\n",
+				       bad, first, buf[first], tbx.resp[first]);
+				fails++;
+			}
+		}
+	}
+
+	printf("toolbox: %s (tb reqs=%llu fills=%llu)\n", fails ? "FAIL" : "PASS",
+	       (unsigned long long)tbx.reqs, (unsigned long long)tbx.fills);
+	return fails ? 1 : 0;
+}
+
 // ---------------- main ----------------
 int main(int argc, char** argv) {
 	Verilated::commandArgs(argc, argv);
@@ -917,6 +1296,14 @@ int main(int argc, char** argv) {
 
 	if (one_mode && !strcmp(one_mode, "gapcmds")) {
 		int rc = run_gapcmds();
+#if VM_TRACE
+		if (tfp) tfp->close();
+#endif
+		return rc;
+	}
+
+	if (one_mode && !strcmp(one_mode, "toolbox")) {
+		int rc = run_toolbox();
 #if VM_TRACE
 		if (tfp) tfp->close();
 #endif

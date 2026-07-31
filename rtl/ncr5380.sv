@@ -818,7 +818,12 @@ module ncr5380
 			// same IDs 0/1 on 2026-07-20; the Toolbox driver locates the drive by
 			// INQUIRY page 0x31, not by ID. Inert until the HPS mounts the
 			// Toolbox shared folder (tb_mounted) and the Main handler answers.
-			scsi #(.ID(i[2:0]), .RING_LOG(i == 0 ? 5 : 4), .TOOLBOX_ENABLE(i == 0)) target
+			// TB_ADDRW(11) on the Toolbox target = 4 KB tb buffer (8 sectors):
+			// a 512-byte SEND DATA payload sits at buffer bytes 16..527 (it
+			// wrapped onto the CDB at 512 B) and a 0xD1 GET fetches its full
+			// 4096-byte block instead of serving one sector eight times.
+			scsi #(.ID(i[2:0]), .RING_LOG(i == 0 ? 5 : 4), .TOOLBOX_ENABLE(i == 0),
+			       .TB_ADDRW(i == 0 ? 11 : 8)) target
 			(
 				.clk    ( clk ),
 				.rst    ( scsi_rst ),
