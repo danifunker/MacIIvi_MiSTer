@@ -194,7 +194,18 @@ struct Hps {
 	std::vector<uint8_t> written;   // captured write-flush image (lba*512 indexed)
 	uint8_t tbblk[512] = {};        // in-flight Toolbox request/response block
 
-	void reset() { st = IDLE; t = wi = tgt = 0; was_write = false; fetches = flushes = 0; written.clear(); }
+	// Slow-HPS injection. /media/fat is mounted sync,dirsync, so one SEND chunk
+	// is a synchronous card write and the card can stall well past the core's
+	// ~262144-cycle (~8 ms) watchdog. Every tb_slow_every'th tb READ is answered
+	// after tb_slow_latency cycles instead of `latency`.
+	int tb_slow_every = 0, tb_slow_latency = 0;
+	uint64_t tb_reads = 0;
+	int cur_tb_latency = 600;
+
+	void reset() {
+		st = IDLE; t = wi = tgt = 0; was_write = false; fetches = flushes = 0; written.clear();
+		tb_reads = 0; cur_tb_latency = latency;
+	}
 
 	void service() {
 		switch (st) {
@@ -224,6 +235,9 @@ struct Hps {
 			else if (st == IDLE && top->tb_rd) {
 				lba = top->tb_lba;
 				tbx.fill(lba, tbblk);
+				tb_reads++;
+				cur_tb_latency = (tb_slow_every && (tb_reads % tb_slow_every) == 0)
+				                 ? tb_slow_latency : latency;
 				st = TBRWAIT; t = 0;
 			}
 			break;
@@ -283,7 +297,7 @@ struct Hps {
 			break;
 		// ---- Toolbox response: HPS -> core (tb_rd), block already staged ----
 		case TBRWAIT:
-			if (++t >= latency) { top->tb_ack = 1; st = TBRSTREAM; wi = 0; t = 0; }
+			if (++t >= cur_tb_latency) { top->tb_ack = 1; st = TBRSTREAM; wi = 0; t = 0; }
 			break;
 		case TBRSTREAM:
 			if ((t & 1) == 0) {
@@ -437,7 +451,13 @@ static bool dma_write16(bool word, uint16_t wdata, int gap) {
 }
 
 // ---------------- SCSI Manager-style PIO ----------------
-static bool wait_csr(uint8_t mask, uint8_t val, int max_polls = 50000) {
+// Initiator patience, in CSR polls. The default matches a Mac driver that gives
+// up quickly; the slow-HPS test raises it because a legitimately stalled SD
+// write holds the target far longer than any normal round trip.
+static int csr_patience = 50000;
+
+static bool wait_csr(uint8_t mask, uint8_t val, int max_polls = 0) {
+	if (max_polls <= 0) max_polls = csr_patience;
 	for (int i = 0; i < max_polls; i++)
 		if ((reg_read(RREG_CSR) & mask) == val) return true;
 	return false;
@@ -1056,7 +1076,7 @@ static int run_gapcmds() {
 static bool tb_select() {
 	reg_write(WREG_ODR, 0x01);                   // target SCSI ID 0
 	reg_write(WREG_ICR, ICR_DATA | ICR_SEL);
-	if (!wait_csr(CSR_BSY, CSR_BSY, 20000)) return false;
+	if (!wait_csr(CSR_BSY, CSR_BSY)) return false;
 	reg_write(WREG_ICR, ICR_DATA);
 	return true;
 }
@@ -1253,6 +1273,116 @@ static int run_toolbox() {
 	return fails ? 1 : 0;
 }
 
+// ---------------- Toolbox transport under a stalling HPS (toolboxslow) -------
+// The HW failure this covers: a 2.7 MiB Mac->SD copy died ~1769 blocks in with
+// "the SD card refused the transfer", leaving a file of exactly 1769*512 bytes.
+// /media/fat is exFAT mounted sync,dirsync, so every SEND chunk is a synchronous
+// card write; when the card hits an erase cycle the handler does not answer
+// inside the core's ~8 ms watchdog. The core then looked at a buffer that still
+// held the CDB it wrote, found no 0xB5 signature, and reported CHECK CONDITION
+// as if no handler existed. One slow round trip in ~1770 is enough to abort a
+// whole copy, which is why small files always worked.
+static int run_toolbox_slow() {
+	reset_dut(0);
+	tbx.reset();
+	top->tb_mounted = 1;
+	for (int i = 0; i < 8; i++) tick();
+
+	tbx.files.clear();
+	tbx.files.push_back({ "seed.bin", std::vector<uint8_t>(16, 0x5A) });
+
+	// Stall every 3rd tb READ for ~3 watchdog periods (786432 > 3*262144), so
+	// the retry path has to survive several re-looks, not just one.
+	hps.tb_reads = 0;
+	hps.tb_slow_every = 3;
+	hps.tb_slow_latency = 786432;
+	const int saved_patience = csr_patience;
+	// A stalled card legitimately holds the target; a 4096-byte GET fetches 8
+	// data sectors, so several stalls can stack inside one command.
+	csr_patience = 3000000;
+
+	const int SRC = 512 * 6;
+	std::vector<uint8_t> src(SRC);
+	for (int i = 0; i < SRC; i++) src[i] = ramp(0xC0000 + i);
+
+	int fails = 0;
+	uint8_t name[33] = {};
+	memcpy(name, "stall.bin", 9);
+	uint8_t cdb_prep[10] = { 0xD3, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	int st = tb_cmd(cdb_prep, name, 33, nullptr, 0, "SLOW PREP");
+	if (st != 0x00) { printf("toolboxslow: PREP status %02x (want 00)\n", st); fails++; }
+
+	for (int blk = 0; blk * 512 < SRC; blk++) {
+		uint8_t chunk[512];
+		memcpy(chunk, &src[blk * 512], 512);
+		uint8_t cdb[10] = { 0xD4, 0, 0, 0, 0, 0, 1, 0, 0, 0 };
+		cdb[3] = (uint8_t)(blk >> 16); cdb[4] = (uint8_t)(blk >> 8); cdb[5] = (uint8_t)blk;
+		char what[32]; snprintf(what, sizeof(what), "SLOW DATA blk%d", blk);
+		st = tb_cmd(cdb, chunk, 512, nullptr, 0, what);
+		if (st != 0x00) {
+			printf("toolboxslow: %s status %02x (want 00) "
+			       "<-- the HW abort: a slow HPS read as CHECK CONDITION\n", what, st);
+			fails++;
+		}
+	}
+
+	uint8_t cdb_end[10] = { 0xD5, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	st = tb_cmd(cdb_end, nullptr, 0, nullptr, 0, "SLOW END");
+	if (st != 0x00) { printf("toolboxslow: END status %02x (want 00)\n", st); fails++; }
+
+	if (tbx.upload.size() != (size_t)SRC) {
+		printf("toolboxslow: uploaded %zu bytes, want %d (%+d)\n",
+		       tbx.upload.size(), SRC, (int)tbx.upload.size() - SRC);
+		fails++;
+	} else {
+		int bad = 0, first = -1;
+		for (int i = 0; i < SRC; i++)
+			if (tbx.upload[i] != src[i]) { if (first < 0) first = i; bad++; }
+		if (bad) {
+			printf("toolboxslow: upload %d/%d bytes wrong, first at %d\n", bad, SRC, first);
+			fails++;
+		}
+	}
+
+	// A GET whose data blocks are stalled too: TBS_DATA must not serve a buffer
+	// the HPS has not filled yet.
+	{
+		uint8_t buf[4096];
+		std::vector<uint8_t> big(4096);
+		for (size_t i = 0; i < big.size(); i++) big[i] = ramp(0xD0000 + i);
+		tbx.files.push_back({ "big.bin", big });
+		uint8_t cdb[10] = { 0xD1, 1, 0, 0, 0, 0, 1, 0, 0, 0 };
+		st = tb_cmd(cdb, nullptr, 0, buf, 4096, "SLOW GET");
+		if (st != 0x00) { printf("toolboxslow: GET status %02x (want 00)\n", st); fails++; }
+		else if (tbx.resp.size() != 4096) {
+			printf("toolboxslow: GET staged %zu bytes, want 4096\n", tbx.resp.size()); fails++;
+		} else {
+			int bad = 0, first = -1;
+			for (int i = 0; i < 4096; i++)
+				if (buf[i] != tbx.resp[i]) { if (first < 0) first = i; bad++; }
+			if (bad) {
+				printf("toolboxslow: GET %d/4096 bytes wrong, first at %d\n", bad, first);
+				for (int s = 0; s < 8; s++) {
+					int sb = 0;
+					for (int i = 0; i < 512; i++)
+						if (buf[s*512+i] != tbx.resp[s*512+i]) sb++;
+					printf("   sector %d: %3d/512 wrong   got %02x %02x %02x  want %02x %02x %02x\n",
+					       s, sb, buf[s*512], buf[s*512+1], buf[s*512+2],
+					       tbx.resp[s*512], tbx.resp[s*512+1], tbx.resp[s*512+2]);
+				}
+				fails++;
+			}
+		}
+	}
+
+	hps.tb_slow_every = 0;
+	csr_patience = saved_patience;
+	printf("toolboxslow: %s (tb reads=%llu, %d stalled past the watchdog)\n",
+	       fails ? "FAIL" : "PASS", (unsigned long long)hps.tb_reads,
+	       (int)(hps.tb_reads / 3));
+	return fails ? 1 : 0;
+}
+
 // ---------------- main ----------------
 int main(int argc, char** argv) {
 	Verilated::commandArgs(argc, argv);
@@ -1304,6 +1434,14 @@ int main(int argc, char** argv) {
 
 	if (one_mode && !strcmp(one_mode, "toolbox")) {
 		int rc = run_toolbox();
+#if VM_TRACE
+		if (tfp) tfp->close();
+#endif
+		return rc;
+	}
+
+	if (one_mode && !strcmp(one_mode, "toolboxslow")) {
+		int rc = run_toolbox_slow();
 #if VM_TRACE
 		if (tfp) tfp->close();
 #endif
