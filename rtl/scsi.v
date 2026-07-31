@@ -1304,10 +1304,17 @@ always @(posedge clk) begin
 		// The HPS has already filled the buffer by the timeout, so force-latch the
 		// status block. Same watchdog on TBS_DATA. (2026-07-21)
 		//
-		// The watchdog counts UNCONDITIONALLY. A 2026-07-31 attempt to hold it
-		// in reset while tb_ack was high broke every Toolbox command on HW: the
-		// force-latch is the only mechanism this transport actually runs on, and
-		// suppressing it removed the one thing that worked. Do not gate it.
+		// The watchdog counts UNCONDITIONALLY. A 2026-07-31 attempt to hold it in
+		// reset while tb_ack was high broke every Toolbox command on HW.
+		//
+		// Note on the 2026-07-21 claim above that the READ ack "is not observed"
+		// on HW: taken literally that is wrong. `scsi_bench --mode toolboxwdog`
+		// holds tb_ack high past the force-latch, and under that model even the
+		// silicon-proven pre-fix RTL fails (TBS_DATA clears tb_rd_r on the stale
+		// ack, so the fetch never issues and the status block is served as data).
+		// Since LIST demonstrably works on HW, the ack fall must normally BE
+		// caught; the watchdog covers occasional misses. Do not gate it, and do
+		// not assume the ack can be ignored.
 		TBS_STAT: begin
 			if (tb_ack) tb_rd_r <= 1'b0;
 			tb_to <= tb_to + 1'b1;

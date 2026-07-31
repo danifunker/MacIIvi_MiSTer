@@ -185,7 +185,7 @@ static TbHps tbx;
 // scsi.v bumps lba / rd_hps_blk / sd_buff_sel on the io_ack falling edge.
 struct Hps {
 	enum St { IDLE, WAIT, STREAM, WWAIT, WCAP, FINISH,
-	          TBWWAIT, TBWCAP, TBRWAIT, TBRSTREAM, TBFINISH } st = IDLE;
+	          TBWWAIT, TBWCAP, TBRWAIT, TBRSTREAM, TBFINISH, TBAHOLD } st = IDLE;
 	int t = 0, wi = 0, tgt = 0;
 	bool was_write = false;
 	uint32_t lba = 0;
@@ -201,6 +201,16 @@ struct Hps {
 	int tb_slow_every = 0, tb_slow_latency = 0;
 	uint64_t tb_reads = 0;
 	int cur_tb_latency = 600;
+
+	// Ack-fall model. The core's 2026-07-21 comment records that on HW the tb
+	// READ ack fall is NOT observed, so the ~8 ms watchdog — not the ack — is
+	// what advances the round trip. This bench completes on the ack fall by
+	// default, i.e. it exercises a path HW does not use, which is exactly how a
+	// core regression that broke every Toolbox command on hardware still passed
+	// every mode. tb_ack_hold > the watchdog holds tb_ack high past the
+	// force-latch so the WATCHDOG is the completion path and the ack fall lands
+	// late and stale, the way HW appears to behave.
+	int tb_ack_hold = 0;   // 0 = drop tb_ack promptly (original model)
 
 	void reset() {
 		st = IDLE; t = wi = tgt = 0; was_write = false; fetches = flushes = 0; written.clear();
@@ -312,8 +322,14 @@ struct Hps {
 			break;
 		case TBFINISH:
 			top->sd_buff_wr = 0;
+			if (tb_ack_hold) { st = TBAHOLD; t = 0; break; }   // hold tb_ack high
 			top->tb_ack = 0;
 			st = IDLE;
+			break;
+		// tb_ack stays asserted past the core's watchdog, so the force-latch is
+		// what completes the round trip and the eventual fall arrives stale.
+		case TBAHOLD:
+			if (++t >= tb_ack_hold) { top->tb_ack = 0; st = IDLE; }
 			break;
 		}
 	}
@@ -1273,6 +1289,38 @@ static int run_toolbox() {
 	return fails ? 1 : 0;
 }
 
+// ---------------- DIFFERENTIAL probe: stale ack fall (toolboxwdog) -----------
+// The toolbox suite re-run with tb_ack held high past the core's ~8 ms watchdog,
+// so the force-latch completes each round trip and the ack fall arrives stale.
+//
+// THIS IS NOT A PASS/FAIL GATE. The silicon-proven pre-fix RTL (52715a7) fails
+// it too — TBS_DATA clears tb_rd_r on the stale ack, the fetch never issues, and
+// the status block gets served as LIST data. Since LIST works on real hardware,
+// the model is over-constrained: the ack fall must normally be caught there, and
+// the watchdog only covers occasional misses.
+//
+// Its value is DIFFERENTIAL — compare a candidate against 52715a7:
+//   52715a7 (good) : LIST corrupt at byte 1, SEND stalls at byte 23
+//   7ec4e2b (bad)  : dies on the FIRST command (COUNT) — the HW symptom, where
+//                    every Toolbox command returned CHECK and nothing listed
+//   d4c70e6 (fix)  : byte-for-byte identical to 52715a7 => no divergence
+// A candidate that fails EARLIER or DIFFERENTLY than 52715a7 has changed the
+// handshake and must not be deployed.
+static int run_toolbox_wdog() {
+	const int saved_patience = csr_patience;
+	hps.tb_ack_hold = 300000;    // > the 262144-cycle watchdog
+	csr_patience    = 3000000;   // the initiator must outwait the force-latch
+	printf("toolboxwdog: DIFFERENTIAL probe — tb_ack held %d cycles.\n"
+	       "toolboxwdog: known-good 52715a7 ALSO fails here; compare the failure\n"
+	       "toolboxwdog: SHAPE against it, do not read this as pass/fail.\n",
+	       hps.tb_ack_hold);
+	int rc = run_toolbox();
+	hps.tb_ack_hold = 0;
+	csr_patience    = saved_patience;
+	printf("toolboxwdog: probe complete (rc=%d — expected nonzero, see above)\n", rc);
+	return 0;   // differential probe: never gates
+}
+
 // ---------------- Toolbox transport under a stalling HPS (toolboxslow) -------
 // The HW failure this covers: a 2.7 MiB Mac->SD copy died ~1769 blocks in with
 // "the SD card refused the transfer", leaving a file of exactly 1769*512 bytes.
@@ -1429,6 +1477,14 @@ int main(int argc, char** argv) {
 
 	if (one_mode && !strcmp(one_mode, "toolbox")) {
 		int rc = run_toolbox();
+#if VM_TRACE
+		if (tfp) tfp->close();
+#endif
+		return rc;
+	}
+
+	if (one_mode && !strcmp(one_mode, "toolboxwdog")) {
+		int rc = run_toolbox_wdog();
 #if VM_TRACE
 		if (tfp) tfp->close();
 #endif
