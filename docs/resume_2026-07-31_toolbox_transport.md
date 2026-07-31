@@ -5,24 +5,35 @@ Branch `cd-audio` @ `069acc8` (**unpushed, unmerged**, 4 commits past the
 
 ---
 
-## 0. STOP — read this first
+## 0. STATUS — HW VALIDATION PASS (2026-07-31 10:52)
 
-**The core currently on the MiSTer is BROKEN.** It is the `7ec4e2b` build
-(`md5 37035cef0a82f72c75baf3d3ea7775b7`, pushed 08:19). On it **every** BlueSCSI
-Toolbox command returns CHECK CONDITION: MacAtrium lists no shared files and no
-CDs. The CD-ROM data path, audio, disks and boot are unaffected.
+**Everything in §1 that was open is now fixed and validated on `.143`.**
+Deployed RBF: SEED 2 build of `d4c70e6`+`069acc8`,
+`md5 6dea464661d27fe0d289246812ea4251`, worst slack **+0.250**, ALM 96%,
+M10K 524/553.
 
-The fix is committed (`d4c70e6`) but **has not been built into a deployable
-RBF** — a Quartus seed sweep was still running when this was written.
+Validated on hardware, driven end-to-end through MacAtrium:
 
-**Rollback (30 s, no rebuild):**
-```bash
-ssh -i ~/.ssh/mister_only root@$MISTER_HOST \
-  "cp /media/fat/_Unstable/MacIIvi.rbf.prev_20260731_0535 /media/fat/_Unstable/MacIIvi.rbf && sync"
-```
-That restores `md5 9fd8bbd6032ddc238fa1f0c3b45f23aa` (the 05:35 build =
-`52715a7` RTL). On it the Toolbox works but large Mac→SD copies still abort —
-that is the bug this whole effort is about. Reload the core after swapping.
+| Check | Result |
+|---|---|
+| Boot + Finder colour icons | clean (marginality gate) |
+| Toolbox **Shared Files** lists | ✅ (was the `7ec4e2b` regression) |
+| **CD Library** lists both CD images | ✅ (`TIM_3-mac.CUE`, `TIM_3-mac.chd`) |
+| SEND `MacsBug.bin` 113,408 B | COMPLETE, MacBinary CRC ok |
+| SEND **`TIM Audio.bin` 2,912,512 B** | COMPLETE — **the exact file that previously died at 905,728** |
+| SEND `TIM.bin` 1,202,432 B | COMPLETE, CRC ok |
+| GET small + **GET 3 MB** | both "Copied into MacAtrium/Incoming." |
+
+~4.2 MB sent across ~8,300 round trips with zero failures. Every SEND was
+verified structurally, not by size alone: the MacBinary header's declared
+data/resource fork lengths were parsed and the total re-derived
+(`128 + roundup128(data) + roundup128(rsrc)`), plus the header CRC-16.
+
+Evidence: `releases/hw_143_toolbox_{sharedfiles,cdlibrary,send_3files,get_3M}_ok_20260731.png`.
+
+Rollback targets kept on the device if ever needed:
+`/media/fat/_Unstable/MacIIvi.rbf.prev_20260731_0535` (`9fd8bbd6…`, `52715a7`)
+and `MacIIvi.rbf.broken_7ec4e2b` (`37035cef…`, **do not use**).
 
 ---
 
@@ -31,7 +42,7 @@ that is the bug this whole effort is about. Reload the core after swapping.
 | # | Bug | Status |
 |---|---|---|
 | 1 | Mac→SD copies lost 16 bytes per 512-byte block | **FIXED, deployed, HW-confirmed** |
-| 2 | Mac→SD copy aborts mid-file: "The SD card refused the transfer" | **FIXED in `d4c70e6`, NOT yet built** |
+| 2 | Mac→SD copy aborts mid-file: "The SD card refused the transfer" | **FIXED — HW-validated 2026-07-31** |
 | 3 | GET (SD→Mac) under a stalled HPS silently corrupts | **KNOWN GAP, pre-existing, untouched** |
 
 ### Bug 1 — the 16-byte hole (done)
@@ -205,8 +216,8 @@ session — SEED 4 fitted `7ec4e2b` at **+0.058** and `d4c70e6` at **−0.123**.
 `7ec4e2b` sweep (`output_files/seed_sweep_slowhps/`):
 `s2 −0.007`, `s1 −0.001` (ALM 98%), `s3 −0.054`, **`s4 +0.058` WINNER**.
 
-`d4c70e6` sweep (`output_files/seed_sweep_minfix/`), **in progress**:
-`s4 −0.123` fail; `s2` was compiling. Order tried: 4, 2, 1, 3, 5, 6.
+`d4c70e6` sweep (`output_files/seed_sweep_minfix/`): `s4 −0.123` fail,
+**`s2 +0.250` WINNER** (ALM 40,197/41,910 = 96%). Order tried: 4, 2, 1, 3, 5, 6.
 
 All misses are on the `pll_hdmi` pixel-clock domain, by picoseconds — nowhere
 near the SCSI or CPU paths. The design sits at 97–98% ALM / 95% M10K, so the
@@ -299,8 +310,8 @@ then an explicit HTTPS URL, and resync with
 
 ## 8. Next steps
 
-1. Finish the seed sweep; deploy the first all-met fit; run §6 validation.
-2. Once green: merge `cd-audio` → `main`, push, cut a release RBF.
+1. ~~Finish the seed sweep; deploy; validate.~~ **DONE — see §0.**
+2. Merge `cd-audio` → `main`, push, cut a release RBF.
 3. Wire `cdtb_*` into `scsi_bench` (§4) — the CD changer has no coverage.
 4. Only then revisit Bug 3 (GET under stall), with that coverage in place.
 5. Port the whole thing back to `../MacLC_MiSTer` — `rtl/scsi.v` syncs
