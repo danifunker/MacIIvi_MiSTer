@@ -1266,15 +1266,19 @@ always @(posedge clk) begin
 					// Ship that tail FIRST (LBA 1) — the handler then has the
 					// whole payload when the CDB block (LBA 0) runs it.
 					tb_fetch_sec <= 4'd1;
-					tb_wr_r <= 1'b1; tb_lba_r <= 32'd1; tb_state <= TBS_REQ2;
+					tb_wr_r <= 1'b1; tb_lba_r <= 32'd1; tb_to <= 18'd0; tb_state <= TBS_REQ2;
 				end else begin
 					tb_wr_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_REQ;
 				end
 			end else tb_load_w <= tb_load_w + 1'b1;
-		// tail block written; fall through to the CDB request block
+		// tail block written; fall through to the CDB request block. Same ~8 ms
+		// watchdog as TBS_STAT/TBS_DATA: this is the one NEW transfer in the
+		// round-trip, and a missed ack here would wedge the SCSI bus rather than
+		// just corrupt 16 bytes.
 		TBS_REQ2: begin
 			if (tb_ack) tb_wr_r <= 1'b0;
-			if (old_tb_ack & ~tb_ack) begin
+			tb_to <= tb_to + 1'b1;
+			if ((old_tb_ack & ~tb_ack) || (&tb_to)) begin
 				tb_fetch_sec <= 4'd0;   // sector-0 addressing for the CDB/status block
 				tb_wr_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_REQ;
 			end
