@@ -58,8 +58,14 @@ module emu
 	localparam CONF_STR = {
 		"MacIIvi;UART57600:115200;",
 		"-;",
-		"F1,DSKIMG,Mount Pri Floppy;",
-		"F2,DSKIMG,Mount Sec Floppy;",
+		// One floppy only: the real Mac IIvi has a single internal SuperDrive
+		// and no external floppy port. The old "Sec Floppy" (F2, ioctl index 2)
+		// was dropped 2026-08-06 (owner call, fit headroom): the second drive
+		// still exists inside the family-shared swim.v but its insertDisk is
+		// tied off below, so it permanently reports "no disk" — exactly a real
+		// IIvi's empty second bay. Keep the F**1** index: the mount latches key
+		// on dio_menu==1 and Main packs the extension into the upper bits.
+		"F1,DSKIMG,Mount Floppy;",
 		"-;",
 		"SC0,IMGVHDHDA,Mount SCSI-0;",
 		"SC1,IMGVHDHDA,Mount SCSI-1;",
@@ -1942,10 +1948,13 @@ module emu
 
 
 		// floppy disk interface
-		.insertDisk({dsk_ext_ins, dsk_int_ins}),
-		.diskSides({dsk_ext_ds, dsk_int_ds}),
-		.diskMFM({dsk_ext_mfm, dsk_int_mfm}),
-		.diskHD({dsk_ext_hd, dsk_int_hd}),
+		// Drive 2 tied off — single-SuperDrive machine (see CONF_STR note).
+		// Constant zeros let synthesis fold the ext-drive cones in swim.v
+		// without touching the family-shared file.
+		.insertDisk({1'b0, dsk_int_ins}),
+		.diskSides({1'b0, dsk_int_ds}),
+		.diskMFM({1'b0, dsk_int_mfm}),
+		.diskHD({1'b0, dsk_int_hd}),
 		.diskEject(diskEject),
 		.dskReadAddrInt(dskReadAddrInt),
 		.dskReadAckInt(dskReadAckInt),
@@ -2078,10 +2087,12 @@ module emu
 	wire  [5:0] dio_menu = dio_index[5:0];
 
 	// good floppy image sizes are 819200 bytes and 409600 bytes
-	reg dsk_int_ds, dsk_ext_ds;
-	reg dsk_int_ss, dsk_ext_ss;  // single sided image inserted
-	reg dsk_int_mfm, dsk_ext_mfm;  // MFM-format image (ISM/SWIM path): 720K or 1.44MB
-	reg dsk_int_hd,  dsk_ext_hd;   // 1.44MB HD (vs 720K DD)
+	// (single drive — the dsk_ext_* twin machinery was removed with the
+	// second floppy, 2026-08-06)
+	reg dsk_int_ds;
+	reg dsk_int_ss;   // single sided image inserted
+	reg dsk_int_mfm;  // MFM-format image (ISM/SWIM path): 720K or 1.44MB
+	reg dsk_int_hd;   // 1.44MB HD (vs 720K DD)
 
 	// DiskCopy 4.2 (.dsk/.image) support: an 84-byte (42-word) header precedes
 	// the raw logical-order sector data (tags trail the data; they land past
@@ -2113,12 +2124,10 @@ module emu
 	// disk-switched flag insisted nothing changed, a state no real machine
 	// produces (MAME asserts m_dskchg on every unload).
 	localparam [25:0] DSK_EMPTY_CY = 26'h3FFFFFF;
-	reg [25:0] dsk_int_empty_cy, dsk_ext_empty_cy;
+	reg [25:0] dsk_int_empty_cy;
 	wire dsk_int_empty = (dsk_int_empty_cy != DSK_EMPTY_CY);
-	wire dsk_ext_empty = (dsk_ext_empty_cy != DSK_EMPTY_CY);
 	// any known type of disk image inserted?
 	wire dsk_int_ins = !dsk_int_empty && (dsk_int_ds || dsk_int_ss || dsk_int_mfm);
-	wire dsk_ext_ins = !dsk_ext_empty && (dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm);
 	// at the end of a download latch file size
 	// diskEject is set by macos on eject
 	always @(posedge clk_sys) begin
@@ -2159,42 +2168,14 @@ module emu
 		end
 	end	
 
-	always @(posedge clk_sys) begin
-		reg old_down;
-
-		old_down <= dio_download;
-		// see the dsk_int_* block above: a swap must present as leave -> insert
-		if(~old_down && dio_download && dio_menu == 6'd2) begin
-			dsk_ext_ds  <= 0;
-			dsk_ext_ss  <= 0;
-			dsk_ext_mfm <= 0;
-			dsk_ext_hd  <= 0;
-			dsk_ext_empty_cy <= 26'd0;
-		end
-		else if(dio_download && dio_menu == 6'd2)
-			dsk_ext_empty_cy <= 26'd0;
-		else if(dsk_ext_empty_cy != DSK_EMPTY_CY)
-			dsk_ext_empty_cy <= dsk_ext_empty_cy + 26'd1;
-		if(old_down && ~dio_download && dio_menu == 6'd2) begin
-			dsk_ext_ds  <= (dio_addr == 409600) || (dc42_skip && dc42_disk_format == 8'd1);
-			dsk_ext_ss  <= (dio_addr == 204800) || (dc42_skip && dc42_disk_format == 8'd0);
-			dsk_ext_mfm <= (dio_addr == 368640) || (dio_addr == 737280) ||
-			               (dc42_skip && (dc42_disk_format == 8'd2 || dc42_disk_format == 8'd3));
-			dsk_ext_hd  <= (dio_addr == 737280) || (dc42_skip && dc42_disk_format == 8'd3);
-		end
-
-		if(diskEject[1]) begin
-			dsk_ext_ds <= 0;
-			dsk_ext_ss <= 0;
-			dsk_ext_mfm <= 0;
-			dsk_ext_hd <= 0;
-		end
-	end
+	// (the dsk_ext_* mount block was removed with the second floppy;
+	// diskEject[1] from the SWIM now intentionally lands nowhere)
 
 	// Download addresses (SDRAM word addresses, VASP layout):
 	//   ROM (1MB): $000000 + offset
-	//   Floppy 1:  $180000 + offset
-	//   Floppy 2:  $280000 + offset
+	//   Floppy:    $180000 + offset
+	//   ($280000, the old Floppy-2 staging region, is unused since the
+	//    second drive was dropped — index 2 can no longer arrive.)
 	reg [25:0] dio_a;
 	reg [15:0] dio_data;
 	reg        dio_write;
@@ -2217,8 +2198,7 @@ module emu
 			end
 			dio_data <= {ioctl_data[7:0], ioctl_data[15:8]};
 			case (dio_index[1:0])
-				2'b01:   dio_a <= 26'h0180000 + {6'b0, dio_flp_a};  // Floppy 1
-				2'b10:   dio_a <= 26'h0280000 + {6'b0, dio_flp_a};  // Floppy 2
+				2'b01:   dio_a <= 26'h0180000 + {6'b0, dio_flp_a};  // Floppy
 				default: dio_a <= {7'b0, dio_addr[18:0]};           // ROM (1MB) at $000000 (must match addrController rom_sdram_word)
 			endcase
 			ioctl_wait <= 1;

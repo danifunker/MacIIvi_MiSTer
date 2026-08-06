@@ -1057,10 +1057,11 @@ module emu
 		.vid_alt(vid_alt),
 
 
-		.insertDisk({dsk_ext_ins, dsk_int_ins}),
-		.diskSides({dsk_ext_ds, dsk_int_ds}),
-		.diskMFM({dsk_ext_mfm, dsk_int_mfm}),
-		.diskHD({dsk_ext_hd, dsk_int_hd}),
+		// Drive 2 tied off — mirror of MacIIvi.sv (single-SuperDrive machine)
+		.insertDisk({1'b0, dsk_int_ins}),
+		.diskSides({1'b0, dsk_int_ds}),
+		.diskMFM({1'b0, dsk_int_mfm}),
+		.diskHD({1'b0, dsk_int_hd}),
 		.diskEject(diskEject),
 		.dskReadAddrInt(dskReadAddrInt),
 		.dskReadAckInt(dskReadAckInt),
@@ -1121,11 +1122,11 @@ module emu
 	// ioctl_index bits — compare only the MENU index (see MacIIvi.sv rationale)
 	wire [5:0] dio_menu = dio_index[5:0];
 
-	// Floppy disk image tracking
-	reg dsk_int_ds, dsk_ext_ds;
-	reg dsk_int_ss, dsk_ext_ss;
-	reg dsk_int_mfm, dsk_ext_mfm;  // MFM-format image (ISM path): 720K or 1.44MB
-	reg dsk_int_hd,  dsk_ext_hd;   // 1.44MB HD (vs 720K DD)
+	// Floppy disk image tracking (single drive — mirror of MacIIvi.sv)
+	reg dsk_int_ds;
+	reg dsk_int_ss;
+	reg dsk_int_mfm;  // MFM-format image (ISM path): 720K or 1.44MB
+	reg dsk_int_hd;   // 1.44MB HD (vs 720K DD)
 	// DiskCopy 4.2 header skip — mirror of MacIIvi.sv (rationale there).
 	reg dc42_name_ok;
 	reg dc42_skip;
@@ -1136,11 +1137,9 @@ module emu
 	// so this only delays that mount; it is here to keep the two tops from
 	// diverging.
 	localparam [25:0] DSK_EMPTY_CY = 26'h3FFFFFF;
-	reg [25:0] dsk_int_empty_cy, dsk_ext_empty_cy;
+	reg [25:0] dsk_int_empty_cy;
 	wire dsk_int_empty = (dsk_int_empty_cy != DSK_EMPTY_CY);
-	wire dsk_ext_empty = (dsk_ext_empty_cy != DSK_EMPTY_CY);
 	wire dsk_int_ins = !dsk_int_empty && (dsk_int_ds || dsk_int_ss || dsk_int_mfm);
-	wire dsk_ext_ins = !dsk_ext_empty && (dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm);
 
 	always @(posedge clk_sys) begin
 		reg old_down;
@@ -1180,42 +1179,14 @@ module emu
 		end
 	end
 
-	always @(posedge clk_sys) begin
-		reg old_down;
-		old_down <= dio_download;
-		if(~old_down && dio_download && dio_menu == 6'd2) begin
-			dsk_ext_ds  <= 0;
-			dsk_ext_ss  <= 0;
-			dsk_ext_mfm <= 0;
-			dsk_ext_hd  <= 0;
-			dsk_ext_empty_cy <= 26'd0;
-		end
-		else if(dio_download && dio_menu == 6'd2)
-			dsk_ext_empty_cy <= 26'd0;
-		else if(dsk_ext_empty_cy != DSK_EMPTY_CY)
-			dsk_ext_empty_cy <= dsk_ext_empty_cy + 26'd1;
-		if(old_down && ~dio_download && dio_menu == 6'd2) begin
-			dsk_ext_ds <= (dio_addr == 409600) ||
-			              (dc42_skip && (dio_addr == 409642 || dio_addr == 419242));
-			dsk_ext_ss <= (dio_addr == 204800) ||
-			              (dc42_skip && (dio_addr == 204842 || dio_addr == 209642));
-			dsk_ext_mfm <= (dio_addr == 368640) || (dio_addr == 737280) ||
-			               (dc42_skip && (dc42_disk_format == 8'd2 || dc42_disk_format == 8'd3));
-			dsk_ext_hd  <= (dio_addr == 737280) ||
-			               (dc42_skip && dc42_disk_format == 8'd3);
-		end
-		if(diskEject[1]) begin
-			dsk_ext_ds <= 0;
-			dsk_ext_ss <= 0;
-			dsk_ext_mfm <= 0;
-			dsk_ext_hd <= 0;
-		end
-	end
+	// (the dsk_ext_* mount block was removed with the second floppy —
+	// mirror of MacIIvi.sv; diskEject[1] intentionally lands nowhere)
 
 	// Download addresses (SDRAM word addresses, VASP layout):
 	//   ROM (1MB): $000000 + offset
-	//   Floppy 1:  $180000 + offset
-	//   Floppy 2:  $280000 + offset
+	//   Floppy:    $180000 + offset
+	//   ($280000, the old Floppy-2 staging region, is unused since the
+	//    second drive was dropped — index 2 can no longer arrive.)
 	reg [25:0] dio_a;
 	reg [15:0] dio_data;
 	reg        dio_write;
@@ -1241,8 +1212,7 @@ module emu
 			// Don't byte-swap for sim_ram (original swaps for SDRAM byte ordering)
 			dio_data <= ioctl_dout;
 			case (dio_index[1:0])
-				2'b01:   dio_a <= 26'h0180000 + {6'b0, dio_flp_a};  // Floppy 1
-				2'b10:   dio_a <= 26'h0280000 + {6'b0, dio_flp_a};  // Floppy 2
+				2'b01:   dio_a <= 26'h0180000 + {6'b0, dio_flp_a};  // Floppy
 				default: dio_a <= {7'b0, dio_addr[18:0]};           // ROM (1MB) at $000000 (must match addrController rom_sdram_word)
 			endcase
 			ioctl_wait <= 1;
@@ -1262,8 +1232,7 @@ module emu
 	// memoryAddr[25:0] is already the SDRAM word address from addrController.
 	// Download path uses dio_a_comb directly.
 	wire [25:0] dio_a_comb;
-	assign dio_a_comb = (ioctl_index[1:0] == 2'b01) ? 26'h0180000 + {6'b0, ioctl_addr[20:1]} :  // Floppy 1
-	                    (ioctl_index[1:0] == 2'b10) ? 26'h0280000 + {6'b0, ioctl_addr[20:1]} :  // Floppy 2
+	assign dio_a_comb = (ioctl_index[1:0] == 2'b01) ? 26'h0180000 + {6'b0, ioctl_addr[20:1]} :  // Floppy
 	                    {7'b0, ioctl_addr[19:1]};                                                 // ROM (1MB) at $000000 (must match addrController rom_sdram_word)
 
 	// Card cold-tail (ext) SDRAM access — twin of MacIIvi.sv. The card's ext
