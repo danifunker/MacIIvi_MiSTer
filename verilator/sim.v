@@ -1059,8 +1059,8 @@ module emu
 
 		.insertDisk({dsk_ext_ins, dsk_int_ins}),
 		.diskSides({dsk_ext_ds, dsk_int_ds}),
-		.diskMFM(2'b00),   // sim: MFM/ISM floppy path not exercised
-		.diskHD(2'b00),
+		.diskMFM({dsk_ext_mfm, dsk_int_mfm}),
+		.diskHD({dsk_ext_hd, dsk_int_hd}),
 		.diskEject(diskEject),
 		.dskReadAddrInt(dskReadAddrInt),
 		.dskReadAckInt(dskReadAckInt),
@@ -1117,43 +1117,98 @@ module emu
 	wire dio_download = ioctl_download;
 	wire [23:0] dio_addr = ioctl_addr[24:1];
 	wire [7:0] dio_index = ioctl_index;
+	// mirror of MacIIvi.sv: Main packs the matched extension into the upper
+	// ioctl_index bits — compare only the MENU index (see MacIIvi.sv rationale)
+	wire [5:0] dio_menu = dio_index[5:0];
 
 	// Floppy disk image tracking
 	reg dsk_int_ds, dsk_ext_ds;
 	reg dsk_int_ss, dsk_ext_ss;
+	reg dsk_int_mfm, dsk_ext_mfm;  // MFM-format image (ISM path): 720K or 1.44MB
+	reg dsk_int_hd,  dsk_ext_hd;   // 1.44MB HD (vs 720K DD)
 	// DiskCopy 4.2 header skip — mirror of MacIIvi.sv (rationale there).
 	reg dc42_name_ok;
 	reg dc42_skip;
-	wire dsk_int_ins = dsk_int_ds || dsk_int_ss;
-	wire dsk_ext_ins = dsk_ext_ds || dsk_ext_ss;
+	reg [7:0] dc42_disk_format;    // DC42 byte 0x50: 0/1/2/3 = 400G/800G/720M/1440M
+	// Disk-change presentation — mirror of MacIIvi.sv (full rationale there): a
+	// swap must reach the guest as eject THEN insert, because it only learns
+	// about media by polling CSTIN. The sim mounts one image and never swaps,
+	// so this only delays that mount; it is here to keep the two tops from
+	// diverging.
+	localparam [25:0] DSK_EMPTY_CY = 26'h3FFFFFF;
+	reg [25:0] dsk_int_empty_cy, dsk_ext_empty_cy;
+	wire dsk_int_empty = (dsk_int_empty_cy != DSK_EMPTY_CY);
+	wire dsk_ext_empty = (dsk_ext_empty_cy != DSK_EMPTY_CY);
+	wire dsk_int_ins = !dsk_int_empty && (dsk_int_ds || dsk_int_ss || dsk_int_mfm);
+	wire dsk_ext_ins = !dsk_ext_empty && (dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm);
 
 	always @(posedge clk_sys) begin
 		reg old_down;
 		old_down <= dio_download;
-		if(old_down && ~dio_download && dio_index == 1) begin
+		if(~old_down && dio_download && dio_menu == 6'd1) begin
+			dsk_int_ds  <= 0;
+			dsk_int_ss  <= 0;
+			dsk_int_mfm <= 0;
+			dsk_int_hd  <= 0;
+			dsk_int_empty_cy <= 26'd0;
+		end
+		else if(dio_download && dio_menu == 6'd1)
+			dsk_int_empty_cy <= 26'd0;
+		else if(dsk_int_empty_cy != DSK_EMPTY_CY)
+			dsk_int_empty_cy <= dsk_int_empty_cy + 26'd1;
+		if(old_down && ~dio_download && dio_menu == 6'd1) begin
 			dsk_int_ds <= (dio_addr == 409600) ||
 			              (dc42_skip && (dio_addr == 409642 || dio_addr == 419242));
 			dsk_int_ss <= (dio_addr == 204800) ||
 			              (dc42_skip && (dio_addr == 204842 || dio_addr == 209642));
+			dsk_int_mfm <= (dio_addr == 368640) || (dio_addr == 737280) ||
+			               (dc42_skip && (dc42_disk_format == 8'd2 || dc42_disk_format == 8'd3));
+			dsk_int_hd  <= (dio_addr == 737280) ||
+			               (dc42_skip && dc42_disk_format == 8'd3);
+			$display("SIM: floppy0 download end dio_addr(words)=%0d dc42=%b fmt=%02x -> ds=%b ss=%b mfm=%b hd=%b",
+			         dio_addr, dc42_skip, dc42_disk_format,
+			         (dio_addr == 409600) || (dc42_skip && (dio_addr == 409642 || dio_addr == 419242)),
+			         (dio_addr == 204800) || (dc42_skip && (dio_addr == 204842 || dio_addr == 209642)),
+			         (dio_addr == 368640) || (dio_addr == 737280) || (dc42_skip && (dc42_disk_format == 8'd2 || dc42_disk_format == 8'd3)),
+			         (dio_addr == 737280) || (dc42_skip && dc42_disk_format == 8'd3));
 		end
 		if(diskEject[0]) begin
 			dsk_int_ds <= 0;
 			dsk_int_ss <= 0;
+			dsk_int_mfm <= 0;
+			dsk_int_hd <= 0;
 		end
 	end
 
 	always @(posedge clk_sys) begin
 		reg old_down;
 		old_down <= dio_download;
-		if(old_down && ~dio_download && dio_index == 2) begin
+		if(~old_down && dio_download && dio_menu == 6'd2) begin
+			dsk_ext_ds  <= 0;
+			dsk_ext_ss  <= 0;
+			dsk_ext_mfm <= 0;
+			dsk_ext_hd  <= 0;
+			dsk_ext_empty_cy <= 26'd0;
+		end
+		else if(dio_download && dio_menu == 6'd2)
+			dsk_ext_empty_cy <= 26'd0;
+		else if(dsk_ext_empty_cy != DSK_EMPTY_CY)
+			dsk_ext_empty_cy <= dsk_ext_empty_cy + 26'd1;
+		if(old_down && ~dio_download && dio_menu == 6'd2) begin
 			dsk_ext_ds <= (dio_addr == 409600) ||
 			              (dc42_skip && (dio_addr == 409642 || dio_addr == 419242));
 			dsk_ext_ss <= (dio_addr == 204800) ||
 			              (dc42_skip && (dio_addr == 204842 || dio_addr == 209642));
+			dsk_ext_mfm <= (dio_addr == 368640) || (dio_addr == 737280) ||
+			               (dc42_skip && (dc42_disk_format == 8'd2 || dc42_disk_format == 8'd3));
+			dsk_ext_hd  <= (dio_addr == 737280) ||
+			               (dc42_skip && dc42_disk_format == 8'd3);
 		end
 		if(diskEject[1]) begin
 			dsk_ext_ds <= 0;
 			dsk_ext_ss <= 0;
+			dsk_ext_mfm <= 0;
+			dsk_ext_hd <= 0;
 		end
 	end
 
@@ -1177,7 +1232,9 @@ module emu
 					dc42_skip    <= 1'b0;
 					dc42_name_ok <= ((ioctl_dout[7:0]  >= 8'd1) && (ioctl_dout[7:0]  <= 8'd63)) ||
 					                ((ioctl_dout[15:8] >= 8'd1) && (ioctl_dout[15:8] <= 8'd63));
-				end else if (dio_addr[19:0] == 20'd41 && dc42_name_ok &&
+				end else if (dio_addr[19:0] == 20'd40)
+					dc42_disk_format <= ioctl_dout[7:0];  // byte 0x50 (low byte of word 40)
+				else if (dio_addr[19:0] == 20'd41 && dc42_name_ok &&
 				             (ioctl_dout == 16'h0001 || ioctl_dout == 16'h0100))
 					dc42_skip <= 1'b1;
 			end

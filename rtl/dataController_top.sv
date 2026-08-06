@@ -40,6 +40,9 @@ module dataController_top(
 	output [31:0] dbg_ncr2,   // req_deferred/req_bus + IRQ machine + counters
 	output [31:0] dbg_wr,     // write-stall snapshot (DATA_IN target)
 	output [31:0] dbg_wrfb,   // write first-beat forensics (JTAG WRFB)
+	output [31:0] dbg_ism_flpe, // swim ISM error/overrun counters (JTAG FLPE)
+	output [31:0] dbg_ring0,  // disk-0 read-ring bookkeeping (anchor feed)
+	output [31:0] dbg_ring1,  // disk-1 read-ring bookkeeping (anchor feed)
 	input selectSCC,
 	input selectIWM,
 	input selectVIA,
@@ -167,6 +170,30 @@ module dataController_top(
 	output        via_sr_dbg_dir,
 	output        via_sr_dbg_cb1,
 	output        via_sr_dbg_cb2,
+
+	// Floppy forensics passthrough (swim/floppy PFLP deck + ISM witnesses;
+	// consumed by the MacIIvi.sv marginality anchor + optional probe/HUD decks)
+	output [15:0] dbg_flp_byte_cnt,
+	output [15:0] dbg_flp_miss_cnt,
+	output [7:0]  dbg_flp_disk_data,
+	output [6:0]  dbg_flp_track,
+	output        dbg_flp_side,
+	output [15:0] dbg_flp_step_cnt,
+	output [7:0]  dbg_iwm_latch,
+	output        dbg_flp_byte_stb,  // 1-clk delivered-byte strobe (capture ring)
+	output [7:0]  dbg_flp_raw,      // pre-encoder SDRAM fetch latch (internal drive)
+	output [31:0] dbg_ism_state,
+	output [15:0] dbg_flp_strb_cnt,
+	output [15:0] dbg_flp_strb_en_cnt,
+	output [23:0] dbg_flp_strb_last,
+	output [8:0]  dbg_flp_rej_step,
+	output [7:0]  dbg_flp_status,
+	output [31:0] dbg_flp_media,   // media-change witness (floppy.v dbg_media)
+	output [21:0] dbg_flp_gcr_addr, // live GCR fetch address (internal drive)
+	output [31:0] dbg_ism_verdict,  // {b1_hot,b5_hot} over handshake reads
+	output [31:0] dbg_ism_unrlatch, // first-error[2]-onset forensic latch
+	output [31:0] dbg_ism_scan,     // SCAN-WITNESS {run,hunt_ms,par,gap_us}
+	output [23:0] dbg_mfm_stall,    // {stall_us[15:0], stall_cnt[7:0]}
 
 	// Egret debug outputs for on-screen indicator
 	output        egret_dbg_running,       // HC05 not in reset
@@ -474,6 +501,8 @@ module dataController_top(
 		.dbg_ncr2(dbg_ncr2),
 		.dbg_wr(dbg_wr),
 		.dbg_wrfb(dbg_wrfb),
+		.dbg_ring0(dbg_ring0),
+		.dbg_ring1(dbg_ring1),
 		// CD-audio engine + CD target command visibility (JTAG CDA0..CDA4)
 		.dbg_cda0(dbg_cda0),
 		.dbg_cda1(dbg_cda1),
@@ -507,6 +536,24 @@ module dataController_top(
 	assign snd_vol = ~via_pa_oe[2:0] | via_pa_o[2:0];
 	assign driveSel = ~via_pa_oe[4] | via_pa_o[4];  // Drive select from VIA PA4
 	assign SEL = ~via_pa_oe[5] | via_pa_o[5];
+
+`ifdef SIMULATION
+	// PA trace: SEL (PA5/HDSEL) picks the drive sense bank (regs 8-F) and the
+	// head; the Sony driver toggles it with read-modify-writes around every
+	// high-bank sense read. Diff against the MAME capture's "V8-PA5 HDSEL -> x".
+	reg [7:0] dbg_pa_o_d = 8'hxx, dbg_pa_oe_d = 8'hxx;
+	reg [11:0] dbg_pa_cnt = 0;
+	always @(posedge clk32) begin
+		if ((via_pa_o != dbg_pa_o_d || via_pa_oe != dbg_pa_oe_d) && dbg_pa_cnt < 12'd600) begin
+			dbg_pa_cnt <= dbg_pa_cnt + 1'd1;
+			$display("VIA-PA: o=%02x oe=%02x -> SEL=%b driveSel=%b @%0t",
+			         via_pa_o, via_pa_oe, ~via_pa_oe[5] | via_pa_o[5],
+			         ~via_pa_oe[4] | via_pa_o[4], $time);
+			dbg_pa_o_d  <= via_pa_o;
+			dbg_pa_oe_d <= via_pa_oe;
+		end
+	end
+`endif
 	assign vid_alt = ~via_pa_oe[6] | via_pa_o[6];
 
 	// Port B - Mac LC Egret/CUDA interface (V8 protocol)
@@ -1051,7 +1098,30 @@ module dataController_top(
 		.dskReadAckInt(dskReadAckInt),
 		.dskReadAddrExt(dskReadAddrExt),
 		.dskReadAckExt(dskReadAckExt),
-		.dskReadData(memoryDataIn[7:0])
+		.dskReadData(memoryDataIn[7:0]),
+
+		.dbg_ism_flpe(dbg_ism_flpe),
+		.dbg_flp_byte_cnt(dbg_flp_byte_cnt),
+		.dbg_flp_miss_cnt(dbg_flp_miss_cnt),
+		.dbg_flp_disk_data(dbg_flp_disk_data),
+		.dbg_flp_track(dbg_flp_track),
+		.dbg_flp_side(dbg_flp_side),
+		.dbg_flp_step_cnt(dbg_flp_step_cnt),
+		.dbg_iwm_latch(dbg_iwm_latch),
+		.dbg_flp_byte_stb(dbg_flp_byte_stb),
+		.dbg_flp_raw(dbg_flp_raw),
+		.dbg_flp_gcr_addr(dbg_flp_gcr_addr),
+		.dbg_ism_verdict(dbg_ism_verdict),
+		.dbg_ism_unrlatch(dbg_ism_unrlatch),
+		.dbg_ism_scan(dbg_ism_scan),
+		.dbg_mfm_stall(dbg_mfm_stall),
+		.dbg_ism_state(dbg_ism_state),
+		.dbg_flp_strb_cnt(dbg_flp_strb_cnt),
+		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),
+		.dbg_flp_strb_last(dbg_flp_strb_last),
+		.dbg_flp_rej_step(dbg_flp_rej_step),
+		.dbg_flp_status(dbg_flp_status),
+		.dbg_flp_media(dbg_flp_media)
 	);
 
 	// SCC

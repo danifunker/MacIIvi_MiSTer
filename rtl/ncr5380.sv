@@ -150,6 +150,11 @@ module ncr5380
 	//   [22]=io_busy [23]=sd_buff_sel [24]=cmd_write [30:25]=tlen [31]=req
 	output      [31:0] dbg_wr,
 	output      [31:0] dbg_wrfb,  // JTAG WRFB: write first-beat forensics (data-phase-routed)
+
+	// Read-ring serve/refill bookkeeping per disk target (scsi.v dbg_ring),
+	// consumed ONLY by the always-on marginality anchor in MacIIvi.sv.
+	output      [31:0] dbg_ring0,
+	output      [31:0] dbg_ring1,
 	// JTAG CDA0/CDA1: CD-audio engine + CD target command visibility
 	output      [31:0] dbg_cda0,
 	output      [31:0] dbg_cda1,
@@ -657,6 +662,7 @@ module ncr5380
 	wire [31:0]     target_selsnap[DEVS];  // JTAG debug: selection/command handshake
 	wire [31:0]     target_wrstall[DEVS];  // JTAG debug: write-stall snapshot (PSCW)
 	wire [31:0]     target_wrfb[DEVS];     // JTAG debug: write first-beat forensics (WRFB)
+	wire [31:0]     target_ring[DEVS];     // read-ring bookkeeping (anchor feed)
 	wire [DEVS-1:0] target_bsy;
 
 	// Count SCSI bus resets (Mac asserting ICR.RST) -- the abort/retry signal.
@@ -793,7 +799,8 @@ module ncr5380
 		.dbg_wrsnap( ),
 		.dbg_selsnap( ),
 		.dbg_wrstall( ),
-		.dbg_wrfb( )
+		.dbg_wrfb( ),
+		.dbg_ring( )
 	);
 
 	generate
@@ -818,12 +825,17 @@ module ncr5380
 			// same IDs 0/1 on 2026-07-20; the Toolbox driver locates the drive by
 			// INQUIRY page 0x31, not by ID. Inert until the HPS mounts the
 			// Toolbox shared folder (tb_mounted) and the Main handler answers.
-			// TB_ADDRW(11) on the Toolbox target = 4 KB tb buffer (8 sectors):
-			// a 512-byte SEND DATA payload sits at buffer bytes 16..527 (it
-			// wrapped onto the CDB at 512 B) and a 0xD1 GET fetches its full
-			// 4096-byte block instead of serving one sector eight times.
+			// TB_ADDRW(12) on the Toolbox target = 8 KB tb buffer (16 sectors).
+			// 11 (4 KB) fixed the 512-byte case — the payload sits at buffer
+			// bytes 16..527, so on a 512-byte buffer it wrapped onto the CDB and
+			// lost 16 bytes per block (MacIIvi 205800b). 12 is what a 4 KB
+			// large-send chunk needs: bytes 16..4111 do NOT fit in 4 KB, and the
+			// extra headroom is what lets the core advertise CAP_LARGE_SEND
+			// (scsi.v TB_SEND_CAP gates on TB_ADDRW >= 12 — do not lower this
+			// while TB_CAPS bit 1 is set). +4 KB of M10K vs the old 11; gate the
+			// next fit on icon integrity per the marginality-anchor law.
 			scsi #(.ID(i[2:0]), .RING_LOG(i == 0 ? 5 : 4), .TOOLBOX_ENABLE(i == 0),
-			       .TB_ADDRW(i == 0 ? 11 : 8)) target
+			       .TB_ADDRW(i == 0 ? 12 : 8)) target
 			(
 				.clk    ( clk ),
 				.rst    ( scsi_rst ),
@@ -884,7 +896,8 @@ module ncr5380
 				.dbg_wrsnap( target_wrsnap[i] ),
 				.dbg_selsnap( target_selsnap[i] ),
 				.dbg_wrstall( target_wrstall[i] ),
-				.dbg_wrfb( target_wrfb[i] )
+				.dbg_wrfb( target_wrfb[i] ),
+				.dbg_ring( target_ring[i] )
 			);
 		end
 	endgenerate
@@ -989,6 +1002,10 @@ module ncr5380
 				wrfb_tgt <= k[WRFB_TGT_W-1:0];
 	end
 	assign dbg_wrfb = target_wrfb[wrfb_tgt];
+
+	// Anchor feeds: per-disk read-ring bookkeeping, straight through.
+	assign dbg_ring0 = target_ring[0];
+	assign dbg_ring1 = target_ring[1];
 
 	// NOTE: lbmactwo's JTAG In-System Source/Probe (altsource_probe) blocks for
 	// target_wrsnap/target_selsnap were removed in the MacIIvi port — this core has

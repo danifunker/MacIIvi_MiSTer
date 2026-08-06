@@ -943,10 +943,46 @@ module emu
 	// lets synthesis restructure the cones); ~352 FFs is the entire cost.
 	wire [31:0] dbg_cda0_w, dbg_cda1_w, dbg_cda2_w, dbg_cda3_w, dbg_cda4_w;
 	wire [31:0] dbg_cdur_w, dbg_wrfb_w;
+	wire [31:0] dbg_ring0_w, dbg_ring1_w;  // read-ring bookkeeping (anchor-only)
+	wire [31:0] dbg_ism_flpe_w;            // swim ISM error/overrun counters
+	// Floppy forensics (PFLP deck; anchor consumes a subset, the rest are
+	// unconnected-but-declared so a future probe/HUD deck is a hookup away —
+	// see MacLC.sv USE_DBG_HUD for the on-screen renderer if a hunt needs it).
+	wire [15:0] dbg_flp_byte_cnt, dbg_flp_miss_cnt, dbg_flp_step_cnt;
+	wire [7:0]  dbg_flp_disk_data, dbg_iwm_latch, dbg_flp_raw, dbg_flp_status;
+	wire [6:0]  dbg_flp_track;
+	wire        dbg_flp_side, dbg_flp_byte_stb;
+	wire [21:0] dbg_flp_gcr_addr;
+	wire [31:0] dbg_ism_state, dbg_ism_verdict_w, dbg_ism_unrlatch_w, dbg_ism_scan_w;
+	wire [31:0] dbg_flp_media;
+	wire [15:0] dbg_flp_strb_cnt, dbg_flp_strb_en_cnt;
+	wire [23:0] dbg_flp_strb_last, dbg_mfm_stall_w;
+	wire [8:0]  dbg_flp_rej_step;
 	(* preserve, noprune *) reg [31:0] anchor_cda0, anchor_cda1, anchor_cda2,
 	                                   anchor_cda3, anchor_cda4, anchor_cdur;
 	(* preserve, noprune *) reg [31:0] anchor_psdt, anchor_psds, anchor_psd2,
 	                                   anchor_psd3, anchor_wrfb;
+	// (2026-08-03, MacLC) Extension: the 11-word anchor above proved
+	// INSUFFICIENT on the post-floppy netlist — a probes-off fit corrupted the
+	// Finder colour-icon read path with the anchor present, while the ISSP
+	// deck on the same RTL/seed lineage passed the gate + 3-boot soak. The
+	// recurring failure fingerprint of this class is RING-STALE serving: a
+	// ring slot served at/past the rd_hps_blk fill boundary. These two words
+	// pin that exact cone — the stall comparators, fill counter, and
+	// look-ahead adder of each disk target (scsi.v dbg_ring; comparator nets
+	// shared with io_busy by construction). Same law: never remove, ifdef,
+	// or fold.
+	(* preserve, noprune *) reg [31:0] anchor_ring0, anchor_ring1;
+	// (2026-08-04, MacLC) Floppy-cone extension. An LC build passed the SCSI
+	// icon gate + soak yet failed a sustained floppy file copy mid-file
+	// ("disk error") — while the copy-pattern TB (tb_ism_copytest) proves the
+	// RTL serves the identical region byte-exact. Same per-fit marginality
+	// class, different cone: the icon gate only exercises the SCSI path, and
+	// the floppy fetch cone (SDRAM slot -> dskReadDataLatch -> MFM engine)
+	// had never been pinned. These words load the fetch latch,
+	// delivery/starve counters, head position, and the live fetch address.
+	// Same law: never remove, ifdef, or fold.
+	(* preserve, noprune *) reg [31:0] anchor_flp0, anchor_flp1, anchor_flp2;
 	always @(posedge clk_sys) begin
 		anchor_cda0 <= dbg_cda0_w;
 		anchor_cda1 <= dbg_cda1_w;
@@ -959,6 +995,12 @@ module emu
 		anchor_psd2 <= sdma_snap_ncr;
 		anchor_psd3 <= sdma_snap_wr;
 		anchor_wrfb <= dbg_wrfb_w;
+		anchor_ring0 <= dbg_ring0_w;
+		anchor_ring1 <= dbg_ring1_w;
+		anchor_flp0  <= {dbg_flp_byte_cnt, dbg_flp_miss_cnt};
+		anchor_flp1  <= {dbg_flp_step_cnt, dbg_iwm_latch, dbg_flp_raw};
+		anchor_flp2  <= {dbg_flp_byte_stb, dbg_flp_side, dbg_flp_track[6:0],
+		                 1'b0, dskReadAddrInt[21:0]};
 	end
 
 	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space) ? 1'b1 : ~(!_cpuAS && io_space && !selectSCSIDMA));
@@ -1968,6 +2010,30 @@ module emu
 		.dbg_cda4(dbg_cda4_w),
 		.dbg_cdur(dbg_cdur_w),
 		.dbg_wrfb(dbg_wrfb_w),
+		.dbg_ism_flpe(dbg_ism_flpe_w),
+		.dbg_ring0(dbg_ring0_w),
+		.dbg_ring1(dbg_ring1_w),
+		.dbg_flp_byte_cnt(dbg_flp_byte_cnt),
+		.dbg_flp_miss_cnt(dbg_flp_miss_cnt),
+		.dbg_flp_disk_data(dbg_flp_disk_data),
+		.dbg_flp_track(dbg_flp_track),
+		.dbg_flp_side(dbg_flp_side),
+		.dbg_flp_step_cnt(dbg_flp_step_cnt),
+		.dbg_iwm_latch(dbg_iwm_latch),
+		.dbg_flp_byte_stb(dbg_flp_byte_stb),
+		.dbg_flp_raw(dbg_flp_raw),
+		.dbg_flp_gcr_addr(dbg_flp_gcr_addr),
+		.dbg_ism_verdict(dbg_ism_verdict_w),
+		.dbg_ism_unrlatch(dbg_ism_unrlatch_w),
+		.dbg_ism_scan(dbg_ism_scan_w),
+		.dbg_mfm_stall(dbg_mfm_stall_w),
+		.dbg_ism_state(dbg_ism_state),
+		.dbg_flp_strb_cnt(dbg_flp_strb_cnt),
+		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),
+		.dbg_flp_strb_last(dbg_flp_strb_last),
+		.dbg_flp_rej_step(dbg_flp_rej_step),
+		.dbg_flp_status(dbg_flp_status),
+		.dbg_flp_media(dbg_flp_media),
 
 		// PRAM persistence (NVRAM) — driven by the FSM above
 		.pram_load_wr(pram_load_wr),
@@ -2002,6 +2068,14 @@ module emu
 	wire dio_download;
 	wire [23:0] dio_addr = ioctl_addr[24:1];  // word address from byte address
 	wire  [7:0] dio_index;
+	// MiSTer Main encodes the MATCHED EXTENSION of a multi-extension F entry
+	// in the upper bits of ioctl_index (menu index in the low bits): an F1
+	// pick of a .dsk arrives as 8'h01 but a .img as 8'h41. The mount-flag
+	// latches below compared the FULL byte, so a .img mount downloaded into
+	// SDRAM (the write path already masks [1:0]) yet never presented a disk —
+	// a silent no-op mount, latent since the beginning. Found 2026-08-06 on
+	// MacLC driving the swap gates. Compare the MENU index.
+	wire  [5:0] dio_menu = dio_index[5:0];
 
 	// good floppy image sizes are 819200 bytes and 409600 bytes
 	reg dsk_int_ds, dsk_ext_ds;
@@ -2021,15 +2095,52 @@ module emu
 	reg dc42_skip;
 	reg [7:0] dc42_disk_format;  // DC42 byte 0x50: 0=400K GCR,1=800K GCR,2=720K MFM,3=1440K MFM
 
+	// ── Disk CHANGE must be presented as a TRANSITION (MacLC 2026-08-05/06) ──
+	// The guest learns about media only by polling the drive's CSTIN sense
+	// line, so "a disk is present" is not enough — it must see no-disk and
+	// THEN disk to run its unmount/mount machinery. dsk_*_ins used to be a
+	// pure LEVEL from the size latched at end-of-download, so mounting image
+	// B over image A never moved CSTIN: the guest kept A's VCB and cached
+	// catalog over B's SDRAM contents — the ghost volume ("…cannot be found"
+	// with zero disk I/O). Hold the drive EMPTY from download start until
+	// DSK_EMPTY_CY (2.06 s at clk_sys) after it ends: the guest sees the disk
+	// leave, unmounts, then sees a fresh insert. The hold must outlast the
+	// Sony driver's media poll — MAME 0.264 runtime (MacLC tap_swapB
+	// 2026-08-06) shows the NoDiskInPl+DiskChg pair polled every ~0.8 s.
+	// ★ Landed together with floppy.v's disk_switched (SWITCHED sense reg) —
+	// this same hold WITHOUT that flag was the reverted ebbdac6 regression:
+	// the transition told the driver the disk left and came back while the
+	// disk-switched flag insisted nothing changed, a state no real machine
+	// produces (MAME asserts m_dskchg on every unload).
+	localparam [25:0] DSK_EMPTY_CY = 26'h3FFFFFF;
+	reg [25:0] dsk_int_empty_cy, dsk_ext_empty_cy;
+	wire dsk_int_empty = (dsk_int_empty_cy != DSK_EMPTY_CY);
+	wire dsk_ext_empty = (dsk_ext_empty_cy != DSK_EMPTY_CY);
 	// any known type of disk image inserted?
-	wire dsk_int_ins = dsk_int_ds || dsk_int_ss || dsk_int_mfm;
-	wire dsk_ext_ins = dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm;
+	wire dsk_int_ins = !dsk_int_empty && (dsk_int_ds || dsk_int_ss || dsk_int_mfm);
+	wire dsk_ext_ins = !dsk_ext_empty && (dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm);
 	// at the end of a download latch file size
 	// diskEject is set by macos on eject
 	always @(posedge clk_sys) begin
 		reg old_down;
 		old_down <= dio_download;
-		if(old_down && ~dio_download && dio_index == 1) begin
+		// Download START = the change event: drop the media immediately and
+		// hold the timer at 0 for the whole upload (SDRAM is being
+		// overwritten, so the old geometry is meaningless the moment the
+		// transfer begins; clearing the regs also means a wrong-sized file
+		// leaves the drive EMPTY instead of re-inserting stale geometry).
+		if(~old_down && dio_download && dio_menu == 6'd1) begin
+			dsk_int_ds  <= 0;
+			dsk_int_ss  <= 0;
+			dsk_int_mfm <= 0;
+			dsk_int_hd  <= 0;
+			dsk_int_empty_cy <= 26'd0;
+		end
+		else if(dio_download && dio_menu == 6'd1)
+			dsk_int_empty_cy <= 26'd0;
+		else if(dsk_int_empty_cy != DSK_EMPTY_CY)
+			dsk_int_empty_cy <= dsk_int_empty_cy + 26'd1;
+		if(old_down && ~dio_download && dio_menu == 6'd1) begin
 			// GCR (IWM path) — raw word count, or DC42 disk_format byte (rusty-backup
 			// dc42.rs: 0x50 = 0/1/2/3 = 400G/800G/720M/1440M, authoritative + tag-agnostic).
 			dsk_int_ds  <= (dio_addr == 409600) || (dc42_skip && dc42_disk_format == 8'd1);
@@ -2052,7 +2163,19 @@ module emu
 		reg old_down;
 
 		old_down <= dio_download;
-		if(old_down && ~dio_download && dio_index == 2) begin
+		// see the dsk_int_* block above: a swap must present as leave -> insert
+		if(~old_down && dio_download && dio_menu == 6'd2) begin
+			dsk_ext_ds  <= 0;
+			dsk_ext_ss  <= 0;
+			dsk_ext_mfm <= 0;
+			dsk_ext_hd  <= 0;
+			dsk_ext_empty_cy <= 26'd0;
+		end
+		else if(dio_download && dio_menu == 6'd2)
+			dsk_ext_empty_cy <= 26'd0;
+		else if(dsk_ext_empty_cy != DSK_EMPTY_CY)
+			dsk_ext_empty_cy <= dsk_ext_empty_cy + 26'd1;
+		if(old_down && ~dio_download && dio_menu == 6'd2) begin
 			dsk_ext_ds  <= (dio_addr == 409600) || (dc42_skip && dc42_disk_format == 8'd1);
 			dsk_ext_ss  <= (dio_addr == 204800) || (dc42_skip && dc42_disk_format == 8'd0);
 			dsk_ext_mfm <= (dio_addr == 368640) || (dio_addr == 737280) ||
