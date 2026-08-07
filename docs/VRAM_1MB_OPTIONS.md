@@ -59,15 +59,36 @@ video owns the 2 unused extra-slot phases (4.06M words/s floor) and/or a
 full-line hblank burst with CPU lockout (~15-18% CPU cost). Only worth
 building if A's counters show real starvation on HW.
 
-## Verdict
+## Verdict (2026-08-07 end of session)
 
-(filled in as attempts land — see commit map below)
+**Option A is the shipped default** (SDRAM window + burst video port +
+released windows + 2-line-ahead triple buffer). Option B is integrated,
+bench-passed and dormant behind `MDC_VRAM_DDR` / `+vramddr` — the fallback
+if HW ever shows SDRAM contention Option A can't absorb, and the growth
+path past 1MB (24bpp @ 640x480 needs a 2MB card).
 
-| Attempt | Commit | Sim gate | Notes |
+| Attempt | Commit | Gates | Notes |
 |---|---|---|---|
 | scoping doc | 060b6b4 | — | — |
-| A: SDRAM burst port | (this commit) | check_boot PASS at montype 6 AND 7 (Slot Manager card probes ride the new all-ext path); standalone benches PASS (see below); card-view boot run to frame 710: stable, artifact-free scanout, zero underruns (desktop-pattern confirmation via fast-ramtest ROM in flight — the stock ROM's full 4MB march hasn't reached drawing by frame 710) | |
-| B: DDR3 backing | TBD | TBD | adapter+DDR model bench PASS pre-integration |
+| A: SDRAM burst port | 8c60798 | sim build + check_boot montype 6/7 PASS; benches PASS; sim desktop dither pixel-perfect full-frame (fast-ramtest ROM, frames 350-650) | **HW boot 2026-08-07 (.143): System 7.5.5 → MacAtrium on the card** — content correct, no noise/tearing; right ~27% of each line froze (line-fetch shortfall under load) → v2 |
+| A v2: released windows + triple buffer | c87cafe | tb_sdram_vid saturating-cpu case: 320-word line in ~1 line-time (was starving); all correctness cases PASS | first fit FAILED STA (-8.1ns): live release compare in the T0 path |
+| A v2.1: pipelined release qualifier | 39f2abc | bench PASS (1078 clk_sys / 1860 budget); check_boot PASS; Quartus STA re-verify pending at session end | **NOT yet deployed — owner hold** |
+| B: DDR3 backing | bf55e4a | sim build clean; check_boot PASS with +vramddr (card probes via DDR); tb_vram_ddr bench PASS | HW untested; needs its own RBF with the qsf macro |
+
+### Open items
+
+- Deploy + judge A v2.1 on HW once the owner clears deploys: verify the
+  right-edge band is gone under MacAtrium animation, then the Finder
+  colour-icon check (icon_gate.py cells are STALE — visual + two-boot
+  pixel compare per its 2026-08-06 header note) and a second boot.
+- deploy_screenshot.sh gates on Fitter status only — it would have shipped
+  the STA-failed v2 fit. Consider adding an sta.summary "no negative
+  slack" check.
+- 24bpp mode plumbing (RAMDAC mode 0xD) is still mapped to 8bpp in the
+  card; the 1MB framebuffer it needs is now fully scannable — follow-up.
+- The h==0 pixel column renders from stale buffer data by design (was
+  port-B prefetch-during-blank garbage before, black now); invisible on
+  real monitors' overscan, cosmetic in sim screenshots.
 
 ### Bench coverage added while landing A (scratchpad, results 2026-08-07)
 
