@@ -103,6 +103,7 @@ V_SRC = \
 	$(RTL)/ncr5380.sv \
 	$(RTL)/scc.v \
 	$(RTL)/nubus/nubus_video_mdc824.sv \
+	$(RTL)/nubus/mdc_scan_fetch.sv \
 	$(RTL)/nubus/vram_ram.sv \
 	$(RTL)/cuda_maclc.sv \
 	$(RTL)/pll/pll_0002.v \

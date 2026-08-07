@@ -78,10 +78,23 @@ module nubus_video_mdc824 #(
     input [15:0] ext_din,
     input ext_ready,
 
-    // VRAM Port B — dedicated scanout read (no cache, never misses)
+    // VRAM Port B — dedicated scanout read (no cache, never misses).
+    // Only used when VRAM_WORDS != 0 (BRAM-backed scanout).
     output     [24:0] vram_scan_addr,
     output            vram_scan_rd,
     input      [15:0] vram_scan_data,
+
+    // Scanline prefetch port — only used when VRAM_WORDS == 0 (VRAM fully
+    // SDRAM-backed, docs/VRAM_1MB_OPTIONS.md Option A). At the start of each
+    // line the card requests the NEXT visible line's words; mdc_scan_fetch
+    // streams them back on scan_wr/scan_wdata into the internal 2-line
+    // ping-pong buffer that scanout reads instead of port B.
+    output            scan_start,   // 1-clk pulse: fetch a line
+    output     [19:0] scan_base,    // card word address of the line start
+    output     [9:0]  scan_words,   // words to fetch
+    input             scan_wr,      // 1-clk: scan_wdata = next word of the line
+    input      [15:0] scan_wdata,
+    output     [15:0] dbg_scan_underrun,  // lines scanned out before their fetch completed
 
     // IOCTL Interface for ROM Download
     input        ioctl_wr,
@@ -342,6 +355,14 @@ module nubus_video_mdc824 #(
     // Scanout VRAM address calculation
     //   fb_byte = base_reg*32 + v*stride_bytes + h_byte
     //   stride_bytes = stride_reg << 2  (<<3 for 24bpp, deferred)
+    //
+    // Two scanout backends, selected by VRAM_WORDS (compile-time):
+    //   != 0 : legacy BRAM port B — word fetched per pixel clock (unchanged).
+    //   == 0 : SDRAM-backed (Option A) — a prefetch engine fetches the NEXT
+    //          visible line into a 2x512-word ping-pong line buffer while the
+    //          current line scans out of the other bank. base/stride are
+    //          32-byte/4-byte units, so a line always starts byte-even and
+    //          the in-line byte select reduces to h_byte[0].
     // ========================================================================
     wire [24:0] base_bytes   = {base_reg[19:0], 5'b00000};   // * 32
     wire [13:0] stride_bytes = {stride_reg[11:0], 2'b00};    // * 4
@@ -352,13 +373,113 @@ module nubus_video_mdc824 #(
         (mode == 2'd2) ? {1'd0, h_cnt[9:1]} :     // 4bpp: h/2
                          h_cnt[9:0];              // 8bpp: h
 
-    wire [24:0] v_byte_offset  = v_cnt[9:0] * stride_bytes;
-    wire [24:0] fetch_byte_addr = base_bytes + v_byte_offset + {15'd0, h_byte};
-    wire [23:0] fetch_word_addr = fetch_byte_addr[24:1];
-    wire fetch_byte_sel = fetch_byte_addr[0];
+    wire        fetch_byte_sel;
+    wire [15:0] scan_word_q;      // scanout word (registered, 1 clk_video_en late)
 
-    assign vram_scan_addr = VRAM_BASE + {1'b0, fetch_word_addr};
-    assign vram_scan_rd   = clk_video_en;
+    generate if (VRAM_WORDS != 0) begin : scan_bram
+
+        wire [24:0] v_byte_offset  = v_cnt[9:0] * stride_bytes;
+        wire [24:0] fetch_byte_addr = base_bytes + v_byte_offset + {15'd0, h_byte};
+        wire [23:0] fetch_word_addr = fetch_byte_addr[24:1];
+        assign fetch_byte_sel = fetch_byte_addr[0];
+
+        assign vram_scan_addr = VRAM_BASE + {1'b0, fetch_word_addr};
+        assign vram_scan_rd   = clk_video_en;
+        assign scan_word_q    = vram_scan_data;
+
+        assign scan_start = 1'b0;
+        assign scan_base  = 20'd0;
+        assign scan_words = 10'd0;
+        assign dbg_scan_underrun = 16'd0;
+
+    end else begin : scan_sdram
+
+        assign vram_scan_addr = 25'd0;
+        assign vram_scan_rd   = 1'b0;
+        assign fetch_byte_sel = h_byte[0];   // line starts are always byte-even
+
+        // words per visible line for the current depth
+        wire [9:0] line_words = (mode == 2'd0) ? {4'b0, h_res[9:4]} :
+                                (mode == 2'd1) ? {3'b0, h_res[9:3]} :
+                                (mode == 2'd2) ? {2'b0, h_res[9:2]} :
+                                                 {1'b0, h_res[9:1]};
+
+        // the line to prefetch while the current one scans out: the next
+        // visible line, or line 0 when the last raster line is scanning
+        wire [9:0]  next_line  = (v_cnt == v_total - 11'd1) ? 10'd0 : (v_cnt[9:0] + 10'd1);
+        wire        next_visible = {1'b0, next_line} < v_res;
+        wire [24:0] next_line_bytes = base_bytes + next_line * stride_bytes;
+        // guard: only fetch lines that lie entirely inside the card's 1MB
+        // (a garbage base_reg during setup must not matter — reads would be
+        // harmless, but keep the address math honest)
+        wire        fetch_ok = ({1'b0, next_line_bytes[24:1]} + {15'd0, line_words})
+                               <= TOTAL_WORDS;
+
+        // 2-line ping-pong buffer, bank = line parity. Write side: fetch
+        // stream; read side: scanout at the pixel clock enable. Single write
+        // port + single read port -> clean M10K simple-dual-port inference
+        // (2 M10K vs the 384 the full-frame BRAM used to take).
+        (* ramstyle = "M10K" *) reg [15:0] linebuf [0:1023];
+        reg [15:0] lb_q;
+        reg [8:0]  fill_ptr;
+        reg        fill_bank;
+        reg [9:0]  fill_words;
+        reg        fill_busy;
+        reg [15:0] underrun_cnt;
+        reg        r_start;
+        reg [19:0] r_base;
+        reg [9:0]  r_words;
+
+        assign scan_start = r_start;
+        assign scan_base  = r_base;
+        assign scan_words = r_words;
+        assign dbg_scan_underrun = underrun_cnt;
+
+        always @(posedge clk) begin
+            r_start <= 1'b0;
+            if (reset) begin
+                fill_ptr <= 9'd0; fill_bank <= 1'b0; fill_words <= 10'd0;
+                fill_busy <= 1'b0; underrun_cnt <= 16'd0;
+                r_base <= 20'd0; r_words <= 10'd0;
+            end else begin
+                if (scan_wr && fill_busy) begin
+                    linebuf[{fill_bank, fill_ptr}] <= scan_wdata;
+                    fill_ptr <= fill_ptr + 9'd1;
+                    if ({1'b0, fill_ptr} + 10'd1 == fill_words) fill_busy <= 1'b0;
+                end
+                // schedule the next line's fetch at the start of every line —
+                // a full line time + hblank of budget before it scans out
+                if (clk_video_en && h_cnt == 11'd0 && next_visible && stride_reg != 32'd0) begin
+                    if (fill_busy) underrun_cnt <= underrun_cnt + 16'd1;
+                    if (fetch_ok && line_words != 10'd0) begin
+                        r_start    <= 1'b1;
+                        r_base     <= next_line_bytes[20:1];
+                        r_words    <= line_words;
+                        fill_bank  <= next_line[0];
+                        fill_ptr   <= 9'd0;
+                        fill_words <= line_words;
+                        fill_busy  <= 1'b1;
+                    end
+                end
+            end
+        end
+
+        // scanout read — same registered-1-enable-late timing as port B had
+        always @(posedge clk)
+            if (clk_video_en) lb_q <= linebuf[{v_cnt[0], h_byte[9:1]}];
+        assign scan_word_q = lb_q;
+
+`ifdef SIMULATION
+        reg [15:0] underrun_last = 16'd0;
+        always @(posedge clk)
+            if (vbl_pulse && underrun_cnt != underrun_last) begin
+                $display("[MDC] scanline fetch underruns: %0d (+%0d)",
+                         underrun_cnt, underrun_cnt - underrun_last);
+                underrun_last <= underrun_cnt;
+            end
+`endif
+
+    end endgenerate
 
     // ========================================================================
     // SDRAM/BRAM state machine — CPU access only (scanout uses port B)
@@ -382,7 +503,13 @@ module nubus_video_mdc824 #(
     // BRAM/cold-tail steer: one FSM, two targets. ext_sel_r is latched at
     // cycle accept; the FSM's generic rd/wr/ready plumbing fans out to
     // whichever port owns the word. RMW partial writes work identically
-    // over both (read-merge-write through the same mux).
+    // over both (read-merge-write through the same mux). With VRAM_WORDS=0
+    // (SDRAM-backed VRAM) every word steers ext.
+    /* verilator lint_off UNSIGNED */
+    /* verilator lint_off CMPCONST */
+    wire cpu_word_in_bram = (VRAM_WORDS != 0) && (cpu_vram_word < VRAM_WORDS);
+    /* verilator lint_on CMPCONST */
+    /* verilator lint_on UNSIGNED */
     reg  ext_sel_r;
     reg  port_rd_r, port_wr_r;
     assign vram_rd = port_rd_r & ~ext_sel_r;
@@ -554,7 +681,7 @@ module nubus_video_mdc824 #(
                         // tail (ext port); beyond -> ack-and-drop as before.
                         if (!rw_n && addr_is_vram) begin
                             if (cpu_vram_word < TOTAL_WORDS) begin
-                                ext_sel_r <= (cpu_vram_word >= VRAM_WORDS);
+                                ext_sel_r <= !cpu_word_in_bram;
                                 vram_addr <= VRAM_BASE + {5'd0, cpu_vram_word};
                                 cpu_write_data <= data_in;
                                 cpu_write_strobes <= uds_lds;
@@ -574,7 +701,7 @@ module nubus_video_mdc824 #(
                         // ---- VRAM read (raw) ----
                         else if (rw_n && addr_is_vram) begin
                             if (cpu_vram_word < TOTAL_WORDS) begin
-                                ext_sel_r <= (cpu_vram_word >= VRAM_WORDS);
+                                ext_sel_r <= !cpu_word_in_bram;
                                 vram_addr <= VRAM_BASE + {5'd0, cpu_vram_word};
                                 state <= S_CPU_READ;
                             end else begin
@@ -693,7 +820,7 @@ module nubus_video_mdc824 #(
     end
 
     // Big-endian: byte_sel=0 -> [15:8], byte_sel=1 -> [7:0]
-    wire [7:0] vram_byte = byte_sel_d ? vram_scan_data[7:0] : vram_scan_data[15:8];
+    wire [7:0] vram_byte = byte_sel_d ? scan_word_q[7:0] : scan_word_q[15:8];
 
     reg [7:0] pixel_idx;
     always @(*) begin

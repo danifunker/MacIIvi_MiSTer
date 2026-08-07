@@ -65,6 +65,24 @@ building if A's counters show real starvation on HW.
 
 | Attempt | Commit | Sim gate | Notes |
 |---|---|---|---|
-| scoping doc | (this commit) | — | — |
-| A: SDRAM burst port | TBD | TBD | |
-| B: DDR3 backing | TBD | TBD | |
+| scoping doc | 060b6b4 | — | — |
+| A: SDRAM burst port | (this commit) | check_boot PASS at montype 6 AND 7 (Slot Manager card probes ride the new all-ext path); standalone benches PASS (see below); card-view boot run to frame 710: stable, artifact-free scanout, zero underruns (desktop-pattern confirmation via fast-ramtest ROM in flight — the stock ROM's full 4MB march hasn't reached drawing by frame 710) | |
+| B: DDR3 backing | TBD | TBD | adapter+DDR model bench PASS pre-integration |
+
+### Bench coverage added while landing A (scratchpad, results 2026-08-07)
+
+- `tb_scan_fetch`: mdc_scan_fetch against the sim_ram video-port twin —
+  aligned/unaligned bases, mid-line abort (seq-tag word dropping), cpu-port
+  contention stalls. PASS.
+- `tb_sdram_vid`: the REAL sdram.v (bench-split inout) + mdc_scan_fetch
+  against a protocol-checking behavioral SDR chip — CPU reads/writes stay
+  correct under concurrent video scavenging, chained-read groups legal
+  (ACTIVE/READ×4/PRECHARGE; zero protocol errors), refresh credit holds
+  under saturated video (243 refreshes where ≥40 demanded). PASS. This is
+  the only pre-hardware coverage sdram.v gets — the main sim swaps it for
+  sim_ram.
+- `tb_vram_ddr` (Option B prep): mdc_vram_ddr + sim_ddram — 64-bit lane
+  packing/byte enables, cross-burst word order, abort tagging, ext ops
+  preempting between scan bursts. PASS. Caught a real contract bug (level-
+  held requests re-latched as phantom ops → stale-completion aliasing);
+  fixed with edge-qualified accept + level ready.

@@ -331,6 +331,7 @@ set_global_assignment -name VERILOG_FILE rtl/scsi.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cd_audio.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ncr5380.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/nubus_video_mdc824.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/mdc_scan_fetch.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/vram_ram.sv
 set_global_assignment -name VERILOG_FILE rtl/floppy_track_encoder.v
 set_global_assignment -name VERILOG_FILE rtl/floppy.v

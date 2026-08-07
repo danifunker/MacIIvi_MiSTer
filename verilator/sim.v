@@ -167,11 +167,12 @@ module emu
 	wire v8_ce_pix;
 
 	// Display source select: run with +mdc824 to route the CARD's scanout to
-	// the sim display (built-in video stays the default). NOTE: this no
-	// longer touches the monitor sense — montype 7 ("no display") WEDGES the
-	// ROM in early POST (MAME-proven with :vasp:MONTYPE forced: F2400 loop
-	// at $4084xxxx, zero slot traffic). Sense stays 6; the card becomes the
-	// boot display the real-hardware way, via the PRAM main-display setting.
+	// the sim display (built-in video stays the default). The standard
+	// card-as-boot-display run is `+montype=7 +mdc824` — the same sense-7
+	// no-onboard-monitor config the FPGA build hardwires (HW-confirmed
+	// 2026-07-13; the old "sense 7 WEDGES the ROM" note here was WRONG —
+	// MAME's incomplete static-sense model, see MacIIvi.sv. Re-verified
+	// 2026-08-07: +montype=7 boots and draws on the card in this sim).
 	reg disp_mdc824 = 1'b0;
 	initial disp_mdc824 = ($test$plusargs("mdc824") != 0);
 
@@ -699,19 +700,19 @@ module emu
 	wire        card_ext_rd, card_ext_wr;
 	wire [15:0] card_ext_din;
 	wire        card_ext_ready;
+	wire        mdc_scan_start, mdc_scan_wr;
+	wire [19:0] mdc_scan_base;
+	wire [9:0]  mdc_scan_words;
+	wire [15:0] mdc_scan_wdata;
 
-	// Hybrid card VRAM (task #9, 2026-07-11): 384KB hot framebuffer in
-	// BRAM (unchanged scanout) + cold tail to TOTAL_WORDS=1MB through the
-	// ext_* port into the SDRAM window at word $100000. PrimaryInit
-	// (decl-ROM code) sizes VRAM by writing $AAAAAAAA to byte offset
-	// $F4B00 (~979KB) and reading it back (MAME rw-tap capture,
-	// /tmp/mame_pinit_rw.txt); the IIvi ROM's Slot Manager — unlike the
-	// Mac II's, which tolerates the miss (lbmactwo boots this card at
-	// plain 384KB) — hard-fails the card on a miss: sResources dropped,
-	// boot-display hunt dies smRecNotFnd, sad Mac $0F/$33. The tail
-	// answers the probe; nothing is ever scanned out from it (8bpp @
-	// 640x480 = 300KB fits BRAM). Matches MacIIvi.sv (keep in sync).
-	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(196608),
+	// SDRAM-backed card VRAM (docs/VRAM_1MB_OPTIONS.md Option A, 2026-08-07):
+	// VRAM_WORDS=0 = the FULL 1MB lives at SDRAM word $100000. Every CPU
+	// access steers through the ext_* path (the HW-proven cold-tail plumbing,
+	// now covering word 0 upward — PrimaryInit's $AAAAAAAA sizing probe at
+	// byte $F4B00 included), and scanout runs from the card's internal
+	// 2x512-word line buffer via mdc_scan_fetch + sim_ram's video burst
+	// port twin. Matches MacIIvi.sv default shape (keep in sync).
+	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(0),
 	                     .TOTAL_WORDS(524288)) nubus_card (
 		.clk(clk_sys),
 		.reset(!_cpuReset),
@@ -742,6 +743,12 @@ module emu
 		.vram_scan_addr(mdc_vram_scan_addr),
 		.vram_scan_rd(mdc_vram_scan_rd),
 		.vram_scan_data(mdc_vram_scan_data),
+		.scan_start(mdc_scan_start),
+		.scan_base(mdc_scan_base),
+		.scan_words(mdc_scan_words),
+		.scan_wr(mdc_scan_wr),
+		.scan_wdata(mdc_scan_wdata),
+		.dbg_scan_underrun(),
 		.ioctl_wr(1'b0), .ioctl_addr(25'd0), .ioctl_data(16'd0),
 		.ioctl_download(1'b0), .ioctl_index(8'd0),
 		.overlay_en(1'b0),
@@ -752,17 +759,32 @@ module emu
 		.dbg_irq_cnt(), .dbg_ack_cnt(), .dbg_vblank_enable()
 	);
 
-	vram_ram #(.WORDS(196608)) mdc_vram (   // 384KB BRAM — must match VRAM_WORDS above
+	// No BRAM card VRAM in the SDRAM-backed shape (VRAM_WORDS=0): the FSM
+	// steers every access ext, scanout runs from the card's line buffer.
+	assign mdc_vram_din       = 16'h0000;
+	assign mdc_vram_ready     = 1'b1;
+	assign mdc_vram_scan_data = 16'h0000;
+
+	// Scanline fetch client: card line requests -> sim_ram's video port twin
+	// (keep in sync with MacIIvi.sv, which wires the same module to sdram.v).
+	wire        ram_vid_rd, ram_vid_seq, ram_vid_dseq, ram_vid_tog;
+	wire [25:0] ram_vid_addr;
+	wire [15:0] ram_vid_data;
+
+	mdc_scan_fetch #(.SDRAM_BASE(26'h0100000)) mdc_fetch (
 		.clk(clk_sys),
-		.addr(mdc_vram_addr),
-		.din(mdc_vram_dout),
-		.dout(mdc_vram_din),
-		.rd(mdc_vram_rd),
-		.wr(mdc_vram_wr),
-		.ready(mdc_vram_ready),
-		.addr_b(mdc_vram_scan_addr),
-		.rd_b(mdc_vram_scan_rd),
-		.dout_b(mdc_vram_scan_data)
+		.reset(!_cpuReset),
+		.start(mdc_scan_start),
+		.base_word(mdc_scan_base),
+		.words(mdc_scan_words),
+		.wvalid(mdc_scan_wr),
+		.wdata(mdc_scan_wdata),
+		.vid_rd(ram_vid_rd),
+		.vid_addr(ram_vid_addr),
+		.vid_seq(ram_vid_seq),
+		.vid_data(ram_vid_data),
+		.vid_dseq(ram_vid_dseq),
+		.vid_tog(ram_vid_tog)
 	);
 
 	// Empty-slot open bus (slots $C/$D): 32 clk with no card ack -> $FFFF+DTACK.
@@ -1235,13 +1257,16 @@ module emu
 	assign dio_a_comb = (ioctl_index[1:0] == 2'b01) ? 26'h0180000 + {6'b0, ioctl_addr[20:1]} :  // Floppy
 	                    {7'b0, ioctl_addr[19:1]};                                                 // ROM (1MB) at $000000 (must match addrController rom_sdram_word)
 
-	// Card cold-tail (ext) SDRAM access — twin of MacIIvi.sv. The card's ext
-	// port owns card words [196608, 524288) at SDRAM word $100000 + word
-	// (= $130000..$17FFFF inside the reserved mdc824 window). An ext access
-	// coincides with a CPU bus cycle TO the card, so the cpu RAM/ROM arms
-	// are idle by construction; only floppy staging can collide, and then
-	// the ext op just waits (the ready counter only advances on presented
-	// cycles). Priority: download > floppy staging > card ext > cpu.
+	// Card ext SDRAM access — twin of MacIIvi.sv. With the SDRAM-backed card
+	// VRAM (Option A) this is the path for EVERY card VRAM word [0, 524288)
+	// at SDRAM word $100000 + word (the whole reserved mdc824 window). An
+	// ext access coincides with a CPU bus cycle TO the card, so the cpu
+	// RAM/ROM arms are idle by construction; only floppy staging can
+	// collide, and then the ext op just waits (the ready counter only
+	// advances on presented cycles). sim_ram serves in one cycle, so the
+	// flat 4-cycle ready here stands in for the HW clk8-edge-counted write
+	// ack / ram_ready read handshake in MacIIvi.sv.
+	// Priority: download > floppy staging > card ext > cpu.
 	wire [25:0] card_ext_addr = 26'h0100000 + {6'd0, mdc_vram_addr[19:0]};
 	wire        card_ext_req  = card_ext_rd || card_ext_wr;
 	wire        card_ext_slot = card_ext_req && !download_cycle
@@ -1292,7 +1317,13 @@ module emu
 		.oe             ( ram_oe      ),
 		.dout           ( ram_do_raw  ),
 		.module_sz      ( cfg_sdramMod ),
-		.frame_count    ( sim_frame_count )
+		.frame_count    ( sim_frame_count ),
+		.vid_rd         ( ram_vid_rd   ),
+		.vid_addr       ( ram_vid_addr ),
+		.vid_seq        ( ram_vid_seq  ),
+		.vid_data       ( ram_vid_data ),
+		.vid_dseq       ( ram_vid_dseq ),
+		.vid_tog        ( ram_vid_tog  )
 	);
 
 	// RAM debug outputs

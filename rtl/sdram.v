@@ -44,7 +44,30 @@ module sdram
 	input [1:0]         ds,         // upper/lower data strobe
 	input               oe,         // cpu/chipset requests read
 	input               we,         // cpu/chipset requests write
-	output              ram_ready   // 1 = dout holds valid data for the address on `addr`
+	output              ram_ready,  // 1 = dout holds valid data for the address on `addr`
+
+	// Video burst read port (mdc824 scanline prefetch — docs/VRAM_1MB_OPTIONS.md
+	// Option A). STRICTLY lowest priority: it only ever uses a command window in
+	// which the cpu/chipset presented NO op, never two windows in a row, and
+	// yields to the forced-refresh credit. In its window it runs a self-
+	// contained ACTIVE @T0 / up to 4 chained BL1 READs @T2..T5 / explicit
+	// single-bank PRECHARGE @T6 sequence (tRCD 2ck=31ns>20, tRAS 6ck=92ns>42,
+	// tRP 2ck=31ns>20 — all satisfied with margin, and the DQ bus is free again
+	// 2 cycles before the next window's earliest write data). Chained groups
+	// start at vid_addr and run to the next 4-word boundary, so a group can
+	// never cross a row. Served words stream out on vid_data/vid_tog at one
+	// word per 2 clk_64 (= one per clk_sys), each held 2 clk_64; vid_tog flips
+	// once per word so the 32.5MHz consumer can count words even when the data
+	// repeats. The controller starts a new group only when the client's
+	// vid_addr has caught up with base+n of the previous group (or vid_seq
+	// changed = client restarted on a new line), so a stale-sampled vid_addr
+	// can never produce a duplicated/overlapping group.
+	input               vid_rd,     // level: fetch engine wants words at vid_addr
+	input [25:0]        vid_addr,   // word address of the next unserved word
+	input               vid_seq,    // flips when the client restarts (new line)
+	output reg [15:0]   vid_data,   // served word (held 2 clk_64)
+	output reg          vid_dseq,   // vid_seq of the group this word belongs to
+	output reg          vid_tog     // flips once per served word
 );
 
 localparam RASCAS_DELAY   = 3'd2;   // tRCD=20ns -> 3 cycles@128MHz
@@ -172,13 +195,86 @@ reg [25:0] dout_addr;
 reg        dout_valid;
 assign ram_ready = dout_valid && (dout_addr == addr);
 
+// ---- video burst port state (Option A) ------------------------------------
+// vid_* inputs are launched from clk_sys registers; clk_sys and clk_64 come
+// from the same PLL (2:1), so a single clk_64 sampling register is a timed
+// synchronous crossing (STA-covered), not an async CDC.
+reg        vid_rd_m;
+reg [25:0] vid_addr_m;
+reg        vid_seq_m;
+reg        vid_win;         // the current window is a video window
+reg        vid_win_d;       // the PREVIOUS window was video (cooldown + tail captures)
+reg [3:0]  vid_issue;       // bit k: a READ was issued at T(2+k) (col base+k)
+reg [25:0] vid_base;        // group base, latched at T0 of the video window
+// group-completion handshake (see the port comment): next group only when the
+// client caught up or restarted
+reg        vid_expect_valid;
+reg [25:0] vid_expect_addr;
+reg        vid_expect_seq;
+reg        vid_grp_seq;     // vid_seq latched with the group — tags served words
+// capture queue (up to 4 words land at T6,T7,T0',T1'; drained 1 per 2 clk_64).
+// Entries carry {group seq, data}: after a line restart (vid_seq flip) the
+// client drops any still-draining words of the aborted group by tag, with no
+// timing assumptions.
+reg [16:0] vid_q [0:3];
+reg [1:0]  vid_q_wr, vid_q_rd;
+reg [2:0]  vid_q_cnt;
+reg        vid_drain_ph;
+// forced-refresh credit: refresh used to fire on EVERY idle window; with the
+// video port competing for idle windows, refresh gets a hard credit instead —
+// one forced refresh at least every RF_FORCE windows (24 windows = 2.95us,
+// alternating chips = each chip every 5.9us, still well inside the 7.8us
+// JEDEC cadence). Truly idle windows (no video pending) still refresh
+// opportunistically exactly like before.
+localparam [4:0] RF_FORCE = 5'd24;
+reg [4:0]  rf_cnt;
+
+// video queue push/pop, computed once so the count stays coherent when a
+// capture and a drain land on the same edge. Captures for READs issued at
+// T2/T3 land at T6/T7 of the same window; the T4/T5 reads land at T0/T1 of
+// the NEXT window — at the T0 edge `vid_win` still holds the video window's
+// value (its new value is assigned on that same edge), at T1 `vid_win_d`
+// (updated at T0 from the old vid_win) carries it. The cooldown (`!vid_win`
+// in the grant term) guarantees the window after a video window is never
+// video, so vid_issue is stable through both tail captures.
+wire vid_pop  = (vid_q_cnt != 3'd0) && vid_drain_ph;
+wire vid_push = (reset == 0) && (
+	(t == 3'd6 && vid_win   && vid_issue[0]) ||
+	(t == 3'd7 && vid_win   && vid_issue[1]) ||
+	(t == 3'd0 && vid_win   && vid_issue[2]) ||
+	(t == 3'd1 && vid_win_d && vid_issue[3]));
+
 always @(posedge clk_64) begin
 	sd_cmd <= CMD_INHIBIT;  // default: idle (with nCS=1: INHIBIT to chip 0,
 	sd_cs_r <= 1'b1;        // NOP to a 128MB module's inverted-nCS chip 1)
 	sd_data <= 16'bZZZZZZZZZZZZZZZZ;
 
+	// video port input sampling + word drain run unconditionally (drain is
+	// inert while the queue is empty)
+	vid_rd_m   <= vid_rd;
+	vid_addr_m <= vid_addr;
+	vid_seq_m  <= vid_seq;
+	vid_drain_ph <= ~vid_drain_ph;
+	if (vid_pop) begin
+		{vid_dseq, vid_data} <= vid_q[vid_q_rd];
+		vid_q_rd  <= vid_q_rd + 2'd1;
+		vid_tog   <= ~vid_tog;
+	end
+	if (vid_push) begin
+		vid_q[vid_q_wr] <= {vid_grp_seq, sd_data};
+		vid_q_wr <= vid_q_wr + 2'd1;
+	end
+	if (!vid_rd_m) vid_expect_valid <= 1'b0;
+
 	if(reset != 0) begin
 		dout_valid <= 1'b0;
+		vid_win    <= 1'b0;
+		vid_win_d  <= 1'b0;
+		vid_q_cnt  <= 3'd0;
+		vid_q_wr   <= 2'd0;
+		vid_q_rd   <= 2'd0;
+		vid_expect_valid <= 1'b0;
+		rf_cnt     <= 5'd0;
 		// init ladder, one command slot per chipset cycle (~123ns apart), run
 		// for BOTH chips of a 128MB module (even slot = chip 0, odd = chip 1;
 		// on 32/64MB modules the chip-1 slots land on a deselected nCS and are
@@ -212,6 +308,9 @@ always @(posedge clk_64) begin
 		// -------------------  cpu/chipset read/write ----------------------
 		if(t == STATE_CMD_START) begin
 			{oe_latch, we_latch} <= {oe, we};
+			vid_win_d <= vid_win;
+			vid_win   <= 1'b0;
+			rf_cnt    <= (rf_cnt == 5'd31) ? rf_cnt : rf_cnt + 5'd1;
 			if (we) dout_valid <= 1'b0;   // a write invalidates the read-data cache
 			if (we || oe) begin
 				// Capture the access address NOW for the CAS column (see the
@@ -222,16 +321,69 @@ always @(posedge clk_64) begin
 				sd_cs_r <= addr[25];
 				sd_addr <= { addr[23], addr[19:8] };
 				sd_ba <= addr[21:20];
-		// ------------------------ no access --------------------------
+		// ------------------ no access: video / refresh ---------------
+			end else if (rf_cnt < RF_FORCE && vid_rd_m && !vid_win &&
+			             (!vid_expect_valid || (vid_seq_m != vid_expect_seq) ||
+			              (vid_addr_m == vid_expect_addr))) begin
+				// Video window (lowest priority): the refresh credit is not
+				// due, a fetch is pending, the previous window was not video
+				// (drain/capture separation), and the client has consumed the
+				// previous group (or restarted a line = vid_seq flipped).
+				vid_win  <= 1'b1;
+				vid_base <= vid_addr_m;
+				// chained READs run from addr to the next 4-word boundary
+				vid_issue <= (vid_addr_m[1:0] == 2'd0) ? 4'b1111 :
+				             (vid_addr_m[1:0] == 2'd1) ? 4'b0111 :
+				             (vid_addr_m[1:0] == 2'd2) ? 4'b0011 : 4'b0001;
+				vid_expect_addr  <= vid_addr_m + {23'd0,
+				                    (vid_addr_m[1:0] == 2'd0) ? 3'd4 :
+				                    (vid_addr_m[1:0] == 2'd1) ? 3'd3 :
+				                    (vid_addr_m[1:0] == 2'd2) ? 3'd2 : 3'd1};
+				vid_expect_seq   <= vid_seq_m;
+				vid_expect_valid <= 1'b1;
+				vid_grp_seq      <= vid_seq_m;
+				sd_cmd  <= CMD_ACTIVE;
+				sd_cs_r <= vid_addr_m[25];
+				sd_addr <= { vid_addr_m[23], vid_addr_m[19:8] };
+				sd_ba   <= vid_addr_m[21:20];
 			end else begin
 				// Idle slot: refresh, alternating chips so BOTH chips of a
 				// 128MB module get their full 8192/64ms cadence (a chip-1
-				// refresh is inert on 32/64MB modules). The CPU can hold at
-				// most 3 of 4 slots, so each chip still refreshes at least
-				// every ~1us — an ~8x margin over the 7.8us requirement.
+				// refresh is inert on 32/64MB modules). Forced at the first
+				// idle window once rf_cnt hits RF_FORCE, opportunistic when
+				// no video fetch is pending — the CPU can hold at most 3 of
+				// 4 slots, so an idle window always arrives in time.
 				sd_cmd <= CMD_AUTO_REFRESH;
 				sd_cs_r <= rfsh_chip;
 				rfsh_chip <= ~rfsh_chip;
+				rf_cnt <= 5'd0;
+			end
+		end
+
+		// Video window command phases: chained BL1 READs at T2..T5 (columns
+		// base+0..3, A10=0 = no auto precharge, DQM open), then an explicit
+		// single-bank PRECHARGE at T6. sd_ba was set at the ACTIVE and is
+		// held by register through the whole window.
+		if (vid_win) begin
+			if (t == 3'd2 && vid_issue[0]) begin
+				sd_cmd <= CMD_READ; sd_cs_r <= vid_base[25];
+				sd_addr <= {2'b00, 1'b0, vid_base[24], vid_base[22], vid_base[7:2], vid_base[1:0]};
+			end
+			if (t == 3'd3 && vid_issue[1]) begin
+				sd_cmd <= CMD_READ; sd_cs_r <= vid_base[25];
+				sd_addr <= {2'b00, 1'b0, vid_base[24], vid_base[22], vid_base[7:2], vid_base[1:0] + 2'd1};
+			end
+			if (t == 3'd4 && vid_issue[2]) begin
+				sd_cmd <= CMD_READ; sd_cs_r <= vid_base[25];
+				sd_addr <= {2'b00, 1'b0, vid_base[24], vid_base[22], vid_base[7:2], vid_base[1:0] + 2'd2};
+			end
+			if (t == 3'd5 && vid_issue[3]) begin
+				sd_cmd <= CMD_READ; sd_cs_r <= vid_base[25];
+				sd_addr <= {2'b00, 1'b0, vid_base[24], vid_base[22], vid_base[7:2], vid_base[1:0] + 2'd3};
+			end
+			if (t == 3'd6) begin
+				sd_cmd <= CMD_PRECHARGE; sd_cs_r <= vid_base[25];
+				sd_addr <= 13'd0;   // A10=0: single-bank precharge (sd_ba held)
 			end
 		end
 
@@ -258,6 +410,9 @@ always @(posedge clk_64) begin
 			dout_addr  <= addr_latch;
 			dout_valid <= 1'b1;
 		end
+
+		// video queue occupancy (push and pop can coincide)
+		vid_q_cnt <= vid_q_cnt + (vid_push ? 3'd1 : 3'd0) - (vid_pop ? 3'd1 : 3'd0);
 
 	end
 end

@@ -52,6 +52,9 @@ module mdc_bench;
         .ext_ready(ext_ready),
         .vram_scan_addr(vram_scan_addr), .vram_scan_rd(vram_scan_rd),
         .vram_scan_data(vram_scan_data),
+        // SDRAM-backed scanout port — unused in the bench's BRAM shape
+        .scan_start(), .scan_base(), .scan_words(),
+        .scan_wr(1'b0), .scan_wdata(16'd0), .dbg_scan_underrun(),
         .ioctl_wr(1'b0), .ioctl_addr(25'd0), .ioctl_data(16'd0),
         .ioctl_download(1'b0), .ioctl_index(8'd0),
         .overlay_en(1'b0), .monochrome(1'b0), .monitor_512(1'b0),
