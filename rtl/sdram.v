@@ -202,16 +202,33 @@ assign ram_ready = dout_valid && (dout_addr == addr);
 // video port to ~73% of each scanline (frozen right-edge band on hardware).
 // Track write completion the same way read completion is tracked (address
 // AND data compared — a back-to-back write of different data to the same
-// address never matches, so it executes), and release a window whose
-// presented op is already served. Only provably-redundant re-executions are
-// skipped: the first window of every op still executes it, so every existing
-// completion contract (slot-start DTACK, ext 3-edge write count, PMMU-walk
-// ram_ready wait) holds unchanged.
+// address never matches, so it executes; a same-addr+data skip provably
+// rewrites memory's current content since every writer shares this port),
+// and release a window whose presented op is already served.
+//
+// TIMING SHAPE (the first cut put the 42-bit compare LIVE in front of the
+// T0 arbitration: cpu-EA -> compare -> command mux blew up at -8ns): the
+// compare runs in its own register pipeline — stage 1 samples addr/din/
+// oe/we (the same arrival class as the addr_latch capture, timed for
+// years), stage 2 is a register-to-register compare, and a window is
+// released only after THREE consecutive served verdicts (rls_cnt). The
+// presented op can change at most every 2 clk_64 (clk_sys grid), so the
+// counter spans any change-blindness of the pipeline: a window is only
+// ever released for an op that has been stable AND served for >=5 cycles.
+// The T0 decision itself is (oe||we) && !register — v1 depth. Only
+// provably-redundant re-executions are skipped: the first window of every
+// op still executes it, so every existing completion contract (slot-start
+// DTACK, ext 3-edge write count, PMMU-walk ram_ready wait) is unchanged.
 reg [25:0] wr_done_addr;
 reg [15:0] wr_done_din;
 reg        wr_done_valid;
-wire wr_served = wr_done_valid && (wr_done_addr == addr) && (wr_done_din == din);
-wire cpu_window_needed = (we && !wr_served) || (oe && !ram_ready);
+reg [25:0] rls_addr_q;
+reg [15:0] rls_din_q;
+reg        rls_oe_q, rls_we_q;
+reg        rls_raw;
+reg [1:0]  rls_cnt;
+wire       rls_ok = (rls_cnt == 2'd3);
+wire cpu_window_needed = (we || oe) && !rls_ok;
 
 // ---- video burst port state (Option A) ------------------------------------
 // vid_* inputs are launched from clk_sys registers; clk_sys and clk_64 come
@@ -272,6 +289,16 @@ always @(posedge clk_64) begin
 	vid_rd_m   <= vid_rd;
 	vid_addr_m <= vid_addr;
 	vid_seq_m  <= vid_seq;
+
+	// release-qualifier pipeline (see the wr_done/rls comment block above)
+	rls_addr_q <= addr;
+	rls_din_q  <= din;
+	rls_oe_q   <= oe;
+	rls_we_q   <= we;
+	rls_raw <= (rls_we_q && wr_done_valid && (wr_done_addr == rls_addr_q)
+	                     && (wr_done_din == rls_din_q)) ||
+	           (rls_oe_q && dout_valid && (dout_addr == rls_addr_q));
+	rls_cnt <= rls_raw ? ((rls_cnt == 2'd3) ? 2'd3 : rls_cnt + 2'd1) : 2'd0;
 	vid_drain_ph <= ~vid_drain_ph;
 	if (vid_pop) begin
 		{vid_dseq, vid_data} <= vid_q[vid_q_rd];
@@ -287,6 +314,7 @@ always @(posedge clk_64) begin
 	if(reset != 0) begin
 		dout_valid <= 1'b0;
 		wr_done_valid <= 1'b0;
+		rls_cnt    <= 2'd0;
 		vid_win    <= 1'b0;
 		vid_win_d  <= 1'b0;
 		vid_q_cnt  <= 3'd0;
