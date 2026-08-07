@@ -77,6 +77,7 @@ V_SRC = \
 	tg68k_debug.vlt \
 	sim.v \
 	sim_ram.v \
+	sim_ddram.v \
 	$(RTL)/tg68k/TG68KdotC_Kernel.v \
 	$(RTL)/tg68k/TG68K_Cache_030.v \
 	$(RTL)/tg68k/tg68k.v \
@@ -104,6 +105,7 @@ V_SRC = \
 	$(RTL)/scc.v \
 	$(RTL)/nubus/nubus_video_mdc824.sv \
 	$(RTL)/nubus/mdc_scan_fetch.sv \
+	$(RTL)/nubus/mdc_vram_ddr.sv \
 	$(RTL)/nubus/vram_ram.sv \
 	$(RTL)/cuda_maclc.sv \
 	$(RTL)/pll/pll_0002.v \

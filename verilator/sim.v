@@ -765,11 +765,25 @@ module emu
 	assign mdc_vram_ready     = 1'b1;
 	assign mdc_vram_scan_data = 16'h0000;
 
-	// Scanline fetch client: card line requests -> sim_ram's video port twin
-	// (keep in sync with MacIIvi.sv, which wires the same module to sdram.v).
-	wire        ram_vid_rd, ram_vid_seq, ram_vid_dseq, ram_vid_tog;
-	wire [25:0] ram_vid_addr;
+	// Scanline fetch client: card line requests -> the VRAM backend's video
+	// port (keep in sync with MacIIvi.sv). Unlike the FPGA build's
+	// compile-time MDC_VRAM_DDR macro, the sim carries BOTH backends and
+	// selects at runtime with +vramddr (Option B: DDR3/sim_ddram; default:
+	// Option A, sim_ram's SDRAM video-port twin) so A/B compare without a
+	// rebuild.
+	reg use_ddr_vram = 1'b0;
+	initial use_ddr_vram = ($test$plusargs("vramddr") != 0);
+
+	wire        vidp_rd, vidp_seq;
+	wire [25:0] vidp_addr;
+	wire        ram_vid_dseq, ram_vid_tog;
 	wire [15:0] ram_vid_data;
+	wire        ddr_vid_dseq, ddr_vid_tog;
+	wire [15:0] ddr_vid_data;
+	wire        ram_vid_rd  = vidp_rd && !use_ddr_vram;
+	wire        ddr_vid_rd  = vidp_rd &&  use_ddr_vram;
+	wire [25:0] ram_vid_addr = vidp_addr;
+	wire        ram_vid_seq  = vidp_seq;
 
 	mdc_scan_fetch #(.SDRAM_BASE(26'h0100000)) mdc_fetch (
 		.clk(clk_sys),
@@ -779,12 +793,61 @@ module emu
 		.words(mdc_scan_words),
 		.wvalid(mdc_scan_wr),
 		.wdata(mdc_scan_wdata),
-		.vid_rd(ram_vid_rd),
-		.vid_addr(ram_vid_addr),
-		.vid_seq(ram_vid_seq),
-		.vid_data(ram_vid_data),
-		.vid_dseq(ram_vid_dseq),
-		.vid_tog(ram_vid_tog)
+		.vid_rd(vidp_rd),
+		.vid_addr(vidp_addr),
+		.vid_seq(vidp_seq),
+		.vid_data(use_ddr_vram ? ddr_vid_data : ram_vid_data),
+		.vid_dseq(use_ddr_vram ? ddr_vid_dseq : ram_vid_dseq),
+		.vid_tog(use_ddr_vram ? ddr_vid_tog : ram_vid_tog)
+	);
+
+	// Option B backend: DDR adapter + behavioral DDRAM model (sim twins of
+	// MacIIvi.sv's mdc_vram_ddr-on-DDRAM_* wiring)
+	wire        sddr_busy, sddr_rd, sddr_we, sddr_dout_ready;
+	wire [7:0]  sddr_burstcnt, sddr_be;
+	wire [28:0] sddr_addr;
+	wire [63:0] sddr_din, sddr_dout;
+	wire [15:0] ddr_ext_dout;
+	wire        ddr_ext_ready;
+
+	mdc_vram_ddr #(.DDR_BASE_QW(29'h06000000)) mdc_ddr (
+		.clk(clk_sys),
+		.reset(!_cpuReset),
+		.ddr_busy(sddr_busy),
+		.ddr_burstcnt(sddr_burstcnt),
+		.ddr_addr(sddr_addr),
+		.ddr_dout(sddr_dout),
+		.ddr_dout_ready(sddr_dout_ready),
+		.ddr_rd(sddr_rd),
+		.ddr_din(sddr_din),
+		.ddr_be(sddr_be),
+		.ddr_we(sddr_we),
+		.vid_rd(ddr_vid_rd),
+		.vid_addr(vidp_addr),
+		.vid_seq(vidp_seq),
+		.vid_data(ddr_vid_data),
+		.vid_dseq(ddr_vid_dseq),
+		.vid_tog(ddr_vid_tog),
+		.ext_rd(card_ext_rd && use_ddr_vram),
+		.ext_wr(card_ext_wr && use_ddr_vram),
+		.ext_word(mdc_vram_addr[19:0]),
+		.ext_wdata(mdc_vram_dout),
+		.ext_dout(ddr_ext_dout),
+		.ext_ready(ddr_ext_ready)
+	);
+
+	sim_ddram sddr (
+		.clk(clk_sys),
+		.reset(reset),
+		.addr(sddr_addr),
+		.burstcnt(sddr_burstcnt),
+		.din(sddr_din),
+		.be(sddr_be),
+		.rd(sddr_rd),
+		.we(sddr_we),
+		.busy(sddr_busy),
+		.dout(sddr_dout),
+		.dout_ready(sddr_dout_ready)
 	);
 
 	// Empty-slot open bus (slots $C/$D): 32 clk with no card ack -> $FFFF+DTACK.
@@ -1268,7 +1331,7 @@ module emu
 	// ack / ram_ready read handshake in MacIIvi.sv.
 	// Priority: download > floppy staging > card ext > cpu.
 	wire [25:0] card_ext_addr = 26'h0100000 + {6'd0, mdc_vram_addr[19:0]};
-	wire        card_ext_req  = card_ext_rd || card_ext_wr;
+	wire        card_ext_req  = (card_ext_rd || card_ext_wr) && !use_ddr_vram;
 	wire        card_ext_slot = card_ext_req && !download_cycle
 	                            && !dskReadAckInt && !dskReadAckExt;
 	reg  [1:0]  card_ext_cnt = 2'd0;
@@ -1278,8 +1341,8 @@ module emu
 		else if (card_ext_slot && card_ext_cnt != 2'd3)
 			card_ext_cnt <= card_ext_cnt + 2'd1;
 	end
-	assign card_ext_ready = (card_ext_cnt == 2'd3);
-	assign card_ext_din   = ram_do_raw;
+	assign card_ext_ready = use_ddr_vram ? ddr_ext_ready : (card_ext_cnt == 2'd3);
+	assign card_ext_din   = use_ddr_vram ? ddr_ext_dout  : ram_do_raw;
 
 	wire [25:0] ram_addr = download_cycle ? dio_a_comb :
 	                       card_ext_slot  ? card_ext_addr : memoryAddr;

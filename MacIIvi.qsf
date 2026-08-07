@@ -332,7 +332,11 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/cd_audio.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ncr5380.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/nubus_video_mdc824.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/mdc_scan_fetch.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/mdc_vram_ddr.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/vram_ram.sv
+# Option B (docs/VRAM_1MB_OPTIONS.md): uncomment to move the card VRAM from
+# the SDRAM window onto the HPS DDR3 channel instead.
+# set_global_assignment -name VERILOG_MACRO "MDC_VRAM_DDR=1"
 set_global_assignment -name VERILOG_FILE rtl/floppy_track_encoder.v
 set_global_assignment -name VERILOG_FILE rtl/floppy.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ps2_kbd.sv

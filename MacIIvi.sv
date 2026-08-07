@@ -27,7 +27,13 @@ module emu
 	assign ADC_BUS  = 'Z;
 	assign USER_OUT = '1;
 
+`ifndef MDC_VRAM_DDR
 	assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
+`else
+	// Option B (docs/VRAM_1MB_OPTIONS.md): the DDRAM channel carries the
+	// mdc824 card VRAM — driven by the mdc_vram_ddr adapter below.
+	assign DDRAM_CLK = clk_sys;
+`endif
 	assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
 	assign LED_USER  = dio_download || (disk_act ^ |diskMotor);
@@ -1471,11 +1477,16 @@ module emu
 		assign mdc_vram_scan_data = 16'h0000;
 	end endgenerate
 
-	// Scanline fetch client: card line requests -> sdram.v burst video port
-	// (idle-window chained reads into the reserved window at word $100000).
-	wire        sdram_vid_rd, sdram_vid_seq, sdram_vid_dseq, sdram_vid_tog;
-	wire [25:0] sdram_vid_addr;
-	wire [15:0] sdram_vid_data;
+	// Scanline fetch client: card line requests -> the VRAM backend's burst
+	// video port. Backend select (docs/VRAM_1MB_OPTIONS.md):
+	//   default      = Option A: sdram.v idle-window chained reads into the
+	//                  reserved window at word $100000.
+	//   MDC_VRAM_DDR = Option B: the mdc_vram_ddr adapter on the HPS DDR3
+	//                  channel (same client contract; SDRAM untouched by
+	//                  card VRAM traffic, ext ops rerouted below too).
+	wire        vidp_rd, vidp_seq, vidp_dseq, vidp_tog;
+	wire [25:0] vidp_addr;
+	wire [15:0] vidp_data;
 
 	mdc_scan_fetch #(.SDRAM_BASE(26'h0100000)) mdc_fetch (
 		.clk(clk_sys),
@@ -1485,13 +1496,30 @@ module emu
 		.words(mdc_scan_words),
 		.wvalid(mdc_scan_wr),
 		.wdata(mdc_scan_wdata),
-		.vid_rd(sdram_vid_rd),
-		.vid_addr(sdram_vid_addr),
-		.vid_seq(sdram_vid_seq),
-		.vid_data(sdram_vid_data),
-		.vid_dseq(sdram_vid_dseq),
-		.vid_tog(sdram_vid_tog)
+		.vid_rd(vidp_rd),
+		.vid_addr(vidp_addr),
+		.vid_seq(vidp_seq),
+		.vid_data(vidp_data),
+		.vid_dseq(vidp_dseq),
+		.vid_tog(vidp_tog)
 	);
+
+	wire        sdram_vid_dseq, sdram_vid_tog;
+	wire [15:0] sdram_vid_data;
+`ifdef MDC_VRAM_DDR
+	// Option B: SDRAM video port idles; the DDR adapter serves the stream
+	// and the card's ext ops (instance below, next to the ext glue).
+	wire        sdram_vid_rd   = 1'b0;
+	wire        sdram_vid_seq  = 1'b0;
+	wire [25:0] sdram_vid_addr = 26'd0;
+`else
+	wire        sdram_vid_rd   = vidp_rd;
+	wire        sdram_vid_seq  = vidp_seq;
+	wire [25:0] sdram_vid_addr = vidp_addr;
+	assign vidp_data = sdram_vid_data;
+	assign vidp_dseq = sdram_vid_dseq;
+	assign vidp_tog  = sdram_vid_tog;
+`endif
 
 	// Empty-slot open bus: slots $C/$D (and any slot cycle the card doesn't
 	// claim) — after 32 clk_sys with no card ack, answer $FFFF with DTACK. The
@@ -2269,6 +2297,37 @@ module emu
 	// A9 from addr[24]); 68MB reaches into a 128MB module's second chip
 	// (addr[25] -> nCS level). Both are OSD-gated by sdram_sz above.
 
+`ifdef MDC_VRAM_DDR
+	// Option B: card ext ops go to DDR3 through the adapter — the SDRAM mux
+	// never sees them (card_ext_slot is constant 0, its mux arms fold away).
+	wire        card_ext_slot = 1'b0;
+	wire [25:0] card_ext_addr = 26'd0;
+	mdc_vram_ddr #(.DDR_BASE_QW(29'h06000000)) mdc_ddr (   // byte 0x30000000
+		.clk(clk_sys),
+		.reset(!_cpuReset),
+		.ddr_busy(DDRAM_BUSY),
+		.ddr_burstcnt(DDRAM_BURSTCNT),
+		.ddr_addr(DDRAM_ADDR),
+		.ddr_dout(DDRAM_DOUT),
+		.ddr_dout_ready(DDRAM_DOUT_READY),
+		.ddr_rd(DDRAM_RD),
+		.ddr_din(DDRAM_DIN),
+		.ddr_be(DDRAM_BE),
+		.ddr_we(DDRAM_WE),
+		.vid_rd(vidp_rd),
+		.vid_addr(vidp_addr),
+		.vid_seq(vidp_seq),
+		.vid_data(vidp_data),
+		.vid_dseq(vidp_dseq),
+		.vid_tog(vidp_tog),
+		.ext_rd(card_ext_rd),
+		.ext_wr(card_ext_wr),
+		.ext_word(mdc_vram_addr[19:0]),
+		.ext_wdata(mdc_vram_dout),
+		.ext_dout(card_ext_din),
+		.ext_ready(card_ext_ready)
+	);
+`else
 	// Card ext SDRAM access — twin of verilator/sim.v (long note there). With
 	// the SDRAM-backed card VRAM (Option A) this is the path for EVERY card
 	// VRAM word: SDRAM word $100000 + card word. An ext access coincides with
@@ -2298,6 +2357,7 @@ module emu
 	                      ? (sdram_ram_ready && sdram_addr == card_ext_addr)
 	                      : (card_ext_wedge == 2'd3);
 	assign card_ext_din   = sdram_out;
+`endif
 
 	wire [25:0] sdram_addr = download_cycle ? dio_a :
 	                         card_ext_slot  ? card_ext_addr : memoryAddr;
