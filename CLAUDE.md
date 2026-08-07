@@ -95,11 +95,12 @@ works but the client falls back to slow single-block transfers.
   probe-less fits corrupt the SCSI read path on HW while STA is met — the
   preserve+noprune anchor registers keep those cones loaded. Do NOT remove,
   ifdef, or fold them. Gate every new fit in the Finder on icon integrity.
-- **CD-detach gating law** (MacLC 2026-07-30): a CUE/CHD attached AT BOOT can
-  hang intermittently on ANY build, including known-good ones — never treat a
-  boot-attach hang as a build verdict. For gating: detach the CD from the boot
-  config (`mv /media/fat/config/MacIIvi.s4` aside), boot, judge, then remount.
-  One boot is never a verdict; two boots of the same RBF can differ.
+- **CD-detach gating law — RETIRED by the owner 2026-08-07** ("CD booting
+  isn't causing issues anymore; this was a stale reference"): no need to
+  detach `config/MacIIvi.s4` before judging a build. Kept for history: the
+  MacLC 2026-07-30 finding was that a CUE/CHD attached at boot could hang
+  intermittently on any build. Still in force: one boot is never a verdict;
+  two boots of the same RBF can differ.
 - SCSI writes + CD reads are validated upstream (word-pairing lane-slip fix +
   look-ahead boundary REQ stall, MacLC 2026-07-29, byte-identical copies on
   HW). `verilator/scsi_bench` full sweep + `--mode gapcmds/cdvol/wbyte/wword`
