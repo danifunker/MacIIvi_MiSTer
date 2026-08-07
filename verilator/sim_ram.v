@@ -90,7 +90,11 @@ always @(posedge clk) begin
 	end
 end
 
-// Video burst port model
+// Video burst port model. Rate: one word per 2 clk = the real controller's
+// alternate-window 4-word-group average. No oe/we gate since the v2
+// redundant-window release (sdram.v): a held cpu op only costs video its
+// FIRST window, which this average already absorbs — tb_sdram_vid's chip-
+// model bench carries the honest per-window contention.
 wire [25:0] vid_eff = (module_sz == 2'd1) ? {2'b00, vid_addr[23:0]} :
                       (module_sz == 2'd2) ? {1'b0,  vid_addr[24:0]} :
                                             vid_addr;
@@ -98,7 +102,7 @@ reg vid_ph = 1'b0;
 initial begin vid_tog = 1'b0; vid_dseq = 1'b0; vid_data = 16'h0000; end
 always @(posedge clk) begin
 	vid_ph <= ~vid_ph;
-	if (vid_rd && vid_ph && !(oe || we)) begin
+	if (vid_rd && vid_ph) begin
 		vid_data <= mem[vid_eff];
 		vid_dseq <= vid_seq;
 		vid_tog  <= ~vid_tog;

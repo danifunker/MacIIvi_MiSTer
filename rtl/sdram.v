@@ -195,6 +195,24 @@ reg [25:0] dout_addr;
 reg        dout_valid;
 assign ram_ready = dout_valid && (dout_addr == addr);
 
+// Redundant-window release (Option A v2, 2026-08-07 HW finding): a 68030 bus
+// cycle holds oe/we presented across 2-3 command windows while only the first
+// window's execution matters — the extra windows used to re-execute the op
+// idempotently, and under a drawing-loop workload that occupancy starved the
+// video port to ~73% of each scanline (frozen right-edge band on hardware).
+// Track write completion the same way read completion is tracked (address
+// AND data compared — a back-to-back write of different data to the same
+// address never matches, so it executes), and release a window whose
+// presented op is already served. Only provably-redundant re-executions are
+// skipped: the first window of every op still executes it, so every existing
+// completion contract (slot-start DTACK, ext 3-edge write count, PMMU-walk
+// ram_ready wait) holds unchanged.
+reg [25:0] wr_done_addr;
+reg [15:0] wr_done_din;
+reg        wr_done_valid;
+wire wr_served = wr_done_valid && (wr_done_addr == addr) && (wr_done_din == din);
+wire cpu_window_needed = (we && !wr_served) || (oe && !ram_ready);
+
 // ---- video burst port state (Option A) ------------------------------------
 // vid_* inputs are launched from clk_sys registers; clk_sys and clk_64 come
 // from the same PLL (2:1), so a single clk_64 sampling register is a timed
@@ -268,6 +286,7 @@ always @(posedge clk_64) begin
 
 	if(reset != 0) begin
 		dout_valid <= 1'b0;
+		wr_done_valid <= 1'b0;
 		vid_win    <= 1'b0;
 		vid_win_d  <= 1'b0;
 		vid_q_cnt  <= 3'd0;
@@ -307,12 +326,12 @@ always @(posedge clk_64) begin
 		// RAS phase
 		// -------------------  cpu/chipset read/write ----------------------
 		if(t == STATE_CMD_START) begin
-			{oe_latch, we_latch} <= {oe, we};
+			{oe_latch, we_latch} <= cpu_window_needed ? {oe, we} : 2'b00;
 			vid_win_d <= vid_win;
 			vid_win   <= 1'b0;
 			rf_cnt    <= (rf_cnt == 5'd31) ? rf_cnt : rf_cnt + 5'd1;
 			if (we) dout_valid <= 1'b0;   // a write invalidates the read-data cache
-			if (we || oe) begin
+			if (cpu_window_needed) begin
 				// Capture the access address NOW for the CAS column (see the
 				// addr_latch comment above). A12 = addr[23] (13th row bit);
 				// nCS level = addr[25] picks the chip on 128MB modules.
@@ -393,7 +412,13 @@ always @(posedge clk_64) begin
 		if(t == STATE_CMD_CONT && (we_latch || oe_latch)) begin
 			sd_cmd <= we_latch?CMD_WRITE:CMD_READ;
 			sd_cs_r <= addr_latch[25];   // same chip as the ACTIVE row
-			if (we_latch) sd_data <= din;
+			if (we_latch) begin
+				sd_data <= din;
+				// record the served write for the window-release compare
+				wr_done_addr  <= addr_latch;
+				wr_done_din   <= din;
+				wr_done_valid <= 1'b1;
+			end
 			// always return both bytes in a read. The cpu may not
 			// need it, but the caches need to be able to store everything
 			// Column: A10=1 (auto precharge), A9=addr[24] (the 10th column

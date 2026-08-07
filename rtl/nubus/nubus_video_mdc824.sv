@@ -404,25 +404,36 @@ module nubus_video_mdc824 #(
                                 (mode == 2'd2) ? {2'b0, h_res[9:2]} :
                                                  {1'b0, h_res[9:1]};
 
-        // the line to prefetch while the current one scans out: the next
-        // visible line, or line 0 when the last raster line is scanning
-        wire [9:0]  next_line  = (v_cnt == v_total - 11'd1) ? 10'd0 : (v_cnt[9:0] + 10'd1);
-        wire        next_visible = {1'b0, next_line} < v_res;
-        wire [24:0] next_line_bytes = base_bytes + next_line * stride_bytes;
+        // the line to prefetch: TWO lines ahead of the one starting now
+        // (v2, 2026-08-07 HW finding — one line time was not enough budget
+        // under a saturating CPU; two line-times + the released-window
+        // supply in sdram.v covers 8bpp with margin), wrapping so lines
+        // 0 and 1 are fetched while raster lines v_total-2 / v_total-1 scan
+        wire [9:0]  next2_line = (v_cnt == v_total - 11'd2) ? 10'd0 :
+                                 (v_cnt == v_total - 11'd1) ? 10'd1 :
+                                 (v_cnt[9:0] + 10'd2);
+        wire        next2_visible = ({1'b0, next2_line} < v_res) &&
+                                    (v_cnt < v_res - 11'd2 || v_cnt >= v_total - 11'd2);
+        wire [24:0] next_line_bytes = base_bytes + next2_line * stride_bytes;
         // guard: only fetch lines that lie entirely inside the card's 1MB
         // (a garbage base_reg during setup must not matter — reads would be
         // harmless, but keep the address math honest)
         wire        fetch_ok = ({1'b0, next_line_bytes[24:1]} + {15'd0, line_words})
                                <= TOTAL_WORDS;
 
-        // 2-line ping-pong buffer, bank = line parity. Write side: fetch
-        // stream; read side: scanout at the pixel clock enable. Single write
-        // port + single read port -> clean M10K simple-dual-port inference
-        // (2 M10K vs the 384 the full-frame BRAM used to take).
-        (* ramstyle = "M10K" *) reg [15:0] linebuf [0:1023];
+        // 3-line rotating buffer (fills run up to two lines ahead of scan).
+        // Banks rotate 0->1->2 on the fill side per SCHEDULED fetch and on
+        // the scan side per visible line, both forced to bank 0 at line 0 /
+        // the line-0 schedule, so the two rotations re-sync every frame and
+        // stay aligned for any v_total (525 and 407 are not both mod-3
+        // friendly — arithmetic on line numbers is not). Single write port +
+        // single read port -> M10K simple dual port (4 M10K: 2048x16 with
+        // the fourth bank unused; vs the 384 the full-frame BRAM took).
+        (* ramstyle = "M10K" *) reg [15:0] linebuf [0:2047];
         reg [15:0] lb_q;
         reg [8:0]  fill_ptr;
-        reg        fill_bank;
+        reg [1:0]  fill_bank;
+        reg [1:0]  scan_bank;
         reg [9:0]  fill_words;
         reg        fill_busy;
         reg [15:0] underrun_cnt;
@@ -435,38 +446,51 @@ module nubus_video_mdc824 #(
         assign scan_words = r_words;
         assign dbg_scan_underrun = underrun_cnt;
 
+        wire [1:0] fill_bank_nxt = (next2_line == 10'd0) ? 2'd0 :
+                                   (fill_bank == 2'd2)   ? 2'd0 : fill_bank + 2'd1;
+
         always @(posedge clk) begin
             r_start <= 1'b0;
             if (reset) begin
-                fill_ptr <= 9'd0; fill_bank <= 1'b0; fill_words <= 10'd0;
+                fill_ptr <= 9'd0; fill_bank <= 2'd0; fill_words <= 10'd0;
                 fill_busy <= 1'b0; underrun_cnt <= 16'd0;
                 r_base <= 20'd0; r_words <= 10'd0;
+                scan_bank <= 2'd0;
             end else begin
                 if (scan_wr && fill_busy) begin
                     linebuf[{fill_bank, fill_ptr}] <= scan_wdata;
                     fill_ptr <= fill_ptr + 9'd1;
                     if ({1'b0, fill_ptr} + 10'd1 == fill_words) fill_busy <= 1'b0;
                 end
-                // schedule the next line's fetch at the start of every line —
-                // a full line time + hblank of budget before it scans out
-                if (clk_video_en && h_cnt == 11'd0 && next_visible && stride_reg != 32'd0) begin
-                    if (fill_busy) underrun_cnt <= underrun_cnt + 16'd1;
-                    if (fetch_ok && line_words != 10'd0) begin
-                        r_start    <= 1'b1;
-                        r_base     <= next_line_bytes[20:1];
-                        r_words    <= line_words;
-                        fill_bank  <= next_line[0];
-                        fill_ptr   <= 9'd0;
-                        fill_words <= line_words;
-                        fill_busy  <= 1'b1;
+                if (clk_video_en && h_cnt == 11'd0) begin
+                    // scan-side bank rotation for the line starting NOW
+                    if (v_cnt == 11'd0)
+                        scan_bank <= 2'd0;
+                    else if (v_cnt < v_res)
+                        scan_bank <= (scan_bank == 2'd2) ? 2'd0 : scan_bank + 2'd1;
+                    // schedule the fetch of the line TWO ahead
+                    if (next2_visible && stride_reg != 32'd0) begin
+                        if (fill_busy) underrun_cnt <= underrun_cnt + 16'd1;
+                        if (fetch_ok && line_words != 10'd0) begin
+                            r_start    <= 1'b1;
+                            r_base     <= next_line_bytes[20:1];
+                            r_words    <= line_words;
+                            fill_bank  <= fill_bank_nxt;
+                            fill_ptr   <= 9'd0;
+                            fill_words <= line_words;
+                            fill_busy  <= 1'b1;
+                        end
                     end
                 end
             end
         end
 
-        // scanout read — same registered-1-enable-late timing as port B had
+        // scanout read — same registered-1-enable-late timing as port B had.
+        // scan_bank updates on the h==0 tick of each line; the h==0 pixel's
+        // read (stale by design, see the line-buffer note) may use the old
+        // bank for one access — the pixel was never derived from live data.
         always @(posedge clk)
-            if (clk_video_en) lb_q <= linebuf[{v_cnt[0], h_byte[9:1]}];
+            if (clk_video_en) lb_q <= linebuf[{scan_bank, h_byte[9:1]}];
         assign scan_word_q = lb_q;
 
 `ifdef SIMULATION
