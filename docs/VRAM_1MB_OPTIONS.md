@@ -72,7 +72,8 @@ path past 1MB (24bpp @ 640x480 needs a 2MB card).
 | scoping doc | 060b6b4 | — | — |
 | A: SDRAM burst port | 8c60798 | sim build + check_boot montype 6/7 PASS; benches PASS; sim desktop dither pixel-perfect full-frame (fast-ramtest ROM, frames 350-650) | **HW boot 2026-08-07 (.143): System 7.5.5 → MacAtrium on the card** — content correct, no noise/tearing; right ~27% of each line froze (line-fetch shortfall under load) → v2 |
 | A v2: released windows + triple buffer | c87cafe | tb_sdram_vid saturating-cpu case: 320-word line in ~1 line-time (was starving); all correctness cases PASS | first fit FAILED STA (-8.1ns): live release compare in the T0 path |
-| A v2.1: pipelined release qualifier | 39f2abc | bench PASS (1078 clk_sys / 1860 budget); check_boot PASS; Quartus STA re-verify pending at session end | **NOT yet deployed — owner hold** |
+| A v2.1: pipelined release qualifier | 39f2abc | bench PASS (1078 clk_sys / 1860 budget); check_boot PASS | first respin -1.6ns: live din into the new wr_done_din endpoint |
+| A v2.2: registered din capture + sdc | b3ca894 + (sdc commit) | bench PASS; **STA CLOSED: 0 negative slack design-wide (clk_64 +0.823, HDMI +0.406)** — the residual -1.9 was the long-waived sd_data din-cone path on a fitter DUPLICATE register whose name escaped the sdc keeper pattern; pattern widened + same-argument MCP2 for the rls_* sampling regs | rbf 2026-08-07 18:56 = deployable artifact; **NOT deployed — owner hold** |
 | B: DDR3 backing | bf55e4a | sim build clean; check_boot PASS with +vramddr (card probes via DDR); tb_vram_ddr bench PASS | HW untested; needs its own RBF with the qsf macro |
 
 ### Open items

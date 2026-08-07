@@ -57,12 +57,36 @@ set_multicycle_path -hold  -end 1 -from [get_keepers {*TG68KdotC_Kernel*}] -to [
 # settled value, so -setup -end 2 is safe. Scope is -from clk_sys -to the
 # sd_data registers only: it does NOT touch the clk_mem->sd_data load-enable
 # (we_latch) path nor the address/command paths, which stay single-cycle.
+# The keeper pattern must also catch fitter-created DUPLICATES of the output
+# register (sd_data[N]~reg0_Duplicate_M): the 2026-08-07 VRAM work added
+# fanout on the din cone and the fitter began cloning sd_data regs — the
+# clone carried this exact already-waived path but its name escaped the
+# original ~reg0 pattern, resurfacing the known -1.9ns as a "new" violation.
 set_multicycle_path -setup -end 2 \
     -from [get_clocks {*|pll|pll_inst|altera_pll_i|general[1].*|divclk}] \
-    -to   [get_keepers {*sdram:sdram|sd_data[*]~reg0}]
+    -to   [get_keepers {*sdram:sdram|sd_data[*]~reg0*}]
 set_multicycle_path -hold  -end 1 \
     -from [get_clocks {*|pll|pll_inst|altera_pll_i|general[1].*|divclk}] \
-    -to   [get_keepers {*sdram:sdram|sd_data[*]~reg0}]
+    -to   [get_keepers {*sdram:sdram|sd_data[*]~reg0*}]
+
+# ----------------------------------------------------------------------------
+# Window-release sampling registers (Option A v2, rtl/sdram.v rls_*) — same
+# physical argument as sd_data above: rls_addr_q/rls_din_q sample the
+# clk_sys-launched addr/din cones into the 65MHz domain, and those buses only
+# change on clk_sys edges (>= 2 clk_mem periods apart), so a 1-period-late
+# capture latches the same settled value. The downstream release pipeline was
+# DESIGNED for capture skew: a window is only released after three
+# consecutive served verdicts on an op that is held stable for its whole
+# multi-window lifetime, so +/-1 cycle of sampling latency cannot create a
+# wrong release (a new op's first window always executes — rtl/sdram.v
+# comment block). Command/control and every other sdram path stay
+# single-cycle.
+set_multicycle_path -setup -end 2 \
+    -from [get_clocks {*|pll|pll_inst|altera_pll_i|general[1].*|divclk}] \
+    -to   [get_keepers {*sdram:sdram|rls_addr_q[*] *sdram:sdram|rls_din_q[*]}]
+set_multicycle_path -hold  -end 1 \
+    -from [get_clocks {*|pll|pll_inst|altera_pll_i|general[1].*|divclk}] \
+    -to   [get_keepers {*sdram:sdram|rls_addr_q[*] *sdram:sdram|rls_din_q[*]}]
 
 # ----------------------------------------------------------------------------
 # Peripheral (VPA) read-data register — SCSI read-path fit-stabilization.
