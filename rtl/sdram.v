@@ -200,11 +200,19 @@ assign ram_ready = dout_valid && (dout_addr == addr);
 // window's execution matters — the extra windows used to re-execute the op
 // idempotently, and under a drawing-loop workload that occupancy starved the
 // video port to ~73% of each scanline (frozen right-edge band on hardware).
-// Track write completion the same way read completion is tracked (address
-// AND data compared — a back-to-back write of different data to the same
-// address never matches, so it executes; a same-addr+data skip provably
-// rewrites memory's current content since every writer shares this port),
-// and release a window whose presented op is already served.
+// Track write completion the same way read completion is tracked and release
+// a window whose presented op is already served.
+//
+// The write compare is address + data + BYTE STROBES. All three are load-
+// bearing: dropping `ds` silently ate the second half of every
+// byte-write-then-other-byte pair to the same word with equal data — the
+// canonical case is a byte-wise clear loop (din 0x0000 twice, ds 01 then 10),
+// where the second write was skipped as "already served" and that byte stayed
+// stale. That shipped as v2.2 and WEDGED THE HARDWARE BOOT before any drawing
+// (2026-08-07, blank screen; the bench missed it because every write case was
+// full-word ds=11 — byte-strobe cases added). With all three compared, a skip
+// provably rewrites memory's current content for exactly the enabled lanes,
+// since every writer on this machine shares this port.
 //
 // TIMING SHAPE (the first cut put the 42-bit compare LIVE in front of the
 // T0 arbitration: cpu-EA -> compare -> command mux blew up at -8ns): the
@@ -221,9 +229,11 @@ assign ram_ready = dout_valid && (dout_addr == addr);
 // DTACK, ext 3-edge write count, PMMU-walk ram_ready wait) is unchanged.
 reg [25:0] wr_done_addr;
 reg [15:0] wr_done_din;
+reg  [1:0] wr_done_ds;
 reg        wr_done_valid;
 reg [25:0] rls_addr_q;
 reg [15:0] rls_din_q;
+reg  [1:0] rls_ds_q;
 reg        rls_oe_q, rls_we_q;
 reg        rls_raw;
 reg [1:0]  rls_cnt;
@@ -293,10 +303,12 @@ always @(posedge clk_64) begin
 	// release-qualifier pipeline (see the wr_done/rls comment block above)
 	rls_addr_q <= addr;
 	rls_din_q  <= din;
+	rls_ds_q   <= ds;
 	rls_oe_q   <= oe;
 	rls_we_q   <= we;
 	rls_raw <= (rls_we_q && wr_done_valid && (wr_done_addr == rls_addr_q)
-	                     && (wr_done_din == rls_din_q)) ||
+	                     && (wr_done_din == rls_din_q)
+	                     && (wr_done_ds  == rls_ds_q)) ||
 	           (rls_oe_q && dout_valid && (dout_addr == rls_addr_q));
 	rls_cnt <= rls_raw ? ((rls_cnt == 2'd3) ? 2'd3 : rls_cnt + 2'd1) : 2'd0;
 	vid_drain_ph <= ~vid_drain_ph;
@@ -450,6 +462,7 @@ always @(posedge clk_64) begin
 				// into a fresh fabric endpoint missed timing by -1.6ns.
 				wr_done_addr  <= addr_latch;
 				wr_done_din   <= rls_din_q;
+				wr_done_ds    <= rls_ds_q;
 				wr_done_valid <= 1'b1;
 			end
 			// always return both bytes in a read. The cpu may not
