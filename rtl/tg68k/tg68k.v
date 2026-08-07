@@ -392,16 +392,26 @@ end
 	// (berr_exception_active), where it re-samples make_berr and mistakes the SAME
 	// fault for a *second* one -> double bus fault -> cpu_halted. (The old 68000/020
 	// kernel had no double-fault detector, so holding to s_state 0 was harmless.)
+	// Only a bus error on the KERNEL'S OWN cycle may be latched for the kernel
+	// (MacLCII, walk-hold family; imported 2026-08-07 with the kernel fixes).
+	// While the PMMU walker has borrowed the bus (walk_cycle), a berr belongs to
+	// the WALKER — the kernel is frozen and its access has not been issued yet.
+	// Latching it as the kernel's own turns a walker table-fetch fault into a
+	// spurious bus error against whatever instruction happens to be mid-flight.
+	// fill_active is the same argument for a cache line fill; it is tied 0 here
+	// (USE_68030_CACHE=0), so this stays cache-free and matches LCII's
+	// expression verbatim for future syncs.
+	wire berr_kernel_cycle = berr & ~walk_cycle & ~fill_active;
 	reg berr_hold;
 	always @(posedge clk) begin
 		if (reset)
 			berr_hold <= 1'b0;
 		else if (kernel_make_berr || kernel_trap_berr || (phi1 && s_state == 0))
 			berr_hold <= 1'b0;
-		else if (berr)
+		else if (berr_kernel_cycle)
 			berr_hold <= 1'b1;
 	end
-	wire berr_held = (berr | berr_hold) & ~(kernel_make_berr | kernel_trap_berr);
+	wire berr_held = (berr_kernel_cycle | berr_hold) & ~(kernel_make_berr | kernel_trap_berr);
 
 	// 68030 cache-control taps from the kernel. These kernel outputs were
 	// previously left unconnected; they feed the cache subsystem in the generate
