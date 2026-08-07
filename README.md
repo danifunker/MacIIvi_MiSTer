@@ -143,11 +143,10 @@ commands and MiSTer's Main serves a folder on the SD card as shared storage.
 1. Put files in `games/MacIIvi/shared` on the SD card (or set `SHARED_FOLDER=` in
    `MiSTer.ini` to point elsewhere — note that this setting is global, so it will
    redirect every core that uses a shared folder).
-2. Install the client, once: the
-   [`MiSTer_BlueSCSI_Toolbox` disk image from the Mac LC core](https://github.com/danifunker/MacLC_MiSTer/tree/master/releases)
-   works unchanged. Put the `.hda` in your `MacIIvi` folder and mount it with
-   **Mount SCSI-1** (the secondary drive). It appears on the desktop — copy its contents
-   to a folder on your boot volume, then unmount it; you won't need it again.
+2. Install the client, once: put
+   [`releases/BlueSCSI Toolkit for MiSTer.dsk`](releases/) in your `MacIIvi` folder and
+   mount it with **Mount Floppy**. Copy its contents to your boot volume, then eject;
+   you won't need it again.
 3. Run **BlueSCSI SD Transfer** from that folder. It lists the shared folder:
    **Download** copies a file to the Mac, and **File → Upload File** copies one
    back to the SD card.
@@ -211,20 +210,15 @@ running Mac notices ejects, inserts, and swaps on its own — no reset needed.
 
 The natural flow is the real-Mac one:
 
-- **Multi-disk installers just work.** The installer ejects the disk itself and asks
-  for the next one; mount the requested image in the OSD and the installation
-  continues.
 - **In the Finder, eject first** — drag the floppy to the Trash (the Mac ejects it and
   the drive really empties), then mount the next image in the OSD. The new disk is
   picked up within a couple of seconds and mounts as itself.
 - Mounting a *different* image over a still-mounted one (no eject) is the equivalent
   of yanking a disk out of a real drive mid-use: the Mac sees its volume vanish. It
-  copes, but may complain — real Macs never experience this (their drives only eject
-  under software control), so prefer the eject-first flow.
+  copes, but may complain, so prefer the eject-first flow.
 
-> The floppy subsystem is shared, byte-for-byte, with the Mac LC core, where booting from
-> floppy and a complete two-disk System install were verified on hardware. On the IIvi it
-> has had less hardware time — please report anything that misbehaves.
+Booting from a floppy works: mount a bootable image at the flashing-`?` screen and the
+ROM picks it up within a few seconds.
 
 ## PRAM / NVRAM
 
