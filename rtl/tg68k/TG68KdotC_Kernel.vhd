@@ -1558,7 +1558,17 @@ ALU: TG68K_ALU
    regin_out <= regin;
 
 
-	nWr <= '0' WHEN state="11" AND pmmu_busy='0' ELSE '1';
+	-- BUG #428 FIX (completed 2026-07-11): also gate nWr with pmmu_fault, matching
+	-- nUDS/nLDS below. The original BUG #428 fix masked the DATA strobes on a
+	-- faulting write but left nWr asserting, so a pmmu_fault mid-write drove a
+	-- write command onto the bus with both byte lanes masked = the intended write
+	-- SILENTLY DROPPED (memory keeps its stale value) instead of the cycle aborting
+	-- cleanly to berr-and-retry. When the dropped write is a stack push (a return
+	-- address), the later RTS returns to a stale/garbage PC and the CPU derails
+	-- into low-RAM garbage = the POP palette-burst death-flash. Gating nWr too
+	-- suppresses the whole faulting write cycle so the 68030 retries it after the
+	-- fault clears and it commits correctly.
+	nWr <= '0' WHEN state="11" AND pmmu_busy='0' AND pmmu_fault='0' ELSE '1';
 	-- Suppress bus cycles only for odd instruction fetch address errors before AS* assertion.
 	busstate <= "01" WHEN (state="00" AND TG68_PC(0)='1') OR pmmu_busy='1' ELSE state;
 	nResetOut <= '0' WHEN exec(opcRESET)='1' ELSE '1';
@@ -1774,7 +1784,14 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 			IF Reset='1' THEN
 				rte_format_word <= (others => '0');
 			ELSIF clkena_in='1' THEN
-				IF micro_state = rte3 AND next_micro_state = rte4 THEN
+				-- POP death-flash FIX (2026-07-11, walk-hold family): micro_state is
+				-- clkena_lw-frozen, so if the rte3 format-word read stalls on a PMMU
+				-- walk this latch re-fires every walk edge with data_in = walker
+				-- descriptor words, and rte4 consumes it at the completion edge
+				-- before the same-edge true re-latch → garbage frame format →
+				-- misunwound RTE. Hold during CPU-access walk stalls.
+				IF micro_state = rte3 AND next_micro_state = rte4
+				   AND NOT (pmmu_busy='1' AND (state="00" OR state(1)='1')) THEN
 					rte_format_word <= data_in;
 				END IF;
 			END IF;
@@ -3316,7 +3333,32 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 		-- BUG #369 FIX: Also exclude ptest1/pflush1/pload1 - same stale opcode problem.
 		-- When these states retire with setstate="00", state is still "01" from the stall cycle,
 		-- causing opcode <= last_opc_read (stale extension word) instead of data_read (next instr).
-		IF (setstate="00" OR (setstate="01" AND fline_context_valid='1')) AND next_micro_state=idle AND setnextpass='0' AND (exec_write_back='0' OR state="11") AND set_rot_cnt="000001" AND set_exec(opcCHK)='0' AND (micro_state /= pmmu_dn_read_wait OR state="00") AND micro_state /= pmove_decode AND micro_state /= pmove_mem_to_mmu_hi AND micro_state /= pmove_mem_to_mmu_lo AND micro_state /= pmove_mmu_to_mem_hi AND micro_state /= pmove_mmu_to_mem_lo AND micro_state /= ptest1 AND micro_state /= pflush1 AND micro_state /= pload1 AND cpu_halted='0' THEN
+		-- POP death-flash FIX (2026-07-11, 6th walk-hold family member — THE ROOT of
+		-- the "ILLEGAL on a byte-clean instruction stream" derail face): these
+		-- boundary strobes (setendOPC/setinterrupt/setopcode) are combinational off
+		-- clkena_lw-frozen state, so once true they stay true through EVERY
+		-- clkena_in edge of a PMMU walk stall — and the raw-clkena_in latches they
+		-- drive re-fire each walk edge. The killer: `opcode <= data_read(15:0)`
+		-- (state="00" arm), where data_read's low word is combinationally LIVE
+		-- data_in = the WALKER'S PAGE-TABLE DESCRIPTOR WORDS. A fetch-stall walk
+		-- (e.g. the loop's own code page evicted from the ATC by a cross-page copy
+		-- streaming both pointers — exactly POP's screen transitions) streams
+		-- descriptor halves into `opcode`; at the walk-completion edge the
+		-- clkena_lw-domain decode consumes `opcode` BEFORE the same-edge re-latch
+		-- of the true word (VHDL signal semantics), decoding a descriptor word →
+		-- ILLEGAL/F-line/A-line trap while the fetched bytes in RAM are pristine
+		-- (HW fetch-ring capture 2026-07-11 18:25: four clean move.b/dbra
+		-- iterations at $9BD52, then the trap — no wild jump, no garbage fetch).
+		-- Gate the whole boundary block with the family hold: no instruction
+		-- boundary may commit on a walk-stall edge. The strobes' frozen inputs
+		-- persist, so the boundary fires once at the first non-busy edge, where
+		-- data_read carries the true replayed fetch. Delayed-not-blocked also for
+		-- setinterrupt (IRQ/berr/pmmu_fault dispatch: a mid-walk fault drops
+		-- pmmu_busy when the walker aborts, then dispatches one edge later).
+		-- state="01" walks (PTEST/PFLUSH/PLOAD deliberate translations) are
+		-- excluded by the condition, same as every prior family member.
+		IF (setstate="00" OR (setstate="01" AND fline_context_valid='1')) AND next_micro_state=idle AND setnextpass='0' AND (exec_write_back='0' OR state="11") AND set_rot_cnt="000001" AND set_exec(opcCHK)='0' AND (micro_state /= pmmu_dn_read_wait OR state="00") AND micro_state /= pmove_decode AND micro_state /= pmove_mem_to_mmu_hi AND micro_state /= pmove_mem_to_mmu_lo AND micro_state /= pmove_mmu_to_mem_hi AND micro_state /= pmove_mmu_to_mem_lo AND micro_state /= ptest1 AND micro_state /= pflush1 AND micro_state /= pload1 AND cpu_halted='0'
+		   AND NOT (pmmu_busy='1' AND (state="00" OR state(1)='1')) THEN
 			setendOPC <= '1';
 			-- BUG #400 FIX: Also check pmmu_fault directly (not just make_berr) for immediate
 			-- bus error dispatch. make_berr is registered and won't reflect pmmu_fault until
@@ -3508,41 +3550,55 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					-- BUG #53 FIX: Move extension word capture to clkena_in block (1-stage pipeline)
 					-- Previously in clkena_lw block, which never executed for PMOVE memory EA modes!
 					-- PMOVE memory EA sets memmask="100111" → clkena_lw='0' → brief never captured
-					IF getbrief='1' THEN
-						IF next_micro_state = pmove_decode AND fline_context_valid='0' AND clkena_lw='0' THEN
-							-- After PMMU translation resumes an instruction fetch, the first
-							-- F-line extension word can already be on the bus while data_read
-							-- still holds the opcode word from the previous fetch. Capture the
-							-- live bus word so PMOVE/PFLUSH/PTEST/PLOAD decode sees the real
-							-- extension instead of reusing the opcode.
-							brief <= data_in;
-						ELSIF state(1)='1' THEN
-							brief <= last_opc_read(15 downto 0);
-						ELSE
-							brief <= data_read(15 downto 0);
-						END IF;
-						-- MOVEC is especially sensitive to extension-word timing on real
-						-- hardware. Latch the control-register selector alongside the
-						-- extension word so movec1 never decodes a transient/stale brief.
-						IF next_micro_state = movec1 THEN
-							IF state(1)='1' THEN
-								movec_regsel <= last_opc_read(11 downto 0);
+					-- POP death-flash FIX (2026-07-11, walk-hold family, sibling of the
+					-- boundary-strobe gate above): getbrief is combinational off frozen
+					-- decode state, so a walk stall re-latches `brief` every clkena_in
+					-- edge — and the state(1)='0' arm samples data_read whose low word
+					-- is LIVE data_in = walker descriptor words. The clkena_lw-domain
+					-- decode then consumes `brief` at the walk-completion edge BEFORE
+					-- the same-edge re-latch of the true word → garbage extension word
+					-- → wild effective address (the amok-copy face of the derail).
+					-- Hold both brief latches during CPU-access walk stalls; they fire
+					-- once at the first non-busy edge with the true replayed data. The
+					-- :BUG #53 clkena_lw='0' PMOVE arm keeps its memmask-window intent
+					-- (pmmu_busy='0' there in the non-walk case it was built for).
+					IF NOT (pmmu_busy='1' AND (state="00" OR state(1)='1')) THEN
+						IF getbrief='1' THEN
+							IF next_micro_state = pmove_decode AND fline_context_valid='0' AND clkena_lw='0' THEN
+								-- After PMMU translation resumes an instruction fetch, the first
+								-- F-line extension word can already be on the bus while data_read
+								-- still holds the opcode word from the previous fetch. Capture the
+								-- live bus word so PMOVE/PFLUSH/PTEST/PLOAD decode sees the real
+								-- extension instead of reusing the opcode.
+								brief <= data_in;
+							ELSIF state(1)='1' THEN
+								brief <= last_opc_read(15 downto 0);
 							ELSE
-								movec_regsel <= data_read(11 downto 0);
+								brief <= data_read(15 downto 0);
+							END IF;
+							-- MOVEC is especially sensitive to extension-word timing on real
+							-- hardware. Latch the control-register selector alongside the
+							-- extension word so movec1 never decodes a transient/stale brief.
+							IF next_micro_state = movec1 THEN
+								IF state(1)='1' THEN
+									movec_regsel <= last_opc_read(11 downto 0);
+								ELSE
+									movec_regsel <= data_read(11 downto 0);
+								END IF;
 							END IF;
 						END IF;
-					END IF;
 
-					-- pmmu_ld_AnXn1 brief latch: For PMOVE (d8,An,Xn) mode,
-					-- the EA brief extension word was fetched during the state="00"
-					-- bus cycle alongside pmove_decode.  During pmove_decode, state="00"
-					-- so data_read has the current bus data (the EA brief word).
-					-- last_opc_read still has the PREVIOUS cycle's value (the PMOVE
-					-- extension word) because it hasn't been updated yet at this point
-					-- in the process (clkena_lw block updates it at line 2542).
-					-- Use data_read, matching the getbrief mechanism for state(1)='0'.
-					IF micro_state = pmove_decode AND next_micro_state = pmmu_ld_AnXn1 THEN
-						brief <= data_read(15 downto 0);
+						-- pmmu_ld_AnXn1 brief latch: For PMOVE (d8,An,Xn) mode,
+						-- the EA brief extension word was fetched during the state="00"
+						-- bus cycle alongside pmove_decode.  During pmove_decode, state="00"
+						-- so data_read has the current bus data (the EA brief word).
+						-- last_opc_read still has the PREVIOUS cycle's value (the PMOVE
+						-- extension word) because it hasn't been updated yet at this point
+						-- in the process (clkena_lw block updates it at line 2542).
+						-- Use data_read, matching the getbrief mechanism for state(1)='0'.
+						IF micro_state = pmove_decode AND next_micro_state = pmmu_ld_AnXn1 THEN
+							brief <= data_read(15 downto 0);
+						END IF;
 					END IF;
 
 					-- BUG #318/322 FIX: MOVES indexed mode (d8,An,Xn) brief loading

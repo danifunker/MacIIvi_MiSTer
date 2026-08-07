@@ -137,7 +137,10 @@ int main(int argc, char** argv, char** env) {
         return VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__regfile[15 - i];
     };
     // USP storage. The kernel's `usp` is a wire fed by an internal register that
-    // ghdl names n15135 (`assign usp = n15135;` in TG68KdotC_Kernel.v). The
+    // ghdl names n16619_q (`assign usp = n16619_q;` in TG68KdotC_Kernel.v). The
+    // name is POSITIONAL and changes on every reconvert — re-derive with
+    //   grep "assign usp = " rtl/tg68k/TG68KdotC_Kernel.v
+    // and update tg68k_tests.vlt to match. (n15135 -> n16595_q -> n16619_q.) The
     // bench runs in supervisor mode, so USP must be injected separately from the
     // A-regs. If a reconvert renames it, re-derive from that assign and update.
     //
@@ -147,7 +150,7 @@ int main(int argc, char** argv, char** env) {
     // (CCR/D/A/PC/SR) is correct. A proper fix needs a debug-load port on the
     // kernel or a MOVEC-based USP preamble. The non-USP census is the real one.
     auto set_usp = [](uint32_t v) {
-        VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__n15135 = v;
+        VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__n16619_q = v;
     };
 
     // ---- Register-path probe (--probe-regs) ---------------------------
