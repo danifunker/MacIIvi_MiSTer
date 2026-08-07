@@ -442,9 +442,14 @@ always @(posedge clk_64) begin
 			sd_cs_r <= addr_latch[25];   // same chip as the ACTIVE row
 			if (we_latch) begin
 				sd_data <= din;
-				// record the served write for the window-release compare
+				// record the served write for the window-release compare.
+				// The data field comes from the stage-1 sample (rls_din_q),
+				// NOT live din: identical value here (din only changes on
+				// clk_sys edges = even t phases, so the T1 sample equals the
+				// T2 value) but register-to-register — the live din cone
+				// into a fresh fabric endpoint missed timing by -1.6ns.
 				wr_done_addr  <= addr_latch;
-				wr_done_din   <= din;
+				wr_done_din   <= rls_din_q;
 				wr_done_valid <= 1'b1;
 			end
 			// always return both bytes in a read. The cpu may not
