@@ -131,7 +131,15 @@ reg  [7:0] pc_out;  // 8 bits for port test (only lower 4 bits used for actual I
 // not). Inference additionally required the PRAM boot-copy below to become a
 // sequential one-byte-per-cycle engine — a 256-parallel-write burst is not a
 // RAM port. Same recipe as m10k-repack tier 1 (2026-07-18).
-(* ramstyle = "MLAB" *) reg  [7:0] intram[0:367];    // Internal RAM: intram[x] = CPU addr 0x90+x (RAM at 0x90-0x1FF)
+//
+// no_rw_check (2026-08-08): the plain MLAB attribute was NOT enough for
+// intram — quartus_map kept it as registers ("uninferred due to unsupported
+// read-during-write behavior", Info 276009) and only pram converted, so the
+// ~2.9k-register block stayed in ALMs. The waiver is safe by construction:
+// the HC05 never reads and writes the same address in one cycle, the CPU
+// cen is gated during the PRAM boot-copy, and the pram mirror path never
+// reads intram. Proven in MacLC branch egret-alm-and-reboot-video.
+(* ramstyle = "MLAB, no_rw_check" *) reg  [7:0] intram[0:367];    // Internal RAM: intram[x] = CPU addr 0x90+x (RAM at 0x90-0x1FF)
 reg  [7:0] ram_dout;
 
 // ROM
@@ -139,7 +147,7 @@ reg  [7:0] rom[0:8191];  // 2^13 to match 13-bit rom_addr width (only 4352 bytes
 reg  [7:0] rom_dout;
 
 // PRAM storage (256 bytes loaded from disk)
-(* ramstyle = "MLAB" *) reg  [7:0] pram[0:255];
+(* ramstyle = "MLAB, no_rw_check" *) reg  [7:0] pram[0:255];
 reg        pram_loaded;
 reg        pc_bit3_prev;        // (legacy; PC3 edge no longer gates the boot-copy)
 
