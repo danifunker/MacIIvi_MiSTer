@@ -101,8 +101,21 @@ path past 1MB (24bpp @ 640x480 needs a 2MB card).
 - deploy_screenshot.sh gates on Fitter status only — it would have shipped
   the STA-failed v2 fit. Consider adding an sta.summary "no negative
   slack" check.
-- 24bpp mode plumbing (RAMDAC mode 0xD) is still mapped to 8bpp in the
-  card; the 1MB framebuffer it needs is now fully scannable — follow-up.
+- 24bpp ("Millions") is OFFERED by the (real, byte-verified) 8•24 DeclROM
+  but NOT implemented — first HW session on B confirmed selecting it shows
+  deterministic garbage and sprays stray single-word writes that persist
+  as specks after switching back (hw_gate/boot3_t5.png + zoom_artifact_*).
+  MAME 0.288 nubus_48gc.cpp is the spec: control bit 2 switches the CPU
+  aperture to a PACKED view (rgb_pack/rgb_unpack — 4-byte XRGB CPU ops
+  stored as 3 bytes), so 640x480 Millions = 900KB and genuinely fits the
+  1MB card (VRAM_MAX comment: "chip supports 2M but card can only use
+  1M"); RAMDAC mode 0xD is the matching 3-byte/pixel scanout. Our RTL has
+  neither half: ctrl bit 2's view switch is ignored (writes land at
+  4/3-scaled addresses, tail past 1MB acked-and-dropped) and mode 0xD
+  falls through to 8bpp decode (nubus_video_mdc824.sv:249). Implementing
+  it needs ~3x the 8bpp fetch rate (960 words/line) — comfortable on the
+  Option B DDR path, NOT feasible on Option A's sdram port. Direct-mode
+  base/stride scaling differs too (base <<6, stride <<3 vs <<5/<<2).
 - The h==0 pixel column renders from stale buffer data by design (was
   port-B prefetch-during-blank garbage before, black now); invisible on
   real monitors' overscan, cosmetic in sim screenshots.
