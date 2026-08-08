@@ -401,6 +401,10 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 # option-B netlist (8bc03cb, DDR card VRAM + release swept): 2 -> -0.175
 # TNS -3.3, 5 -> -0.106 TNS -0.106, 4 -> +0.123 ALL MET. HDMI-scaler-only
 # throughout; clk_sys stayed >= +2.1. SEED left at 4.
+# 24bpp netlist (5a6592d, no pad): 4 -> -0.048, 2 -> -0.008. Superseded.
+# RELEASE netlist (8b43331 = B-shape trim + tripwire + 4:3 aspect, 50ps
+# HDMI pad now ACTIVE in the sdc): 2 -> +0.003 PADDED (~+0.053 raw) all
+# met FIRST ROLL; ALM 96% (port trim bought ~400), RAM 144/553. SEED 2.
 # Per-fit law: every netlist change is a fresh roll — re-sweep, don't assume.
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION OFF
