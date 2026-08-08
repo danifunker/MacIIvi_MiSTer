@@ -54,7 +54,7 @@ set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 # 880, cdrom_target 4.8k vs 5.8k, egret ~5.1k both) — the overflow is device
 # fullness, not a port regression. HIGH = maximum register packing density.
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT HIGH
-set_global_assignment -name SEED 2
+set_global_assignment -name SEED 4
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -390,6 +390,9 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 # clk_sys +1.65); sweep hit first roll: 2 -> +0.109 all met, 522/553 M10K.
 # family-sync netlist (ae54950): 2 -> +0.205 worst all met FIRST ROLL (HDMI
 # setup +0.313, clk_sys +1.77); ALM 94%->97% (vol LUT + interp + anchor).
+# option-B netlist (8bc03cb, DDR card VRAM + release swept): 2 -> -0.175
+# TNS -3.3, 5 -> -0.106 TNS -0.106, 4 -> +0.123 ALL MET. HDMI-scaler-only
+# throughout; clk_sys stayed >= +2.1. SEED left at 4.
 # Per-fit law: every netlist change is a fresh roll — re-sweep, don't assume.
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION OFF
