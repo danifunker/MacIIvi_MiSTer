@@ -405,6 +405,9 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 # RELEASE netlist (8b43331 = B-shape trim + tripwire + 4:3 aspect, 50ps
 # HDMI pad now ACTIVE in the sdc): 2 -> +0.003 PADDED (~+0.053 raw) all
 # met FIRST ROLL; ALM 96% (port trim bought ~400), RAM 144/553. SEED 2.
+# egret no_rw_check netlist (intram finally infers, -2,994 registers):
+# 2 -> +0.096 PADDED (~+0.146 raw) all met FIRST ROLL; ALM 94%. The
+# headroom visibly de-knifed the HDMI edge. SEED stays 2.
 # Per-fit law: every netlist change is a fresh roll — re-sweep, don't assume.
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION OFF
