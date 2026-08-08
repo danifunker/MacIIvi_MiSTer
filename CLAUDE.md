@@ -166,6 +166,11 @@ rows, MAME-captured + IIcx-silicon-adjudicated). The tg68k Verilator bench:
   to the mdc824).
 - `rtl/nubus/` — Mac II NuBus arbiter + mdc824/toby/highres cards (from
   lbmactwo; integration pending).
+- OSD "Original" aspect is TRUE 4:3 (both machine modes are 4:3). The
+  256:171 it replaced (2026-08-08) was a Mac Plus 512x342 leftover that
+  blanked 5:4 panels via integer-scale width overflow —
+  `scripts/aspect_check.py` is the offline gate (video_freak is never
+  simulated); run it whenever the video_freak instance or AR values move.
 - `rtl/tg68k/` — the pinned 68030+PMMU CPU (VHDL sources → ghdl-converted .v
   via `conv_lf.sh`; see how-to-convert-cpu.txt).
 - `rtl/sdram.v` — SDR SDRAM controller (16-bit words; 25-bit addressing for
