@@ -334,9 +334,14 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/nubus_video_mdc824.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/mdc_scan_fetch.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/mdc_vram_ddr.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/vram_ram.sv
-# Option B (docs/VRAM_1MB_OPTIONS.md): uncomment to move the card VRAM from
-# the SDRAM window onto the HPS DDR3 channel instead.
-# set_global_assignment -name VERILOG_MACRO "MDC_VRAM_DDR=1"
+# Option B (docs/VRAM_1MB_OPTIONS.md): card VRAM lives on the HPS DDR3
+# channel instead of the SDRAM window. The two macros move TOGETHER: with
+# the video port idle, sdram.v's window-release mechanism buys nothing and
+# is unvalidated on hardware (the v2.2 wedge —
+# docs/resume_2026-08-07_vram_1mb.md), so B builds compile it out and run
+# the pre-release controller. Comment both out to fall back to Option A.
+set_global_assignment -name VERILOG_MACRO "MDC_VRAM_DDR=1"
+set_global_assignment -name VERILOG_MACRO "SDRAM_NO_WIN_RELEASE=1"
 set_global_assignment -name VERILOG_FILE rtl/floppy_track_encoder.v
 set_global_assignment -name VERILOG_FILE rtl/floppy.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ps2_kbd.sv

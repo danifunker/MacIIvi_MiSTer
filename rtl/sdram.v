@@ -238,7 +238,17 @@ reg        rls_oe_q, rls_we_q;
 reg        rls_raw;
 reg [1:0]  rls_cnt;
 wire       rls_ok = (rls_cnt == 2'd3);
+`ifdef SDRAM_NO_WIN_RELEASE
+// Paired with MDC_VRAM_DDR in MacIIvi.qsf: with card VRAM on DDR3 the video
+// port never fires, so a released window buys nothing — and the release is
+// unvalidated on hardware (the v2.2 wedge; docs/resume_2026-08-07_vram_1mb.md
+// §4.4). Compile it out: every presented-op window executes, as in the
+// HW-proven pre-release controller. The rls_*/wr_done_* pipeline above loses
+// all fanout and is swept by synthesis.
+wire cpu_window_needed = (we || oe);
+`else
 wire cpu_window_needed = (we || oe) && !rls_ok;
+`endif
 
 // ---- video burst port state (Option A) ------------------------------------
 // vid_* inputs are launched from clk_sys registers; clk_sys and clk_64 come
