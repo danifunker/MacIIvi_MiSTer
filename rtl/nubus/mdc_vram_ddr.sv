@@ -80,13 +80,32 @@ module mdc_vram_ddr #(
 	// card word offset matters here.
 	wire [19:0] vid_word = vid_addr[19:0];
 
-	// ---- scan stream FIFO (one burst deep: 64 words) -----------------------
-	reg [15:0] sfifo [0:63];
-	reg [5:0]  sf_wr, sf_rd;
-	reg [6:0]  sf_cnt;
-	reg        sf_seq;          // seq tag of the words in the FIFO
-	reg [1:0]  sf_skip;         // leading words of beat 0 to drop (alignment)
-	reg [6:0]  sf_expect;       // words the burst will deliver after skip
+	// ---- scan stream FIFO: one 64-bit entry per BEAT (single write port so
+	// it infers MLAB/M10K — the word-wide 4-write-port first cut became ~1K
+	// registers + two 64:1 mux trees and overflowed the device) -------------
+	reg [63:0] bfifo [0:15];
+	reg [3:0]  bf_wr, bf_rd;
+	reg [4:0]  bf_cnt;
+	reg        sf_seq;          // seq tag of the burst in the FIFO
+	reg [1:0]  burst_skip;      // words to drop from the burst's first beat
+	                            // (line starts are word-even in every mode,
+	                            // so this is 0 or 2 — never odd)
+
+	// two-stage serve pipeline: bf_q shows the FIFO head a clock ahead,
+	// cur_beat unpacks it at up to two words per clock
+	reg [63:0] bf_q;
+	reg        bf_q_valid;
+	reg [63:0] cur_beat;
+	reg [2:0]  cur_rem;         // words left in cur_beat
+	reg [1:0]  cur_idx;
+	reg        skip_used;       // burst_skip consumed (first beat served)
+	wire [15:0] cw0 = (cur_idx == 2'd0) ? cur_beat[15:0]  :
+	                  (cur_idx == 2'd1) ? cur_beat[31:16] :
+	                  (cur_idx == 2'd2) ? cur_beat[47:32] : cur_beat[63:48];
+	wire [15:0] cw1 = (cur_idx == 2'd0) ? cur_beat[31:16] :
+	                  (cur_idx == 2'd1) ? cur_beat[47:32] : cur_beat[63:48];
+	wire [1:0]  serve_n  = (cur_rem >= 3'd2) ? 2'd2 : {1'b0, cur_rem[0]};
+	wire        scan_drained = (bf_cnt == 5'd0) && !bf_q_valid && (cur_rem == 3'd0);
 
 	// group handshake (same rule as sdram.v): a new burst starts only when
 	// the client consumed the previous group (vid_addr caught up) or
@@ -114,39 +133,75 @@ module mdc_vram_ddr #(
 	reg        ext_done;                   // completion level for the held request
 	assign ext_ready = ext_done;
 
-	// serve the stream out of the FIFO — two words per tog when available
-	// (line starts are word-even in every mode, so after the even-sized
-	// skip-adjusted first beat the count stays even and pairs dominate)
+	// serve the stream — a pair per clock out of the staged beat. With the
+	// even-skip invariant the first beat holds 2 or 4 words and every later
+	// beat holds 4, so the single-word arm is defensive only.
 	always @(posedge clk) begin
 		if (reset) begin
-			sf_rd   <= 6'd0;
-			vid_tog <= 1'b0;
-			vid_dseq<= 1'b0;
-			vid_pair<= 1'b0;
-		end else if (sf_cnt >= 7'd2) begin
-			vid_data  <= sfifo[sf_rd];
-			vid_data2 <= sfifo[sf_rd + 6'd1];
-			vid_pair  <= 1'b1;
-			vid_dseq  <= sf_seq;
-			vid_tog   <= ~vid_tog;
-			sf_rd     <= sf_rd + 6'd2;
-		end else if (sf_cnt != 7'd0) begin
-			vid_data <= sfifo[sf_rd];
-			vid_pair <= 1'b0;
-			vid_dseq <= sf_seq;
-			vid_tog  <= ~vid_tog;
-			sf_rd    <= sf_rd + 6'd1;
+			bf_rd      <= 4'd0;
+			bf_q_valid <= 1'b0;
+			cur_rem    <= 3'd0;
+			cur_idx    <= 2'd0;
+			skip_used  <= 1'b0;
+			vid_tog    <= 1'b0;
+			vid_dseq   <= 1'b0;
+			vid_pair   <= 1'b0;
+		end else begin
+			// rearm the skip for the next burst once fully drained
+			if (scan_drained) skip_used <= 1'b0;
+
+			if (vid_seq != sf_seq) begin
+				// stale-burst discard: the client restarted while this
+				// burst was draining. A 1-bit seq aliases after TWO
+				// restarts, and a 64-word tail lives long enough to span
+				// them — so a stale tail must never reach vid_tog. Drop a
+				// beat per clock, no toggles.
+				cur_rem    <= 3'd0;
+				bf_q_valid <= 1'b0;
+				if (bf_cnt != 5'd0) bf_rd <= bf_rd + 4'd1;
+			end else begin
+				// serve from the current beat
+				if (cur_rem != 3'd0) begin
+					vid_data <= cw0;
+					vid_pair <= (serve_n == 2'd2);
+					if (serve_n == 2'd2) vid_data2 <= cw1;
+					vid_dseq <= sf_seq;
+					vid_tog  <= ~vid_tog;
+					cur_idx  <= cur_idx + serve_n;
+					cur_rem  <= cur_rem - {1'b0, serve_n};
+				end
+
+				// stage 2 load: take the shown beat when cur empties this
+				// clock (may override the cur_rem decrement above —
+				// intended). The burst's first beat starts at the skip
+				// offset — any alignment, per the port contract (in-system
+				// line starts are word-even, but the bench and the
+				// contract cover odd bases too).
+				if (bf_q_valid && (cur_rem == {1'b0, serve_n})) begin
+					cur_beat   <= bf_q;
+					cur_rem    <= skip_used ? 3'd4
+					                        : (3'd4 - {1'b0, burst_skip});
+					cur_idx    <= skip_used ? 2'd0 : burst_skip;
+					skip_used  <= 1'b1;
+					bf_q_valid <= 1'b0;
+				end
+
+				// stage 1 load: show the FIFO head (bf_cnt is the
+				// write-side guard, registered, so a beat pushed this edge
+				// is not read until the next — no read-during-write on the
+				// MLAB)
+				if (!bf_q_valid && bf_cnt != 5'd0) begin
+					bf_q       <= bfifo[bf_rd];
+					bf_rd      <= bf_rd + 4'd1;
+					bf_q_valid <= 1'b1;
+				end
+			end
 		end
 	end
 
-	wire [1:0] sf_pop_n = (sf_cnt >= 7'd2) ? 2'd2 :
-	                      (sf_cnt != 7'd0) ? 2'd1 : 2'd0;
-	reg  sf_push;
-	reg [2:0] sf_push_n;   // words pushed this cycle (a 64-bit beat = up to 4)
-
+	wire bf_pop_w = (bf_cnt != 5'd0) &&
+	                ((vid_seq != sf_seq) || !bf_q_valid);
 	always @(posedge clk) begin
-		sf_push   <= 1'b0;
-		sf_push_n <= 3'd0;
 		ext_rd_d  <= ext_rd;
 		ext_wr_d  <= ext_wr;
 
@@ -154,7 +209,7 @@ module mdc_vram_ddr #(
 			st <= S_IDLE;
 			ddr_rd <= 1'b0; ddr_we <= 1'b0;
 			ddr_burstcnt <= 8'd1; ddr_be <= 8'hFF;
-			sf_wr <= 6'd0; sf_cnt <= 7'd0;
+			bf_wr <= 4'd0; bf_cnt <= 5'd0;
 			expect_valid <= 1'b0;
 			ext_pend_rd <= 1'b0; ext_pend_wr <= 1'b0;
 			ext_done <= 1'b0;
@@ -172,8 +227,9 @@ module mdc_vram_ddr #(
 			end
 			if (!vid_rd) expect_valid <= 1'b0;
 
-			// FIFO count bookkeeping (push side updates below via sf_push*)
-			sf_cnt <= sf_cnt + (sf_push ? {4'd0, sf_push_n} : 7'd0) - {5'd0, sf_pop_n};
+			// FIFO count: push = a beat landing (below), pop = stage-1 load
+			bf_cnt <= bf_cnt + {4'd0, (st == S_SCAN_RDW) && ddr_dout_ready}
+			                 - {4'd0, bf_pop_w};
 
 			case (st)
 				S_IDLE: begin
@@ -195,7 +251,7 @@ module mdc_vram_ddr #(
 						ddr_rd       <= 1'b1;
 						ext_lane     <= ext_word_l[1:0];
 						st           <= S_EXT_RD;
-					end else if (vid_rd && sf_cnt == 7'd0 &&
+					end else if (vid_rd && scan_drained &&
 					             (!expect_valid || (vid_seq != expect_seq) ||
 					              (vid_word == expect_word) ||
 					              (vid_word == expect_word + 20'd1))) begin
@@ -209,9 +265,8 @@ module mdc_vram_ddr #(
 						ddr_burstcnt <= {3'd0, SCAN_QW};
 						ddr_be       <= 8'hFF;
 						ddr_rd       <= 1'b1;
-						sf_skip      <= vid_word[1:0];
+						burst_skip   <= vid_word[1:0];
 						sf_seq       <= vid_seq;
-						sf_expect    <= ({SCAN_QW, 2'b00} - {3'd0, vid_word[1:0]});
 						expect_word  <= vid_word + ({SCAN_QW, 2'b00} - {3'd0, vid_word[1:0]});
 						expect_seq   <= vid_seq;
 						expect_valid <= 1'b1;
@@ -250,33 +305,10 @@ module mdc_vram_ddr #(
 				end
 
 				S_SCAN_RDW: if (ddr_dout_ready) begin
-					// unpack the beat, dropping sf_skip leading words on beat 0
-					// (writes into the FIFO happen in the same clock; the
-					// count moves via sf_push/sf_push_n)
-					if (sf_skip == 2'd0) begin
-						sfifo[sf_wr]        <= ddr_dout[15:0];
-						sfifo[sf_wr + 6'd1] <= ddr_dout[31:16];
-						sfifo[sf_wr + 6'd2] <= ddr_dout[47:32];
-						sfifo[sf_wr + 6'd3] <= ddr_dout[63:48];
-						sf_wr <= sf_wr + 6'd4;
-						sf_push <= 1'b1; sf_push_n <= 3'd4;
-					end else if (sf_skip == 2'd1) begin
-						sfifo[sf_wr]        <= ddr_dout[31:16];
-						sfifo[sf_wr + 6'd1] <= ddr_dout[47:32];
-						sfifo[sf_wr + 6'd2] <= ddr_dout[63:48];
-						sf_wr <= sf_wr + 6'd3;
-						sf_push <= 1'b1; sf_push_n <= 3'd3;
-					end else if (sf_skip == 2'd2) begin
-						sfifo[sf_wr]        <= ddr_dout[47:32];
-						sfifo[sf_wr + 6'd1] <= ddr_dout[63:48];
-						sf_wr <= sf_wr + 6'd2;
-						sf_push <= 1'b1; sf_push_n <= 3'd2;
-					end else begin
-						sfifo[sf_wr]        <= ddr_dout[63:48];
-						sf_wr <= sf_wr + 6'd1;
-						sf_push <= 1'b1; sf_push_n <= 3'd1;
-					end
-					sf_skip <= 2'd0;
+					// whole beats go into the FIFO; the serve stage applies
+					// burst_skip to the first one
+					bfifo[bf_wr] <= ddr_dout;
+					bf_wr        <= bf_wr + 4'd1;
 					beats_left <= beats_left - 5'd1;
 					if (beats_left == 5'd1) st <= S_IDLE;
 				end
