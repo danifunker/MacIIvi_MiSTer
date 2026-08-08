@@ -19,7 +19,12 @@ set_global_assignment -name GENERATE_RBF_FILE ON
 set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
 set_global_assignment -name NUM_PARALLEL_PROCESSORS ALL
 set_global_assignment -name SAVE_DISK_SPACE OFF
-set_global_assignment -name SMART_RECOMPILE ON
+# SMART_RECOMPILE stays OFF (was ON from the original import): on 2026-08-08
+# it declared a 4-second "successful" compile that silently reused the
+# previous netlist's db — sources, macros and sdc had all changed. A release
+# flow must never be able to report success without compiling; every gate
+# downstream (STA check, deploy md5) trusted that exit code.
+set_global_assignment -name SMART_RECOMPILE OFF
 set_global_assignment -name MIN_CORE_JUNCTION_TEMP "-40"
 set_global_assignment -name MAX_CORE_JUNCTION_TEMP 100
 set_global_assignment -name POWER_PRESET_COOLING_SOLUTION "23 MM HEAT SINK WITH 200 LFPM AIRFLOW"
