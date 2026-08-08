@@ -22,7 +22,7 @@ VFLAGS="--binary --timing --timescale-override 1ns/1ns
   -Wno-PINMISSING"
 
 gen_split() {
-  python - <<'PY'
+  python3 - <<'PY'
 src = open('rtl/sdram.v').read()
 subs = [
   ("\tinout  reg [15:0]   sd_data,    // 16 bit bidirectional data bus",
