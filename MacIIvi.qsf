@@ -54,7 +54,7 @@ set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 # 880, cdrom_target 4.8k vs 5.8k, egret ~5.1k both) — the overflow is device
 # fullness, not a port regression. HIGH = maximum register packing density.
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT HIGH
-set_global_assignment -name SEED 4
+set_global_assignment -name SEED 2
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -335,13 +335,16 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/mdc_scan_fetch.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/mdc_vram_ddr.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/vram_ram.sv
 # Option B (docs/VRAM_1MB_OPTIONS.md): card VRAM lives on the HPS DDR3
-# channel instead of the SDRAM window. The two macros move TOGETHER: with
-# the video port idle, sdram.v's window-release mechanism buys nothing and
-# is unvalidated on hardware (the v2.2 wedge —
-# docs/resume_2026-08-07_vram_1mb.md), so B builds compile it out and run
-# the pre-release controller. Comment both out to fall back to Option A.
+# channel instead of the SDRAM window. The THREE macros move TOGETHER (a
+# tripwire in MacIIvi.sv enforces the pairing): with card VRAM on DDR3,
+# sdram.v's window-release mechanism buys nothing and is unvalidated on
+# hardware (the v2.2 wedge — docs/resume_2026-08-07_vram_1mb.md), and its
+# video port is dead weight (ALMs + muxes on the clk_64 arbitration), so
+# B builds compile both out and run the pre-release controller shape.
+# Comment all three out to fall back to Option A.
 set_global_assignment -name VERILOG_MACRO "MDC_VRAM_DDR=1"
 set_global_assignment -name VERILOG_MACRO "SDRAM_NO_WIN_RELEASE=1"
+set_global_assignment -name VERILOG_MACRO "SDRAM_NO_VID_PORT=1"
 set_global_assignment -name VERILOG_FILE rtl/floppy_track_encoder.v
 set_global_assignment -name VERILOG_FILE rtl/floppy.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ps2_kbd.sv

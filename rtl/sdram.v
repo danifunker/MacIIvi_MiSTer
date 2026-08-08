@@ -391,6 +391,7 @@ always @(posedge clk_64) begin
 				sd_addr <= { addr[23], addr[19:8] };
 				sd_ba <= addr[21:20];
 		// ------------------ no access: video / refresh ---------------
+`ifndef SDRAM_NO_VID_PORT
 			end else if (rf_cnt < RF_FORCE && vid_rd_m && !vid_win &&
 			             (!vid_expect_valid || (vid_seq_m != vid_expect_seq) ||
 			              (vid_addr_m == vid_expect_addr))) begin
@@ -415,6 +416,7 @@ always @(posedge clk_64) begin
 				sd_cs_r <= vid_addr_m[25];
 				sd_addr <= { vid_addr_m[23], vid_addr_m[19:8] };
 				sd_ba   <= vid_addr_m[21:20];
+`endif
 			end else begin
 				// Idle slot: refresh, alternating chips so BOTH chips of a
 				// 128MB module get their full 8192/64ms cadence (a chip-1

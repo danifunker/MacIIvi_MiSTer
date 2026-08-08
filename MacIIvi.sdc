@@ -138,3 +138,14 @@ set_clock_groups -asynchronous -group [get_clocks {emu|pllv|*|divclk}]
 # clock group above, harmless).
 set_false_path -to [get_keepers {*vmode_meta* *monid_meta* *tbyp_meta* *tsel_meta*}]
 set_false_path -to [get_keepers {*vidrst_meta* *vbl_meta* *hbl_meta*}]
+
+# HDMI-scaler closure margin (2026-08-08): the pll_hdmi divclk domain is the
+# core's documented knife-edge — seed sweeps land between roughly -0.2 and
+# +0.2 ns on it while every Mac-side domain holds >= +2. Pad its intra-domain
+# setup uncertainty by 50 ps so a sweep only ever accepts a seed with real
+# margin: a "met" report here means met by more than temperature/aging luck.
+# (-add stacks on top of derive_clock_uncertainty's jitter numbers.)
+set_clock_uncertainty -add -setup \
+    -from [get_clocks {pll_hdmi|pll_hdmi_inst|altera_pll_i|cyclonev_pll|counter[0].output_counter|divclk}] \
+    -to   [get_clocks {pll_hdmi|pll_hdmi_inst|altera_pll_i|cyclonev_pll|counter[0].output_counter|divclk}] \
+    0.050

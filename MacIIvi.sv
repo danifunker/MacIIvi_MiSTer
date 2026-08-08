@@ -30,6 +30,16 @@ module emu
 `ifndef MDC_VRAM_DDR
 	assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
 `else
+	// Macro-pairing tripwire: a B build must also compile out the sdram.v
+	// release mechanism and video port (see the MacIIvi.qsf comment). The
+	// nonexistent modules below only elaborate — loudly — if the pairing
+	// drifts.
+`ifndef SDRAM_NO_WIN_RELEASE
+	SDRAM_NO_WIN_RELEASE_must_pair_with_MDC_VRAM_DDR macro_pairing_tripwire1();
+`endif
+`ifndef SDRAM_NO_VID_PORT
+	SDRAM_NO_VID_PORT_must_pair_with_MDC_VRAM_DDR macro_pairing_tripwire2();
+`endif
 	// Option B (docs/VRAM_1MB_OPTIONS.md): the DDRAM channel carries the
 	// mdc824 card VRAM — driven by the mdc_vram_ddr adapter below.
 	assign DDRAM_CLK = clk_sys;
