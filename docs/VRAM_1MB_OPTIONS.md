@@ -101,21 +101,25 @@ path past 1MB (24bpp @ 640x480 needs a 2MB card).
 - deploy_screenshot.sh gates on Fitter status only — it would have shipped
   the STA-failed v2 fit. Consider adding an sta.summary "no negative
   slack" check.
-- 24bpp ("Millions") is OFFERED by the (real, byte-verified) 8•24 DeclROM
-  but NOT implemented — first HW session on B confirmed selecting it shows
-  deterministic garbage and sprays stray single-word writes that persist
-  as specks after switching back (hw_gate/boot3_t5.png + zoom_artifact_*).
-  MAME 0.288 nubus_48gc.cpp is the spec: control bit 2 switches the CPU
-  aperture to a PACKED view (rgb_pack/rgb_unpack — 4-byte XRGB CPU ops
-  stored as 3 bytes), so 640x480 Millions = 900KB and genuinely fits the
-  1MB card (VRAM_MAX comment: "chip supports 2M but card can only use
-  1M"); RAMDAC mode 0xD is the matching 3-byte/pixel scanout. Our RTL has
-  neither half: ctrl bit 2's view switch is ignored (writes land at
-  4/3-scaled addresses, tail past 1MB acked-and-dropped) and mode 0xD
-  falls through to 8bpp decode (nubus_video_mdc824.sv:249). Implementing
-  it needs ~3x the 8bpp fetch rate (960 words/line) — comfortable on the
-  Option B DDR path, NOT feasible on Option A's sdram port. Direct-mode
-  base/stride scaling differs too (base <<6, stride <<3 vs <<5/<<2).
+- 24bpp ("Millions") — IMPLEMENTED per the MAME 0.288 nubus_48gc.cpp jmfb
+  spec (2026-08-08, NOT yet HW-judged): ctrl bit 2 = the packed CPU
+  aperture (4-byte XRGB bus pixels <-> 3 stored bytes, X drops/reads $00,
+  640x480 = 900KB fits the 1MB card), RAMDAC mode 0xD = 3-byte/pixel
+  direct-colour scanout on the VRAM_WORDS==0 path (base <<6, stride <<3),
+  even/odd split 1024-word line-buffer banks with a 4-phase byte gather.
+  Supply chain grew a PAIR lane (2 words per tog, DDR backend only) and
+  64-word DDR bursts — 960 words/line needs ~1.034 words/clk sustained
+  and the chain now benches at ~1.28 (751 clks/line, 19% margin).
+  Byte-strobed ext/vram writes (ext_ds/vram_ds) replace RMW for packed
+  ops on every backend; linear paths keep full-word RMW unchanged. The
+  empty-slot NuBus timeout widened 32->128 clk so a 2-op packed access
+  under a DDR-busy spike can't hit the open-bus fallback. Gates: all five
+  benches PASS (tb_scan24 NEW: 24bpp gather + 8bpp regression through the
+  split buffer; tb_vram_ddr rate case; mdc_bench packed-aperture suite
+  incl. the 1MB%3 tail byte and linear 3-byte-layout cross-check).
+  BRAM/port-B configs (ONBOARD_DISPLAY, mdc_bench legacy cases) keep the
+  old 0xD->8bpp fallback by construction. Option A's sdram port cannot
+  feed 24bpp (~0.5 words/clk) — Millions is a B-only feature.
 - The h==0 pixel column renders from stale buffer data by design (was
   port-B prefetch-during-blank garbage before, black now); invisible on
   real monitors' overscan, cosmetic in sim screenshots.

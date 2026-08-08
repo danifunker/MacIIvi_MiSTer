@@ -1372,13 +1372,15 @@ module emu
 	wire [24:0] mdc_vram_addr, mdc_vram_scan_addr;
 	wire [15:0] mdc_vram_dout, mdc_vram_din, mdc_vram_scan_data;
 	wire        mdc_vram_rd, mdc_vram_wr, mdc_vram_ready, mdc_vram_scan_rd;
+	wire [1:0]  mdc_vram_ds;
 	wire        card_ext_rd, card_ext_wr;
+	wire [1:0]  card_ext_ds;
 	wire [15:0] card_ext_din;
 	wire        card_ext_ready;
-	wire        mdc_scan_start, mdc_scan_wr;
+	wire        mdc_scan_start, mdc_scan_wr, mdc_scan_wr2;
 	wire [19:0] mdc_scan_base;
 	wire [9:0]  mdc_scan_words;
-	wire [15:0] mdc_scan_wdata;
+	wire [15:0] mdc_scan_wdata, mdc_scan_wdata2;
 
 	// Card VRAM backing (docs/VRAM_1MB_OPTIONS.md Option A, 2026-08-07):
 	// DEFAULT shape = the FULL 1MB lives in the reserved SDRAM window at word
@@ -1430,9 +1432,11 @@ module emu
 		.vram_din(mdc_vram_din),
 		.vram_rd(mdc_vram_rd),
 		.vram_wr(mdc_vram_wr),
+		.vram_ds(mdc_vram_ds),
 		.vram_ready(mdc_vram_ready),
 		.ext_rd(card_ext_rd),
 		.ext_wr(card_ext_wr),
+		.ext_ds(card_ext_ds),
 		.ext_din(card_ext_din),
 		.ext_ready(card_ext_ready),
 		.vram_scan_addr(mdc_vram_scan_addr),
@@ -1443,6 +1447,8 @@ module emu
 		.scan_words(mdc_scan_words),
 		.scan_wr(mdc_scan_wr),
 		.scan_wdata(mdc_scan_wdata),
+		.scan_wr2(mdc_scan_wr2),
+		.scan_wdata2(mdc_scan_wdata2),
 		.dbg_scan_underrun(),
 		// declaration ROM is $readmemh-baked; no download path
 		.ioctl_wr(1'b0), .ioctl_addr(25'd0), .ioctl_data(16'd0),
@@ -1463,6 +1469,7 @@ module emu
 			.clk(clk_sys),
 			.addr(mdc_vram_addr),
 			.din(mdc_vram_dout),
+			.ds(mdc_vram_ds),
 			.dout(mdc_vram_din),
 			.rd(mdc_vram_rd),
 			.wr(mdc_vram_wr),
@@ -1484,9 +1491,9 @@ module emu
 	//   MDC_VRAM_DDR = Option B: the mdc_vram_ddr adapter on the HPS DDR3
 	//                  channel (same client contract; SDRAM untouched by
 	//                  card VRAM traffic, ext ops rerouted below too).
-	wire        vidp_rd, vidp_seq, vidp_dseq, vidp_tog;
+	wire        vidp_rd, vidp_seq, vidp_dseq, vidp_tog, vidp_pair;
 	wire [25:0] vidp_addr;
-	wire [15:0] vidp_data;
+	wire [15:0] vidp_data, vidp_data2;
 
 	mdc_scan_fetch #(.SDRAM_BASE(26'h0100000)) mdc_fetch (
 		.clk(clk_sys),
@@ -1496,12 +1503,16 @@ module emu
 		.words(mdc_scan_words),
 		.wvalid(mdc_scan_wr),
 		.wdata(mdc_scan_wdata),
+		.wvalid2(mdc_scan_wr2),
+		.wdata2(mdc_scan_wdata2),
 		.vid_rd(vidp_rd),
 		.vid_addr(vidp_addr),
 		.vid_seq(vidp_seq),
 		.vid_data(vidp_data),
 		.vid_dseq(vidp_dseq),
-		.vid_tog(vidp_tog)
+		.vid_tog(vidp_tog),
+		.vid_pair(vidp_pair),
+		.vid_data2(vidp_data2)
 	);
 
 	wire        sdram_vid_dseq, sdram_vid_tog;
@@ -1519,6 +1530,8 @@ module emu
 	assign vidp_data = sdram_vid_data;
 	assign vidp_dseq = sdram_vid_dseq;
 	assign vidp_tog  = sdram_vid_tog;
+	assign vidp_pair = 1'b0;          // sdram.v never pairs
+	assign vidp_data2 = 16'd0;
 `endif
 
 	// Empty-slot open bus: slots $C/$D (and any slot cycle the card doesn't
@@ -1528,13 +1541,17 @@ module emu
 	// no arbiter-timeout BERR here). Was 4 clk: the card's cold-tail ext
 	// accesses ride the SDRAM cpu-slot and ack in ~10-20 clk, which the old
 	// horizon would have eaten. Real NuBus allows 25.6us; 32 clk ~= 1us.
-	reg [5:0] nubus_timeout;
+	// Horizon: was 32 clk; a packed-aperture (24bpp) access can be TWO ext
+	// round-trips and a DDR-busy spike must not trip the empty-slot answer
+	// mid-op. 128 clk ~= 4us still sits well inside NuBus's 25.6us and only
+	// slows true empty-slot probes (a handful per boot).
+	reg [7:0] nubus_timeout;
 	always @(posedge clk_sys) begin
-		if (_cpuAS) nubus_timeout <= 6'd0;
-		else if (slot_space && nubusAck_card && !nubus_timeout[5])
-			nubus_timeout <= nubus_timeout + 6'd1;
+		if (_cpuAS) nubus_timeout <= 8'd0;
+		else if (slot_space && nubusAck_card && !nubus_timeout[7])
+			nubus_timeout <= nubus_timeout + 8'd1;
 	end
-	wire nubus_no_card = slot_space && nubusAck_card && nubus_timeout[5];
+	wire nubus_no_card = slot_space && nubusAck_card && nubus_timeout[7];
 	assign nubusDataOut = nubus_no_card ? 16'hFFFF : nubusDataOut_card;
 	assign nubusAck_n   = nubus_no_card ? 1'b0    : nubusAck_card;
 
@@ -2320,8 +2337,11 @@ module emu
 		.vid_data(vidp_data),
 		.vid_dseq(vidp_dseq),
 		.vid_tog(vidp_tog),
+		.vid_pair(vidp_pair),
+		.vid_data2(vidp_data2),
 		.ext_rd(card_ext_rd),
 		.ext_wr(card_ext_wr),
+		.ext_ds(card_ext_ds),
 		.ext_word(mdc_vram_addr[19:0]),
 		.ext_wdata(mdc_vram_dout),
 		.ext_dout(card_ext_din),
@@ -2364,7 +2384,7 @@ module emu
 	wire [15:0] sdram_din  = download_cycle ? dio_data :
 	                         card_ext_slot  ? mdc_vram_dout : memoryDataOut;
 	wire  [1:0] sdram_ds   = download_cycle ? 2'b11 :
-	                         card_ext_slot  ? 2'b11 : { !_memoryUDS, !_memoryLDS };
+	                         card_ext_slot  ? card_ext_ds : { !_memoryUDS, !_memoryLDS };
 	wire        sdram_we   = download_cycle ? dio_write :
 	                         card_ext_slot  ? card_ext_wr : !_ramWE;
 	wire        sdram_oe   = download_cycle ? 1'b0 :

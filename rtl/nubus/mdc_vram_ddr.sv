@@ -40,13 +40,18 @@ module mdc_vram_ddr #(
 	output reg  [7:0] ddr_be,
 	output reg        ddr_we,
 
-	// scanline stream client (contract of sdram.v's video port)
+	// scanline stream client (contract of sdram.v's video port, plus the
+	// pair lane: when the FIFO holds two words they are served together on
+	// one tog — mdc_scan_fetch consumes both. Sustains 24bpp (960 words in
+	// a ~928-clk line); the sdram.v backend never pairs.)
 	input             vid_rd,
 	input      [25:0] vid_addr,       // SDRAM-window-style: base + card word
 	input             vid_seq,
 	output reg [15:0] vid_data,
 	output reg        vid_dseq,
 	output reg        vid_tog,
+	output reg        vid_pair,
+	output reg [15:0] vid_data2,
 
 	// card FSM ext ops (full-word). Contract (matches vram_ram/the SDRAM ext
 	// path): the FSM raises rd/wr and HOLDS it until ready, then drops it —
@@ -58,23 +63,30 @@ module mdc_vram_ddr #(
 	input             ext_wr,
 	input      [19:0] ext_word,
 	input      [15:0] ext_wdata,
+	input      [1:0]  ext_ds,      // write byte strobes ([1]=[15:8], [0]=[7:0])
 	output reg [15:0] ext_dout,
 	output            ext_ready
 );
 
-	localparam [3:0] SCAN_QW = 4'd4;   // quadwords per scan burst (16 words)
+	localparam [4:0] SCAN_QW = 5'd16;  // quadwords per scan burst (64 words).
+	                                   // The bridge model costs ~12 clk dead
+	                                   // latency per burst with no overlap;
+	                                   // 64-word bursts + the pair drain
+	                                   // amortize it to ~0.72 clk/word —
+	                                   // 24bpp needs 960 words in a ~928-clk
+	                                   // line, sustained.
 
 	// vid_addr arrives as SDRAM-layout address (window base + word); only the
 	// card word offset matters here.
 	wire [19:0] vid_word = vid_addr[19:0];
 
-	// ---- scan stream FIFO (one burst deep: 16 words + margin) --------------
-	reg [15:0] sfifo [0:31];
-	reg [4:0]  sf_wr, sf_rd;
-	reg [5:0]  sf_cnt;
+	// ---- scan stream FIFO (one burst deep: 64 words) -----------------------
+	reg [15:0] sfifo [0:63];
+	reg [5:0]  sf_wr, sf_rd;
+	reg [6:0]  sf_cnt;
 	reg        sf_seq;          // seq tag of the words in the FIFO
 	reg [1:0]  sf_skip;         // leading words of beat 0 to drop (alignment)
-	reg [4:0]  sf_expect;       // words the burst will deliver after skip
+	reg [6:0]  sf_expect;       // words the burst will deliver after skip
 
 	// group handshake (same rule as sdram.v): a new burst starts only when
 	// the client consumed the previous group (vid_addr caught up) or
@@ -93,29 +105,42 @@ module mdc_vram_ddr #(
 
 	reg [2:0]  st;
 	reg [1:0]  ext_lane;
-	reg [3:0]  beats_left;
+	reg [4:0]  beats_left;
 	reg        ext_pend_rd, ext_pend_wr;   // accepted (edge-qualified) requests
 	reg [19:0] ext_word_l;
 	reg [15:0] ext_wdata_l;
+	reg [1:0]  ext_ds_l;
 	reg        ext_rd_d, ext_wr_d;
 	reg        ext_done;                   // completion level for the held request
 	assign ext_ready = ext_done;
 
-	// serve the stream out of the FIFO at one word per clock
+	// serve the stream out of the FIFO — two words per tog when available
+	// (line starts are word-even in every mode, so after the even-sized
+	// skip-adjusted first beat the count stays even and pairs dominate)
 	always @(posedge clk) begin
 		if (reset) begin
-			sf_rd   <= 5'd0;
+			sf_rd   <= 6'd0;
 			vid_tog <= 1'b0;
 			vid_dseq<= 1'b0;
-		end else if (sf_cnt != 6'd0) begin
+			vid_pair<= 1'b0;
+		end else if (sf_cnt >= 7'd2) begin
+			vid_data  <= sfifo[sf_rd];
+			vid_data2 <= sfifo[sf_rd + 6'd1];
+			vid_pair  <= 1'b1;
+			vid_dseq  <= sf_seq;
+			vid_tog   <= ~vid_tog;
+			sf_rd     <= sf_rd + 6'd2;
+		end else if (sf_cnt != 7'd0) begin
 			vid_data <= sfifo[sf_rd];
+			vid_pair <= 1'b0;
 			vid_dseq <= sf_seq;
 			vid_tog  <= ~vid_tog;
-			sf_rd    <= sf_rd + 5'd1;
+			sf_rd    <= sf_rd + 6'd1;
 		end
 	end
 
-	wire sf_pop = (sf_cnt != 6'd0);
+	wire [1:0] sf_pop_n = (sf_cnt >= 7'd2) ? 2'd2 :
+	                      (sf_cnt != 7'd0) ? 2'd1 : 2'd0;
 	reg  sf_push;
 	reg [2:0] sf_push_n;   // words pushed this cycle (a 64-bit beat = up to 4)
 
@@ -129,7 +154,7 @@ module mdc_vram_ddr #(
 			st <= S_IDLE;
 			ddr_rd <= 1'b0; ddr_we <= 1'b0;
 			ddr_burstcnt <= 8'd1; ddr_be <= 8'hFF;
-			sf_wr <= 5'd0; sf_cnt <= 6'd0;
+			sf_wr <= 6'd0; sf_cnt <= 7'd0;
 			expect_valid <= 1'b0;
 			ext_pend_rd <= 1'b0; ext_pend_wr <= 1'b0;
 			ext_done <= 1'b0;
@@ -142,12 +167,13 @@ module mdc_vram_ddr #(
 			end
 			if (ext_wr && !ext_wr_d) begin
 				ext_pend_wr <= 1'b1; ext_word_l <= ext_word; ext_wdata_l <= ext_wdata;
+				ext_ds_l <= ext_ds;
 				ext_done <= 1'b0;
 			end
 			if (!vid_rd) expect_valid <= 1'b0;
 
 			// FIFO count bookkeeping (push side updates below via sf_push*)
-			sf_cnt <= sf_cnt + (sf_push ? {3'd0, sf_push_n} : 6'd0) - (sf_pop ? 6'd1 : 6'd0);
+			sf_cnt <= sf_cnt + (sf_push ? {4'd0, sf_push_n} : 7'd0) - {5'd0, sf_pop_n};
 
 			case (st)
 				S_IDLE: begin
@@ -155,7 +181,11 @@ module mdc_vram_ddr #(
 						ddr_addr     <= DDR_BASE_QW + {11'd0, ext_word_l[19:2]};
 						ddr_burstcnt <= 8'd1;
 						ddr_din      <= {4{ext_wdata_l}};
-						ddr_be       <= 8'h03 << {ext_word_l[1:0], 1'b0};
+						// per-byte enables: word lane k spans qword bytes
+						// 2k (= wdata[7:0], ds[0]) and 2k+1 (= wdata[15:8],
+						// ds[1]) — the pair is ext_ds_l as-is, shifted up
+						ddr_be       <= {6'd0, ext_ds_l}
+						                << {ext_word_l[1:0], 1'b0};
 						ddr_we       <= 1'b1;
 						st           <= S_EXT_WR;
 					end else if (ext_pend_rd) begin
@@ -165,13 +195,18 @@ module mdc_vram_ddr #(
 						ddr_rd       <= 1'b1;
 						ext_lane     <= ext_word_l[1:0];
 						st           <= S_EXT_RD;
-					end else if (vid_rd && sf_cnt == 6'd0 &&
+					end else if (vid_rd && sf_cnt == 7'd0 &&
 					             (!expect_valid || (vid_seq != expect_seq) ||
-					              (vid_word == expect_word))) begin
+					              (vid_word == expect_word) ||
+					              (vid_word == expect_word + 20'd1))) begin
+						// (the +1 arm tolerates a client that stepped past
+						// expect_word with a pair after a lone-word serve —
+						// unreachable with even line starts, but a hang if
+						// it ever happened)
 						// scan burst: SCAN_QW quadwords from the aligned base;
 						// leading words below vid_word are dropped on receive
 						ddr_addr     <= DDR_BASE_QW + {11'd0, vid_word[19:2]};
-						ddr_burstcnt <= {4'd0, SCAN_QW};
+						ddr_burstcnt <= {3'd0, SCAN_QW};
 						ddr_be       <= 8'hFF;
 						ddr_rd       <= 1'b1;
 						sf_skip      <= vid_word[1:0];
@@ -220,30 +255,30 @@ module mdc_vram_ddr #(
 					// count moves via sf_push/sf_push_n)
 					if (sf_skip == 2'd0) begin
 						sfifo[sf_wr]        <= ddr_dout[15:0];
-						sfifo[sf_wr + 5'd1] <= ddr_dout[31:16];
-						sfifo[sf_wr + 5'd2] <= ddr_dout[47:32];
-						sfifo[sf_wr + 5'd3] <= ddr_dout[63:48];
-						sf_wr <= sf_wr + 5'd4;
+						sfifo[sf_wr + 6'd1] <= ddr_dout[31:16];
+						sfifo[sf_wr + 6'd2] <= ddr_dout[47:32];
+						sfifo[sf_wr + 6'd3] <= ddr_dout[63:48];
+						sf_wr <= sf_wr + 6'd4;
 						sf_push <= 1'b1; sf_push_n <= 3'd4;
 					end else if (sf_skip == 2'd1) begin
 						sfifo[sf_wr]        <= ddr_dout[31:16];
-						sfifo[sf_wr + 5'd1] <= ddr_dout[47:32];
-						sfifo[sf_wr + 5'd2] <= ddr_dout[63:48];
-						sf_wr <= sf_wr + 5'd3;
+						sfifo[sf_wr + 6'd1] <= ddr_dout[47:32];
+						sfifo[sf_wr + 6'd2] <= ddr_dout[63:48];
+						sf_wr <= sf_wr + 6'd3;
 						sf_push <= 1'b1; sf_push_n <= 3'd3;
 					end else if (sf_skip == 2'd2) begin
 						sfifo[sf_wr]        <= ddr_dout[47:32];
-						sfifo[sf_wr + 5'd1] <= ddr_dout[63:48];
-						sf_wr <= sf_wr + 5'd2;
+						sfifo[sf_wr + 6'd1] <= ddr_dout[63:48];
+						sf_wr <= sf_wr + 6'd2;
 						sf_push <= 1'b1; sf_push_n <= 3'd2;
 					end else begin
 						sfifo[sf_wr]        <= ddr_dout[63:48];
-						sf_wr <= sf_wr + 5'd1;
+						sf_wr <= sf_wr + 6'd1;
 						sf_push <= 1'b1; sf_push_n <= 3'd1;
 					end
 					sf_skip <= 2'd0;
-					beats_left <= beats_left - 4'd1;
-					if (beats_left == 4'd1) st <= S_IDLE;
+					beats_left <= beats_left - 5'd1;
+					if (beats_left == 5'd1) st <= S_IDLE;
 				end
 
 				default: st <= S_IDLE;

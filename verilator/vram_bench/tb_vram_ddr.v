@@ -23,28 +23,30 @@ module tb_vram_ddr;
     );
 
     // scan client chain
-    wire        vid_rd, vid_seq, vid_dseq, vid_tog;
+    wire        vid_rd, vid_seq, vid_dseq, vid_tog, vid_pair;
     wire [25:0] vid_addr;
-    wire [15:0] vid_data;
+    wire [15:0] vid_data, vid_data2;
 
     reg         start = 0;
     reg  [19:0] base_word = 0;
     reg  [9:0]  words = 0;
-    wire        wvalid;
-    wire [15:0] wdata;
+    wire        wvalid, wvalid2;
+    wire [15:0] wdata, wdata2;
 
     mdc_scan_fetch #(.SDRAM_BASE(26'h0100000)) fetch (
         .clk(clk), .reset(reset),
         .start(start), .base_word(base_word), .words(words),
-        .wvalid(wvalid), .wdata(wdata),
+        .wvalid(wvalid), .wdata(wdata), .wvalid2(wvalid2), .wdata2(wdata2),
         .vid_rd(vid_rd), .vid_addr(vid_addr), .vid_seq(vid_seq),
-        .vid_data(vid_data), .vid_dseq(vid_dseq), .vid_tog(vid_tog)
+        .vid_data(vid_data), .vid_dseq(vid_dseq), .vid_tog(vid_tog),
+        .vid_pair(vid_pair), .vid_data2(vid_data2)
     );
 
     // ext port
     reg         ext_rd = 0, ext_wr = 0;
     reg  [19:0] ext_word = 0;
     reg  [15:0] ext_wdata = 0;
+    reg  [1:0]  ext_ds = 2'b11;
     wire [15:0] ext_dout;
     wire        ext_ready;
 
@@ -55,7 +57,8 @@ module tb_vram_ddr;
         .ddr_rd(ddr_rd), .ddr_din(ddr_din), .ddr_be(ddr_be), .ddr_we(ddr_we),
         .vid_rd(vid_rd), .vid_addr(vid_addr), .vid_seq(vid_seq),
         .vid_data(vid_data), .vid_dseq(vid_dseq), .vid_tog(vid_tog),
-        .ext_rd(ext_rd), .ext_wr(ext_wr), .ext_word(ext_word),
+        .vid_pair(vid_pair), .vid_data2(vid_data2),
+        .ext_rd(ext_rd), .ext_wr(ext_wr), .ext_ds(ext_ds), .ext_word(ext_word),
         .ext_wdata(ext_wdata), .ext_dout(ext_dout), .ext_ready(ext_ready)
     );
 
@@ -64,6 +67,10 @@ module tb_vram_ddr;
     always @(posedge clk) if (wvalid) begin
         got[got_n] = wdata;
         got_n = got_n + 1;
+        if (wvalid2) begin
+            got[got_n] = wdata2;
+            got_n = got_n + 1;
+        end
     end
 
     integer i, errors = 0;
@@ -77,6 +84,14 @@ module tb_vram_ddr;
             if (!ext_ready) begin $display("FAIL: ext write %h timeout", w); errors = errors + 1; end
             @(negedge clk); ext_wr = 0;
             @(negedge clk);
+        end
+    endtask
+
+    task ext_write_ds(input [19:0] w, input [15:0] v, input [1:0] ds);
+        begin
+            ext_ds = ds;
+            ext_write(w, v);
+            ext_ds = 2'b11;
         end
     endtask
 
@@ -96,6 +111,7 @@ module tb_vram_ddr;
         end
     endtask
 
+    integer last_fetch_clks;
     task run_fetch(input [19:0] base, input [9:0] n);
         integer timeout;
         begin
@@ -103,6 +119,7 @@ module tb_vram_ddr;
             @(negedge clk); start = 0; got_n = 0;
             timeout = 0;
             while (got_n < n && timeout < 20000) begin @(negedge clk); timeout = timeout + 1; end
+            last_fetch_clks = timeout;
             if (got_n != n) begin
                 $display("FAIL: fetch base=%h n=%0d got %0d", base, n, got_n);
                 errors = errors + 1;
@@ -141,6 +158,19 @@ module tb_vram_ddr;
         ext_read (20'd4004, 16'h5000 + 16'd4004);
         ext_read (20'd3999, 16'h5000 + 16'd3999);
 
+        // 1b) byte-strobe writes (packed-aperture ops): each lane lands
+        // independently, on every 16-bit lane of the quadword
+        ext_write_ds(20'd4000, 16'hAB00, 2'b10);   // high byte only
+        ext_read (20'd4000, 16'hABE0);
+        ext_write_ds(20'd4000, 16'h00CD, 2'b01);   // low byte only
+        ext_read (20'd4000, 16'hABCD);
+        ext_write_ds(20'd4001, 16'h0011, 2'b01);
+        ext_write_ds(20'd4002, 16'h2200, 2'b10);
+        ext_write_ds(20'd4003, 16'h0033, 2'b01);
+        ext_read (20'd4001, 16'hBE11);
+        ext_read (20'd4002, 16'h22E2);
+        ext_read (20'd4003, 16'hBE33);
+
         // 2) scan fetches: aligned + all misalignments, incl. cross-burst
         run_fetch(20'd0,  10'd320);
         run_fetch(20'd2,  10'd320);
@@ -173,6 +203,16 @@ module tb_vram_ddr;
                     $display("FAIL: mid-scan word %0d = %h", i, got[i]);
                     errors = errors + 1;
                 end
+        end
+
+        // 5) 24bpp line-rate: 960 words must land inside a line time (~928
+        //    card clks) with margin — the pair drain + 32-word bursts exist
+        //    for exactly this
+        run_fetch(20'd0, 10'd960);
+        $display("rate: 960 words in ~%0d clks", last_fetch_clks);
+        if (last_fetch_clks > 900) begin
+            $display("FAIL: 24bpp line fetch too slow (%0d clks / 960 words)", last_fetch_clks);
+            errors = errors + 1;
         end
 
         if (errors == 0) $display("PASS: all vram-ddr cases clean");

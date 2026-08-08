@@ -60,5 +60,13 @@ case "$BENCH" in
       $OUT/tb_vram_ddr.v verilator/sim_ddram.v rtl/nubus/mdc_vram_ddr.sv \
       rtl/nubus/mdc_scan_fetch.sv -o tb_vram_ddr --Mdir $OUT/obj_ddr
     ./$OUT/obj_ddr/tb_vram_ddr ;;
-  *) echo "usage: run.sh [sdram|scan|ddr]" >&2; exit 2 ;;
+  scan24)
+    # 24bpp gather + 8bpp regression against the real card scanout. The card
+    # bakes its declaration ROM via a CWD-relative $readmemh, so run from
+    # verilator/ like the main sim does.
+    verilator $VFLAGS +define+SIMULATION --top-module tb_scan24 \
+      $OUT/tb_scan24.v rtl/nubus/nubus_video_mdc824.sv \
+      -o tb_scan24 --Mdir $OUT/obj_scan24
+    (cd verilator && ../$OUT/obj_scan24/tb_scan24) ;;
+  *) echo "usage: run.sh [sdram|scan|ddr|scan24]" >&2; exit 2 ;;
 esac

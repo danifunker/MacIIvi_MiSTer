@@ -36,6 +36,8 @@ module mdc_scan_fetch #(
 	input      [9:0]  words,        // word count (0 = no fetch)
 	output reg        wvalid,       // 1-clk: wdata is the line's next word
 	output reg [15:0] wdata,
+	output reg        wvalid2,      // pair lane: wdata2 is the word after wdata
+	output reg [15:0] wdata2,
 
 	// memory backend video port
 	output            vid_rd,
@@ -43,7 +45,12 @@ module mdc_scan_fetch #(
 	output reg        vid_seq,
 	input      [15:0] vid_data,
 	input             vid_dseq,
-	input             vid_tog
+	input             vid_tog,
+	// pair extension (DDR backend serves 2 words per tog when its FIFO has
+	// them — needed to sustain 24bpp's 960 words inside a ~928-clk line
+	// time; the SDRAM backend never pairs, tie vid_pair 0 there)
+	input             vid_pair,
+	input      [15:0] vid_data2
 );
 
 	reg [19:0] cur;
@@ -54,8 +61,9 @@ module mdc_scan_fetch #(
 	assign vid_addr = SDRAM_BASE + {6'd0, cur};
 
 	always @(posedge clk) begin
-		wvalid <= 1'b0;
-		tog_d  <= vid_tog;
+		wvalid  <= 1'b0;
+		wvalid2 <= 1'b0;
+		tog_d   <= vid_tog;
 
 		if (reset) begin
 			remaining <= 10'd0;
@@ -63,10 +71,20 @@ module mdc_scan_fetch #(
 			vid_seq   <= 1'b0;
 		end else begin
 			if (vid_tog != tog_d && vid_dseq == vid_seq && remaining != 10'd0) begin
-				wdata     <= vid_data;
-				wvalid    <= 1'b1;
-				cur       <= cur + 20'd1;
-				remaining <= remaining - 10'd1;
+				wdata  <= vid_data;
+				wvalid <= 1'b1;
+				if (vid_pair && remaining != 10'd1) begin
+					wdata2    <= vid_data2;
+					wvalid2   <= 1'b1;
+					cur       <= cur + 20'd2;
+					remaining <= remaining - 10'd2;
+				end else begin
+					// a pair with remaining==1 keeps only its first word —
+					// the tail word is backend overshoot, same as a chained
+					// group past the line end
+					cur       <= cur + 20'd1;
+					remaining <= remaining - 10'd1;
+				end
 			end
 
 			if (start) begin
@@ -74,6 +92,7 @@ module mdc_scan_fetch #(
 				remaining <= words;
 				vid_seq   <= ~vid_seq;
 				wvalid    <= 1'b0;   // suppress a same-cycle consume of stale data
+				wvalid2   <= 1'b0;
 			end
 		end
 	end

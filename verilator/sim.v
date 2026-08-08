@@ -697,13 +697,15 @@ module emu
 	wire [24:0] mdc_vram_addr, mdc_vram_scan_addr;
 	wire [15:0] mdc_vram_dout, mdc_vram_din, mdc_vram_scan_data;
 	wire        mdc_vram_rd, mdc_vram_wr, mdc_vram_ready, mdc_vram_scan_rd;
+	wire [1:0]  mdc_vram_ds;
 	wire        card_ext_rd, card_ext_wr;
+	wire [1:0]  card_ext_ds;
 	wire [15:0] card_ext_din;
 	wire        card_ext_ready;
-	wire        mdc_scan_start, mdc_scan_wr;
+	wire        mdc_scan_start, mdc_scan_wr, mdc_scan_wr2;
 	wire [19:0] mdc_scan_base;
 	wire [9:0]  mdc_scan_words;
-	wire [15:0] mdc_scan_wdata;
+	wire [15:0] mdc_scan_wdata, mdc_scan_wdata2;
 
 	// SDRAM-backed card VRAM (docs/VRAM_1MB_OPTIONS.md Option A, 2026-08-07):
 	// VRAM_WORDS=0 = the FULL 1MB lives at SDRAM word $100000. Every CPU
@@ -735,9 +737,11 @@ module emu
 		.vram_din(mdc_vram_din),
 		.vram_rd(mdc_vram_rd),
 		.vram_wr(mdc_vram_wr),
+		.vram_ds(mdc_vram_ds),
 		.vram_ready(mdc_vram_ready),
 		.ext_rd(card_ext_rd),
 		.ext_wr(card_ext_wr),
+		.ext_ds(card_ext_ds),
 		.ext_din(card_ext_din),
 		.ext_ready(card_ext_ready),
 		.vram_scan_addr(mdc_vram_scan_addr),
@@ -748,6 +752,8 @@ module emu
 		.scan_words(mdc_scan_words),
 		.scan_wr(mdc_scan_wr),
 		.scan_wdata(mdc_scan_wdata),
+		.scan_wr2(mdc_scan_wr2),
+		.scan_wdata2(mdc_scan_wdata2),
 		.dbg_scan_underrun(),
 		.ioctl_wr(1'b0), .ioctl_addr(25'd0), .ioctl_data(16'd0),
 		.ioctl_download(1'b0), .ioctl_index(8'd0),
@@ -778,8 +784,8 @@ module emu
 	wire [25:0] vidp_addr;
 	wire        ram_vid_dseq, ram_vid_tog;
 	wire [15:0] ram_vid_data;
-	wire        ddr_vid_dseq, ddr_vid_tog;
-	wire [15:0] ddr_vid_data;
+	wire        ddr_vid_dseq, ddr_vid_tog, ddr_vid_pair;
+	wire [15:0] ddr_vid_data, ddr_vid_data2;
 	wire        ram_vid_rd  = vidp_rd && !use_ddr_vram;
 	wire        ddr_vid_rd  = vidp_rd &&  use_ddr_vram;
 	wire [25:0] ram_vid_addr = vidp_addr;
@@ -793,12 +799,16 @@ module emu
 		.words(mdc_scan_words),
 		.wvalid(mdc_scan_wr),
 		.wdata(mdc_scan_wdata),
+		.wvalid2(mdc_scan_wr2),
+		.wdata2(mdc_scan_wdata2),
 		.vid_rd(vidp_rd),
 		.vid_addr(vidp_addr),
 		.vid_seq(vidp_seq),
 		.vid_data(use_ddr_vram ? ddr_vid_data : ram_vid_data),
 		.vid_dseq(use_ddr_vram ? ddr_vid_dseq : ram_vid_dseq),
-		.vid_tog(use_ddr_vram ? ddr_vid_tog : ram_vid_tog)
+		.vid_tog(use_ddr_vram ? ddr_vid_tog : ram_vid_tog),
+		.vid_pair(use_ddr_vram ? ddr_vid_pair : 1'b0),
+		.vid_data2(ddr_vid_data2)
 	);
 
 	// Option B backend: DDR adapter + behavioral DDRAM model (sim twins of
@@ -828,8 +838,11 @@ module emu
 		.vid_data(ddr_vid_data),
 		.vid_dseq(ddr_vid_dseq),
 		.vid_tog(ddr_vid_tog),
+		.vid_pair(ddr_vid_pair),
+		.vid_data2(ddr_vid_data2),
 		.ext_rd(card_ext_rd && use_ddr_vram),
 		.ext_wr(card_ext_wr && use_ddr_vram),
+		.ext_ds(card_ext_ds),
 		.ext_word(mdc_vram_addr[19:0]),
 		.ext_wdata(mdc_vram_dout),
 		.ext_dout(ddr_ext_dout),
@@ -854,13 +867,17 @@ module emu
 	// (Was 4 clk — the card's cold-tail ext accesses ride the SDRAM cpu-slot
 	// and ack in ~10-20 clk, which the old horizon would have eaten. Real
 	// NuBus allows 25.6us; 32 clk ~= 1us keeps empty-slot probes snappy.)
-	reg [5:0] nubus_timeout;
+	// Horizon: was 32 clk; a packed-aperture (24bpp) access can be TWO ext
+	// round-trips and a DDR-busy spike must not trip the empty-slot answer
+	// mid-op. 128 clk ~= 4us still sits well inside NuBus's 25.6us. Keep in
+	// sync with MacIIvi.sv.
+	reg [7:0] nubus_timeout;
 	always @(posedge clk_sys) begin
-		if (_cpuAS) nubus_timeout <= 6'd0;
-		else if (slot_space && nubusAck_card && !nubus_timeout[5])
-			nubus_timeout <= nubus_timeout + 6'd1;
+		if (_cpuAS) nubus_timeout <= 8'd0;
+		else if (slot_space && nubusAck_card && !nubus_timeout[7])
+			nubus_timeout <= nubus_timeout + 8'd1;
 	end
-	wire nubus_no_card = slot_space && nubusAck_card && nubus_timeout[5];
+	wire nubus_no_card = slot_space && nubusAck_card && nubus_timeout[7];
 	assign nubusDataOut = nubus_no_card ? 16'hFFFF : nubusDataOut_card;
 	assign nubusAck_n   = nubus_no_card ? 1'b0    : nubusAck_card;
 
@@ -1351,7 +1368,7 @@ module emu
 	wire [15:0] ram_din  = download_cycle ? ioctl_dout :
 	                       card_ext_slot  ? mdc_vram_dout : memoryDataOut;
 	wire  [1:0] ram_ds   = download_cycle ? 2'b11 :
-	                       card_ext_slot  ? 2'b11 : { !_memoryUDS, !_memoryLDS };
+	                       card_ext_slot  ? card_ext_ds : { !_memoryUDS, !_memoryLDS };
 	// Use ioctl_wr directly as write enable during download (bypass registered dio_write)
 	wire        ram_we   = download_cycle ? 1'b1 :
 	                       card_ext_slot  ? card_ext_wr : !_ramWE;

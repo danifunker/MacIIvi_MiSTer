@@ -35,6 +35,7 @@ module mdc_bench;
     // $F4B00 = word $7A580, read back) lands in the TAIL — the IIvi ROM
     // sad-Macs if it misses. See the PrimaryInit section below.
     wire        ext_rd, ext_wr;
+    wire [1:0]  ext_ds_w, vram_ds;
     wire [15:0] ext_din;
     wire        ext_ready;
 
@@ -47,14 +48,16 @@ module mdc_bench;
         .vga_r(), .vga_g(), .vga_b(), .vga_hs(), .vga_vs(), .vga_blank(),
         .vga_clk(),
         .vram_addr(vram_addr), .vram_dout(vram_dout), .vram_din(vram_din),
-        .vram_rd(vram_rd), .vram_wr(vram_wr), .vram_ready(vram_ready),
-        .ext_rd(ext_rd), .ext_wr(ext_wr), .ext_din(ext_din),
+        .vram_rd(vram_rd), .vram_wr(vram_wr), .vram_ds(vram_ds),
+        .vram_ready(vram_ready),
+        .ext_rd(ext_rd), .ext_wr(ext_wr), .ext_ds(ext_ds_w), .ext_din(ext_din),
         .ext_ready(ext_ready),
         .vram_scan_addr(vram_scan_addr), .vram_scan_rd(vram_scan_rd),
         .vram_scan_data(vram_scan_data),
         // SDRAM-backed scanout port — unused in the bench's BRAM shape
         .scan_start(), .scan_base(), .scan_words(),
-        .scan_wr(1'b0), .scan_wdata(16'd0), .dbg_scan_underrun(),
+        .scan_wr(1'b0), .scan_wdata(16'd0),
+        .scan_wr2(1'b0), .scan_wdata2(16'd0), .dbg_scan_underrun(),
         .ioctl_wr(1'b0), .ioctl_addr(25'd0), .ioctl_data(16'd0),
         .ioctl_download(1'b0), .ioctl_index(8'd0),
         .overlay_en(1'b0), .monochrome(1'b0), .monitor_512(1'b0),
@@ -74,7 +77,10 @@ module mdc_bench;
         ext_ready_r <= 1'b0;
         if ((ext_rd | ext_wr) && !ext_ready_r) begin
             if (ext_lat == 3'd6) begin
-                if (ext_wr) ext_mem[vram_addr[19:0]] <= vram_dout;
+                if (ext_wr) begin
+                    if (ext_ds_w[1]) ext_mem[vram_addr[19:0]][15:8] <= vram_dout[15:8];
+                    if (ext_ds_w[0]) ext_mem[vram_addr[19:0]][7:0]  <= vram_dout[7:0];
+                end
                 ext_ready_r <= 1'b1;
                 ext_lat <= 3'd0;
             end else
@@ -87,7 +93,7 @@ module mdc_bench;
 
     vram_ram #(.WORDS(196608)) vram (
         .clk(clk),
-        .addr(vram_addr), .din(vram_dout), .dout(vram_din),
+        .addr(vram_addr), .din(vram_dout), .ds(vram_ds), .dout(vram_din),
         .rd(vram_rd), .wr(vram_wr), .ready(vram_ready),
         .addr_b(vram_scan_addr), .rd_b(vram_scan_rd), .dout_b(vram_scan_data)
     );
@@ -335,6 +341,95 @@ module mdc_bench;
                 $display("PINIT PASS: sense, reg $300, 1MB sizing probe (tail), BRAM/tail boundary, ext RMW, beam toggle");
             else
                 $display("PINIT: %0d ERRORS", errors - pinit_errors_at_start);
+        end
+
+        // ---- Packed-RGB aperture (ctrl bit 2; 24bpp "Millions") ----
+        // MAME jmfb rgb_pack/rgb_unpack semantics on our 16-bit bus: aperture
+        // longword p <-> storage bytes 3p+0/1/2 = R/G/B; X dropped on write,
+        // reads back $00; bytes past the 1MB card drop / read $FF.
+        begin : packed_ap
+            integer pk_errors_at_start;
+            pk_errors_at_start = errors;
+
+            // enable the packed view: ctrl <- $0006 (RGB bit + the bit1 strap)
+            bus_write_q(32'hFE200000, 16'h0000, 2'b11);
+            bus_write_q(32'hFE200002, 16'h0006, 2'b11);
+            bus_read_q(32'hFE200002, 2'b11);
+            expect16(32'hFE200002, 16'h0C06, "ctrl-rgb-set");
+
+            // pixel 0 (storage bytes 0-2, BRAM): even-sb R, straddle G/B
+            bus_write_q(32'hFE000000, 16'hEE11, 2'b11);   // X,R
+            bus_write_q(32'hFE000002, 16'h2233, 2'b11);   // G,B
+            // pixel 1 (bytes 3-5): odd-sb R, same-word G/B
+            bus_write_q(32'hFE000004, 16'hEE44, 2'b11);
+            bus_write_q(32'hFE000006, 16'h5566, 2'b11);
+            // pixel 2 (bytes 6-8): G-only then B-only strobes
+            bus_write_q(32'hFE000008, 16'hEE99, 2'b11);   // R=99
+            bus_write_q(32'hFE00000A, 16'h7700, 2'b10);   // G only
+            bus_write_q(32'hFE00000A, 16'h0088, 2'b01);   // B only
+            // pixel 3: X-only write must be a no-op
+            bus_write_q(32'hFE00000C, 16'hAAAA, 2'b10);
+
+            // packed readback (X reads $00; both read shapes)
+            bus_read_q(32'hFE000000, 2'b11);
+            expect16(32'hFE000000, 16'h0011, "pk-rd-p0-xr");
+            bus_read_q(32'hFE000002, 2'b11);
+            expect16(32'hFE000002, 16'h2233, "pk-rd-p0-gb-straddle");
+            bus_read_q(32'hFE000004, 2'b11);
+            expect16(32'hFE000004, 16'h0044, "pk-rd-p1-xr");
+            bus_read_q(32'hFE000006, 2'b11);
+            expect16(32'hFE000006, 16'h5566, "pk-rd-p1-gb-sameword");
+            bus_read_q(32'hFE000008, 2'b11);
+            expect16(32'hFE000008, 16'h0099, "pk-rd-p2-xr");
+            bus_read_q(32'hFE00000A, 2'b11);
+            expect16(32'hFE00000A, 16'h7788, "pk-rd-p2-gb");
+
+            // tail pixel 200000 (storage bytes $927C0-2, ext backend)
+            bus_write_q(32'hFE0C3500, 16'hEEAB, 2'b11);
+            bus_write_q(32'hFE0C3502, 16'hCDEF, 2'b11);
+            bus_read_q(32'hFE0C3500, 2'b11);
+            expect16(32'hFE0C3500, 16'h00AB, "pk-ext-xr");
+            bus_read_q(32'hFE0C3502, 2'b11);
+            expect16(32'hFE0C3502, 16'hCDEF, "pk-ext-gb-straddle");
+
+            // last partial pixel 349525: R = byte $FFFFF (the 1MB%3 leftover
+            // byte) works; G/B fall past the card -> dropped / read $FF
+            bus_write_q(32'hFE155554, 16'hEE77, 2'b11);
+            bus_write_q(32'hFE155556, 16'h8899, 2'b11);
+            bus_read_q(32'hFE155554, 2'b11);
+            expect16(32'hFE155554, 16'h0077, "pk-tail-r");
+            bus_read_q(32'hFE155556, 2'b11);
+            expect16(32'hFE155556, 16'hFFFF, "pk-tail-gb-open");
+
+            // back to the linear view: the 3-byte layout must be visible raw
+            bus_write_q(32'hFE200000, 16'h0000, 2'b11);
+            bus_write_q(32'hFE200002, 16'h0002, 2'b11);
+            bus_read_q(32'hFE000000, 2'b11);
+            expect16(32'hFE000000, 16'h1122, "pk-linear-w0");
+            bus_read_q(32'hFE000002, 2'b11);
+            expect16(32'hFE000002, 16'h3344, "pk-linear-w1");
+            bus_read_q(32'hFE000004, 2'b11);
+            expect16(32'hFE000004, 16'h5566, "pk-linear-w2");
+            bus_read_q(32'hFE000006, 2'b11);
+            expect16(32'hFE000006, 16'h9977, "pk-linear-w3");
+            bus_read_q(32'hFE000008, 2'b11);
+            expect16(32'hFE000008, 16'h8800, "pk-linear-w4-b-and-noop");
+            bus_read_q(32'hFE0927C0, 2'b11);
+            expect16(32'hFE0927C0, 16'hABCD, "pk-linear-ext-w0");
+            bus_read_q(32'hFE0927C2, 2'b11);
+            expect16(32'hFE0927C2, 16'hEF00, "pk-linear-ext-w1");
+            bus_read_q(32'hFE0FFFFE, 2'b11);
+            expect16(32'hFE0FFFFE, 16'h0077, "pk-linear-tail-r");
+
+            // linear RMW still full-word after packed ops (strobes restored)
+            bus_write_q(32'hFE060001, 16'h00A5, 2'b01);
+            bus_read_q(32'hFE060000, 2'b11);
+            expect16(32'hFE060000, 16'h33A5, "pk-linear-rmw-after");
+
+            if (errors == pk_errors_at_start)
+                $display("PACK PASS: packed aperture write/read, strobes, tail byte, linear layout");
+            else
+                $display("PACK: %0d ERRORS", errors - pk_errors_at_start);
         end
 
         $display("DONE");
