@@ -347,9 +347,17 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/vram_ram.sv
 # video port is dead weight (ALMs + muxes on the clk_64 arbitration), so
 # B builds compile both out and run the pre-release controller shape.
 # Comment all three out to fall back to Option A.
-set_global_assignment -name VERILOG_MACRO "MDC_VRAM_DDR=1"
+# BISECT (2026-08-09, branch misc-fixes): owner reports game crashes with
+# the DDR VRAM build — this build takes ONLY the DDR change out and puts
+# card VRAM back on the SDRAM window (Option A v1, the HW-proven 8c60798
+# shape: video port IN, window-release still compiled OUT — the release
+# mechanism stays retired, it wedged v2.2). Millions CANNOT work on this
+# shape (the sdram port supplies ~0.5 words/clk of the 24bpp need — do
+# not select it while bisecting); the v1 right-edge band under heavy
+# 8bpp drawing may reappear, which is expected and part of the signal.
+# set_global_assignment -name VERILOG_MACRO "MDC_VRAM_DDR=1"
 set_global_assignment -name VERILOG_MACRO "SDRAM_NO_WIN_RELEASE=1"
-set_global_assignment -name VERILOG_MACRO "SDRAM_NO_VID_PORT=1"
+# set_global_assignment -name VERILOG_MACRO "SDRAM_NO_VID_PORT=1"
 set_global_assignment -name VERILOG_FILE rtl/floppy_track_encoder.v
 set_global_assignment -name VERILOG_FILE rtl/floppy.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ps2_kbd.sv
