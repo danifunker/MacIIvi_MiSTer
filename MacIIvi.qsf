@@ -59,7 +59,7 @@ set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 # 880, cdrom_target 4.8k vs 5.8k, egret ~5.1k both) — the overflow is device
 # fullness, not a port regression. HIGH = maximum register packing density.
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT HIGH
-set_global_assignment -name SEED 2
+set_global_assignment -name SEED 5
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -418,6 +418,9 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 # headroom visibly de-knifed the HDMI edge. SEED stays 2.
 # soft-reboot netlist (e653e74 RESET-instruction peripheral reset):
 # 2 -> +0.078 PADDED all met FIRST ROLL; ALM 94%. SEED stays 2.
+# bisect netlist (misc-fixes: DDR out, SDRAM vid port back, release
+# still out): 2 -> -0.196 TNS -2.4 (HDMI-only), 5 -> +0.060 PADDED all
+# met; ALM 94%. SEED 5 on this branch.
 # Per-fit law: every netlist change is a fresh roll — re-sweep, don't assume.
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION OFF
