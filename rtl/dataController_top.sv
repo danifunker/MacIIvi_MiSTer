@@ -9,6 +9,14 @@ module dataController_top(
 
 	// system control:
 	input _systemReset,
+	// RESET-instruction soft peripheral reset (2026-08-08 warm-restart fix,
+	// ported from MacLC): pulse from the top level when the 68030 executes
+	// RESET. On real hardware that instruction drives the external reset
+	// line. Here it resets via6522 + the TIP latch + the SWIM ONLY.
+	// Deliberately NOT the NCR/SCC (MacLC's 2026-06-12 lesson: the ROM sets
+	// up the SCSI chip early, issues its own RESET later, and expects that
+	// setup to survive — resetting the NCR regressed cold boot).
+	input softRst,
 	input pseudovia_irq,  // PseudoVIA interrupt (VBlank, slots)
 
 	// 68000 CPU control:
@@ -728,7 +736,10 @@ module dataController_top(
 		.clock      (clk32),
 		.rising     (E_rising),
 		.falling    (E_falling),
-		.reset      (!_cpuReset),
+		// softRst: the RESET instruction resets the VIA on real hardware
+		// (and the ROM re-establishes VIA state after its own boot-time
+		// RESET on every cold boot — real hardware proves that path safe).
+		.reset      (!_cpuReset || softRst),
 
 		.addr       (cpuAddrRegHi),
 		.wen        (selectVIA && !_cpuVMA && !_cpuRW),
@@ -817,7 +828,10 @@ module dataController_top(
 	// PB5=1 → TIP active (session), PB5=0 → TIP idle
 	reg via_tip_latched;
 	always @(posedge clk32) begin
-		if (!_cpuReset) begin
+		// softRst: the VIA just reset (DDRB -> input), so hold the Egret's
+		// TIP view at idle rather than freezing the dying OS session's
+		// last value.
+		if (!_cpuReset || softRst) begin
 			// Reset: TIP idle (0 = no session)
 			via_tip_latched <= 1'b0;
 		end else if (clk8_en_p && via_pb_oe[5]) begin
@@ -1073,11 +1087,19 @@ module dataController_top(
 	end
 
 	// SWIM (IWM + ISM dual-mode floppy controller)
+	// softRst on _reset below: MacLC's decisive warm-restart wedge — the
+	// early cold-path ROM's ISM->IWM switch-back polls rStatus until the
+	// mode clears; a soft restart inheriting the OS's ISM state never
+	// satisfies the exit and loops forever with video still blanked. The
+	// SWIM already resets on the Egret-flavor _cpuReset — the soft flavor
+	// gets the same chip-level reset. Media/mount state lives in floppy.v
+	// and the top-level latches, NOT here — the disk-swap protocol is
+	// untouched.
 	swim sw(
 		.clk(clk32),
 		.cep(clk8_en_p),
 		.cen(clk8_en_n),
-		._reset(_cpuReset),
+		._reset(_cpuReset && !softRst),
 		.selectSWIM(selectIWM),
 		._cpuRW(_cpuRW),
 		._cpuUDS(_cpuUDS),  // LC V8: SWIM is on the upper byte (even addresses)
