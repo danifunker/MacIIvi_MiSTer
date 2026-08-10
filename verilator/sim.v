@@ -736,7 +736,7 @@ module emu
 	localparam MDC_VRAM_WORDS = 153600;  // 300KB hot BRAM — keep in sync
 	                                     // with MacIIvi.sv (bisect retreat)
 	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(MDC_VRAM_WORDS),
-	                     .TOTAL_WORDS(524288)) nubus_card (
+	                     .TOTAL_WORDS(262144)) nubus_card (   // 512KB presented — keep in sync with MacIIvi.sv
 		.clk(clk_sys),
 		.reset(!_cpuReset),
 		// Real A0 required (decl ROM = byte lane 3); see MacIIvi.sv note.

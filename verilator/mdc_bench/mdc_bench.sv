@@ -29,18 +29,19 @@ module mdc_bench;
     wire [15:0] vram_dout, vram_din, vram_scan_data;
     wire        vram_rd, vram_wr, vram_ready, vram_scan_rd;
 
-    // The FPGA hybrid shape (2026-07-11): 384KB hot framebuffer in BRAM +
-    // cold tail to 1MB on the ext_* port (SDRAM window in-system; a latency
-    // model here). PrimaryInit's sizing probe (write $AAAAAAAA @ byte
-    // $F4B00 = word $7A580, read back) lands in the TAIL — the IIvi ROM
-    // sad-Macs if it misses. See the PrimaryInit section below.
+    // The FPGA hybrid shape (2026-08-09 revision): 300KB hot framebuffer in
+    // BRAM + cold tail to the PRESENTED 512KB on the ext_* port (SDRAM
+    // window in-system; a latency model here). PrimaryInit sizes VRAM by
+    // probing: the near-1MB probe ($F4B00) must MISS cleanly (open-bus) and
+    // an in-tail probe below 512KB must hit — that is how the MDC 1.2 ROM
+    // discovers the 4•8-class 512KB configuration and prunes Millions.
     wire        ext_rd, ext_wr;
     wire [1:0]  ext_ds_w, vram_ds;
     wire [15:0] ext_din;
     wire        ext_ready;
 
-    nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(196608),
-                         .TOTAL_WORDS(524288)) card (
+    nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(153600),
+                         .TOTAL_WORDS(262144)) card (   // shipped shape: 300KB hot BRAM, 512KB presented
         .clk(clk), .reset(reset),
         .addr(addr), .data_in(data_in), .uds_lds(uds_lds),
         .cpu_longword(1'b0), .rw_n(rw_n), .cpu_as_n(cpu_as_n),
@@ -91,7 +92,7 @@ module mdc_bench;
     assign ext_din   = ext_mem[vram_addr[19:0]];
     assign ext_ready = ext_ready_r;
 
-    vram_ram #(.WORDS(196608)) vram (
+    vram_ram #(.WORDS(153600)) vram (
         .clk(clk),
         .addr(vram_addr), .din(vram_dout), .ds(vram_ds), .dout(vram_din),
         .rd(vram_rd), .wr(vram_wr), .ready(vram_ready),
@@ -257,19 +258,20 @@ module mdc_bench;
             bus_read_q(32'hFE200302, 2'b11);
             expect16(32'hFE200302, 16'h0000, "reg300-lo");
 
-            // (3) THE VRAM SIZING PROBE: write $AAAAAAAA at byte offset
-            //     $F4B00 (~979KB) and read it back — PrimaryInit's 1MB
-            //     presence test. We model the card's default 1MB config, so
-            //     this must succeed. With the old 384KB VRAM_WORDS the
-            //     readback returned $FFFF, PrimaryInit failed, the Slot
-            //     Manager dropped the video sResources and the ROM
-            //     sad-Macced $0F/$33 (smRecNotFnd) hunting a boot display.
+            // (3) THE VRAM SIZING PROBES. Near-1MB ($F4B00, word $7A580 >=
+            //     the presented 262144 words): acked but DROPPED, reads
+            //     open-bus — this MISS is how PrimaryInit rules out 1MB.
             bus_write_q(32'hFE0F4B00, 16'hAAAA, 2'b11);
-            bus_write_q(32'hFE0F4B02, 16'hAAAA, 2'b11);
             bus_read_q(32'hFE0F4B00, 2'b11);
-            expect16(32'hFE0F4B00, 16'hAAAA, "vram-size-probe-hi");
-            bus_read_q(32'hFE0F4B02, 2'b11);
-            expect16(32'hFE0F4B02, 16'hAAAA, "vram-size-probe-lo");
+            expect16(32'hFE0F4B00, 16'hFFFF, "vram-1mb-probe-miss");
+            //     In-tail probe below 512KB (byte $74B00 = word $3A580, in
+            //     the ext tail): must HIT — discovers the 512KB size.
+            bus_write_q(32'hFE074B00, 16'hAAAA, 2'b11);
+            bus_write_q(32'hFE074B02, 16'h5555, 2'b11);
+            bus_read_q(32'hFE074B00, 2'b11);
+            expect16(32'hFE074B00, 16'hAAAA, "vram-512k-probe-hi");
+            bus_read_q(32'hFE074B02, 2'b11);
+            expect16(32'hFE074B02, 16'h5555, "vram-512k-probe-lo");
 
             // (4) VRAM low-address readback (framebuffer clear region)
             bus_write_q(32'hFE000000, 16'h5678, 2'b11);
@@ -279,21 +281,21 @@ module mdc_bench;
             bus_read_q(32'hFE000002, 2'b11);
             expect16(32'hFE000002, 16'h9ABC, "vram-low-lo");
 
-            // (4b) BRAM/tail boundary straddle: word 196607 (byte $5FFFE) is
-            //      the last BRAM word, word 196608 (byte $60000) the first
+            // (4b) BRAM/tail boundary straddle: word 153599 (byte $4AFFE) is
+            //      the last BRAM word, word 153600 (byte $4B000) the first
             //      tail word — both must hold values independently.
-            bus_write_q(32'hFE05FFFE, 16'h1122, 2'b11);
-            bus_write_q(32'hFE060000, 16'h3344, 2'b11);
-            bus_read_q(32'hFE05FFFE, 2'b11);
-            expect16(32'hFE05FFFE, 16'h1122, "boundary-bram");
-            bus_read_q(32'hFE060000, 2'b11);
-            expect16(32'hFE060000, 16'h3344, "boundary-ext");
+            bus_write_q(32'hFE04AFFE, 16'h1122, 2'b11);
+            bus_write_q(32'hFE04B000, 16'h3344, 2'b11);
+            bus_read_q(32'hFE04AFFE, 2'b11);
+            expect16(32'hFE04AFFE, 16'h1122, "boundary-bram");
+            bus_read_q(32'hFE04B000, 2'b11);
+            expect16(32'hFE04B000, 16'h3344, "boundary-ext");
 
             // (4c) RMW byte write INTO the tail (odd byte -> LDS strobe):
             //      merges over the ext port's read-modify-write path.
-            bus_write_q(32'hFE060001, 16'h0055, 2'b01);
-            bus_read_q(32'hFE060000, 2'b11);
-            expect16(32'hFE060000, 16'h3355, "ext-rmw-byte");
+            bus_write_q(32'hFE04B001, 16'h0055, 2'b01);
+            bus_read_q(32'hFE04B000, 2'b11);
+            expect16(32'hFE04B000, 16'h3355, "ext-rmw-byte");
 
             // (5) beyond-VRAM reads stay open-bus ($FFFF): the sizing probe
             //     must FAIL cleanly past the installed size (here: at 2MB-1,
@@ -385,21 +387,22 @@ module mdc_bench;
             expect16(32'hFE00000A, 16'h7788, "pk-rd-p2-gb");
 
             // tail pixel 200000 (storage bytes $927C0-2, ext backend)
-            bus_write_q(32'hFE0C3500, 16'hEEAB, 2'b11);
-            bus_write_q(32'hFE0C3502, 16'hCDEF, 2'b11);
-            bus_read_q(32'hFE0C3500, 2'b11);
-            expect16(32'hFE0C3500, 16'h00AB, "pk-ext-xr");
-            bus_read_q(32'hFE0C3502, 2'b11);
-            expect16(32'hFE0C3502, 16'hCDEF, "pk-ext-gb-straddle");
+            bus_write_q(32'hFE080000, 16'hEEAB, 2'b11);
+            bus_write_q(32'hFE080002, 16'hCDEF, 2'b11);
+            bus_read_q(32'hFE080000, 2'b11);
+            expect16(32'hFE080000, 16'h00AB, "pk-ext-xr");
+            bus_read_q(32'hFE080002, 2'b11);
+            expect16(32'hFE080002, 16'hCDEF, "pk-ext-gb-straddle");
 
-            // last partial pixel 349525: R = byte $FFFFF (the 1MB%3 leftover
-            // byte) works; G/B fall past the card -> dropped / read $FF
-            bus_write_q(32'hFE155554, 16'hEE77, 2'b11);
-            bus_write_q(32'hFE155556, 16'h8899, 2'b11);
-            bus_read_q(32'hFE155554, 2'b11);
-            expect16(32'hFE155554, 16'h0077, "pk-tail-r");
-            bus_read_q(32'hFE155556, 2'b11);
-            expect16(32'hFE155556, 16'hFFFF, "pk-tail-gb-open");
+            // last partial pixel 174762: 512KB%3 = 2 leftover bytes, so R
+            // ($7FFFE) and G ($7FFFF) land; B ($80000) is past the card ->
+            // dropped on write, reads $FF (MAME's 2-byte tail handler shape)
+            bus_write_q(32'hFE0AAAA8, 16'hEE77, 2'b11);
+            bus_write_q(32'hFE0AAAAA, 16'h8899, 2'b11);
+            bus_read_q(32'hFE0AAAA8, 2'b11);
+            expect16(32'hFE0AAAA8, 16'h0077, "pk-tail-r");
+            bus_read_q(32'hFE0AAAAA, 2'b11);
+            expect16(32'hFE0AAAAA, 16'h88FF, "pk-tail-g-valid-b-open");
 
             // back to the linear view: the 3-byte layout must be visible raw
             bus_write_q(32'hFE200000, 16'h0000, 2'b11);
@@ -414,17 +417,17 @@ module mdc_bench;
             expect16(32'hFE000006, 16'h9977, "pk-linear-w3");
             bus_read_q(32'hFE000008, 2'b11);
             expect16(32'hFE000008, 16'h8800, "pk-linear-w4-b-and-noop");
-            bus_read_q(32'hFE0927C0, 2'b11);
-            expect16(32'hFE0927C0, 16'hABCD, "pk-linear-ext-w0");
-            bus_read_q(32'hFE0927C2, 2'b11);
-            expect16(32'hFE0927C2, 16'hEF00, "pk-linear-ext-w1");
-            bus_read_q(32'hFE0FFFFE, 2'b11);
-            expect16(32'hFE0FFFFE, 16'h0077, "pk-linear-tail-r");
+            bus_read_q(32'hFE060000, 2'b11);
+            expect16(32'hFE060000, 16'hABCD, "pk-linear-ext-w0");
+            bus_read_q(32'hFE060002, 2'b11);
+            expect16(32'hFE060002, 16'hEF00, "pk-linear-ext-w1");
+            bus_read_q(32'hFE07FFFE, 2'b11);
+            expect16(32'hFE07FFFE, 16'h7788, "pk-linear-tail-rg");
 
             // linear RMW still full-word after packed ops (strobes restored)
-            bus_write_q(32'hFE060001, 16'h00A5, 2'b01);
-            bus_read_q(32'hFE060000, 2'b11);
-            expect16(32'hFE060000, 16'h33A5, "pk-linear-rmw-after");
+            bus_write_q(32'hFE04B001, 16'h00A5, 2'b01);
+            bus_read_q(32'hFE04B000, 2'b11);
+            expect16(32'hFE04B000, 16'h33A5, "pk-linear-rmw-after");
 
             if (errors == pk_errors_at_start)
                 $display("PACK PASS: packed aperture write/read, strobes, tail byte, linear layout");

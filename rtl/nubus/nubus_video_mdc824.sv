@@ -651,6 +651,14 @@ module nubus_video_mdc824 #(
     wire [20:0] pk_b0 = pk_sb;                 // R
     wire [20:0] pk_b1 = pk_sb + 21'd1;         // G
     wire [20:0] pk_b2 = pk_sb + 21'd2;         // B
+    // Presented-size gate: storage bytes at or past the card's VRAM end are
+    // dropped on write / read $FF — the aperture scales with TOTAL_WORDS
+    // exactly as the real card's packed view scales with fitted VRAM (MAME
+    // installs it as vramsize/3*4 bytes). Was a hardcoded 1MB bit test.
+    localparam [20:0] PK_BYTES = TOTAL_WORDS * 2;
+    wire pk_b0_ok = (pk_b0 < PK_BYTES);
+    wire pk_b1_ok = (pk_b1 < PK_BYTES);
+    wire pk_b2_ok = (pk_b2 < PK_BYTES);
     reg        pk_we;        // current packed op is a write
     reg        pk_second;    // a second op is queued
     reg        pk_full;      // read op returns the whole word (same-word G,B)
@@ -838,7 +846,7 @@ module nubus_video_mdc824 #(
                             pk_second <= 1'b0;
                             if (!local_addr[1]) begin
                                 // {X,R}: X dropped; R -> storage byte 3p
-                                if (uds_lds[0] && !pk_b0[20]) begin
+                                if (uds_lds[0] && pk_b0_ok) begin
                                     vram_addr <= VRAM_BASE + {5'd0, pk_b0[20:1]};
                                     vram_dout <= {data_in[7:0], data_in[7:0]};
                                     port_ds_r <= pk_b0[0] ? 2'b01 : 2'b10;
@@ -849,25 +857,25 @@ module nubus_video_mdc824 #(
                             end else begin
                                 // {G,B} -> storage bytes 3p+1, 3p+2
                                 if (uds_lds[1] && uds_lds[0]
-                                    && !pk_b1[0] && !pk_b1[20]) begin
+                                    && !pk_b1[0] && pk_b1_ok) begin
                                     // G even: both bytes live in one word
                                     vram_addr <= VRAM_BASE + {5'd0, pk_b1[20:1]};
                                     vram_dout <= data_in;
                                     port_ds_r <= 2'b11;
                                     ext_sel_r <= !pk_word_in_bram(pk_b1[20:1]);
                                     state     <= S_PK_ISSUE;
-                                end else if (uds_lds[1] && !pk_b1[20]) begin
+                                end else if (uds_lds[1] && pk_b1_ok) begin
                                     // G now; B (if strobed and in range) queued
                                     vram_addr <= VRAM_BASE + {5'd0, pk_b1[20:1]};
                                     vram_dout <= {data_in[15:8], data_in[15:8]};
                                     port_ds_r <= pk_b1[0] ? 2'b01 : 2'b10;
                                     ext_sel_r <= !pk_word_in_bram(pk_b1[20:1]);
-                                    pk_second <= uds_lds[0] && !pk_b2[20];
+                                    pk_second <= uds_lds[0] && pk_b2_ok;
                                     pk_word2  <= pk_b2[20:1];
                                     pk_ds2    <= pk_b2[0] ? 2'b01 : 2'b10;
                                     pk_data2  <= {data_in[7:0], data_in[7:0]};
                                     state     <= S_PK_ISSUE;
-                                end else if (uds_lds[0] && !pk_b2[20]) begin
+                                end else if (uds_lds[0] && pk_b2_ok) begin
                                     // B only
                                     vram_addr <= VRAM_BASE + {5'd0, pk_b2[20:1]};
                                     vram_dout <= {data_in[7:0], data_in[7:0]};
@@ -886,7 +894,7 @@ module nubus_video_mdc824 #(
                             if (!local_addr[1]) begin
                                 // {X,R}: X reads $00; R from storage byte 3p
                                 data_out <= 16'h00FF;
-                                if (!pk_b0[20]) begin
+                                if (pk_b0_ok) begin
                                     vram_addr  <= VRAM_BASE + {5'd0, pk_b0[20:1]};
                                     pk_take_hi <= !pk_b0[0];
                                     pk_put_hi  <= 1'b0;
@@ -897,20 +905,20 @@ module nubus_video_mdc824 #(
                             end else begin
                                 // {G,B}; bytes past the card read $FF
                                 data_out <= 16'hFFFF;
-                                if (!pk_b1[0] && !pk_b1[20]) begin
+                                if (!pk_b1[0] && pk_b1_ok) begin
                                     // same word: {G,B} verbatim
                                     vram_addr <= VRAM_BASE + {5'd0, pk_b1[20:1]};
                                     pk_full   <= 1'b1;
                                     ext_sel_r <= !pk_word_in_bram(pk_b1[20:1]);
                                     state     <= S_PK_ISSUE;
-                                end else if (pk_b1[0] && !pk_b1[20]) begin
+                                end else if (pk_b1[0] && pk_b1_ok) begin
                                     // straddle: G = low lane of its word, B =
                                     // high lane of the next (queued if in range)
                                     vram_addr  <= VRAM_BASE + {5'd0, pk_b1[20:1]};
                                     pk_take_hi <= 1'b0;
                                     pk_put_hi  <= 1'b1;
                                     ext_sel_r  <= !pk_word_in_bram(pk_b1[20:1]);
-                                    pk_second  <= !pk_b2[20];
+                                    pk_second  <= pk_b2_ok;
                                     pk_word2   <= pk_b2[20:1];
                                     pk_take_hi2<= 1'b1;
                                     pk_put_hi2 <= 1'b0;

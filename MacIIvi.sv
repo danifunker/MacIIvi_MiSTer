@@ -1451,8 +1451,14 @@ module emu
 	// writes; proper 24bpp display returns with a debugged fast backend.
 	localparam MDC_VRAM_WORDS = 153600;   // 300KB hot BRAM, port-B scanout
 `endif
+	// TOTAL_WORDS 262144 = present 512KB to the OS (2026-08-09, owner call):
+	// the MDC 1.2 DeclROM sizes VRAM by probing, and at 512KB it prunes
+	// Millions from the mode list itself (900KB no longer fits) instead of
+	// offering a mode this BRAM shape can't scan out. MAME's 8•24 device
+	// carries "512 kB (4•8)" as a legitimate config of the same ROM. The
+	// near-1MB sizing probe ($F4B00) now correctly reads open-bus.
 	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(MDC_VRAM_WORDS),
-	                     .TOTAL_WORDS(524288)) nubus_card (
+	                     .TOTAL_WORDS(262144)) nubus_card (
 		.clk(clk_sys),
 		.reset(!_cpuReset),
 		// Real A0 required: the declaration ROM lives on byte lane 3
