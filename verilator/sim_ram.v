@@ -29,21 +29,7 @@ module sim_ram
 	//    vanish, reads float (modeled as $FFFF).
 	input [1:0]         module_sz,
 
-	input [31:0]        frame_count, // frame counter for debug logging
-
-	// Video burst port twin (sdram.v Option A client contract): serves
-	// in-order words from the live vid_addr; each word carries the vid_seq
-	// it was sampled with (the client drops stale-tagged words after a line
-	// restart) and vid_tog flips once per word. Bandwidth realism: at most
-	// one word per 2 clk and only while the cpu/chipset port is idle — the
-	// same 16.25M word/s ceiling as the real controller's alternate-window
-	// 4-word groups, with CPU contention modeled crudely.
-	input               vid_rd,
-	input [25:0]        vid_addr,
-	input               vid_seq,
-	output reg [15:0]   vid_data,
-	output reg          vid_dseq,
-	output reg          vid_tog
+	input [31:0]        frame_count // frame counter for debug logging
 );
 
 // 128MB of RAM (64M words of 16 bits) — mirrors the 128MB-module SDRAM space.
@@ -87,25 +73,6 @@ always @(posedge clk) begin
 				rom_rd_count <= rom_rd_count + 1;
 			end
 		end
-	end
-end
-
-// Video burst port model. Rate: one word per 2 clk = the real controller's
-// alternate-window 4-word-group average. No oe/we gate since the v2
-// redundant-window release (sdram.v): a held cpu op only costs video its
-// FIRST window, which this average already absorbs — tb_sdram_vid's chip-
-// model bench carries the honest per-window contention.
-wire [25:0] vid_eff = (module_sz == 2'd1) ? {2'b00, vid_addr[23:0]} :
-                      (module_sz == 2'd2) ? {1'b0,  vid_addr[24:0]} :
-                                            vid_addr;
-reg vid_ph = 1'b0;
-initial begin vid_tog = 1'b0; vid_dseq = 1'b0; vid_data = 16'h0000; end
-always @(posedge clk) begin
-	vid_ph <= ~vid_ph;
-	if (vid_rd && vid_ph) begin
-		vid_data <= mem[vid_eff];
-		vid_dseq <= vid_seq;
-		vid_tog  <= ~vid_tog;
 	end
 end
 

@@ -31,7 +31,6 @@ module vram_ram #(
     // Port A — CPU read/write (card FSM)
     input      [24:0] addr,
     input      [15:0] din,
-    input      [1:0]  ds,      // write byte strobes ([1]=[15:8], [0]=[7:0])
     output reg [15:0] dout,
     input             rd,
     input             wr,
@@ -52,14 +51,10 @@ module vram_ram #(
     wire [AW-1:0] idx_b = addr_b[AW-1:0];
 
     // Port A: CPU read/write, canonical write-through true-dual-port style.
-    // Byte strobes use the part-select byte-enable inference template; dout
-    // on a write is only the full-word write-through value — the card FSM
-    // never consumes dout on writes, so partial writes need no merge here.
     always @(posedge clk) begin
         if (wr) begin
-            if (ds[1]) mem[idx_a][15:8] <= din[15:8];
-            if (ds[0]) mem[idx_a][7:0]  <= din[7:0];
-            dout       <= din;          // write-through (new data; unread on writes)
+            mem[idx_a] <= din;
+            dout       <= din;          // write-through (new data)
         end else begin
             dout       <= mem[idx_a];
         end

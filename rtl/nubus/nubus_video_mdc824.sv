@@ -20,16 +20,9 @@
 // nubus_video_highres.sv.
 //
 // 1/2/4/8 bpp are supported (VRAM_WORDS BRAM words; 8 bpp @ 640x480 needs
-// 300 KB).  24 bpp (RAMDAC mode 0xD, "Millions") is supported on the
-// VRAM_WORDS==0 (SDRAM/DDR-backed) configuration: the real card stores
-// direct colour PACKED, 3 bytes per pixel — 640x480 = 900 KB, which is why
-// the 341-0868 ROM offers Millions on the 1 MB card. Control bit 2 switches
-// the CPU aperture to the packed view (4-byte XRGB bus pixels <-> 3 stored
-// bytes; MAME nubus_48gc.cpp jmfb rgb_pack/rgb_unpack — that file is the
-// UNACCELERATED 4*8/8*24 JMFB despite its name, and matches this card's
-// register map and $0C02 ctrl golden; Snow's mdc12 24bpp is a 4-byte
-// simplification that needs >1 MB and disagrees with the ROM's own capacity
-// math). Legacy BRAM configs keep the old 0xD->8bpp fallback.
+// 300 KB).  24 bpp (RAMDAC mode 0xD) stays deferred: 640x480 direct colour
+// is a 1.2 MB framebuffer, beyond on-chip BRAM — it would need the SDRAM
+// path back.
 
 module nubus_video_mdc824 #(
     parameter SLOT_ID = 4'hE,
@@ -74,7 +67,6 @@ module nubus_video_mdc824 #(
     input [15:0] vram_din,
     output vram_rd,
     output vram_wr,
-    output [1:0] vram_ds,     // write byte strobes ([1]=high/even, [0]=low/odd)
     input vram_ready,
 
     // Cold-tail port — CPU read/write of words [VRAM_WORDS, TOTAL_WORDS).
@@ -83,29 +75,13 @@ module nubus_video_mdc824 #(
     // vram_dout for write data. ext_word = vram_addr[19:0] (card word).
     output ext_rd,
     output ext_wr,
-    output [1:0] ext_ds,      // write byte strobes (same lanes as vram_ds)
     input [15:0] ext_din,
     input ext_ready,
 
-    // VRAM Port B — dedicated scanout read (no cache, never misses).
-    // Only used when VRAM_WORDS != 0 (BRAM-backed scanout).
+    // VRAM Port B — dedicated scanout read (no cache, never misses)
     output     [24:0] vram_scan_addr,
     output            vram_scan_rd,
     input      [15:0] vram_scan_data,
-
-    // Scanline prefetch port — only used when VRAM_WORDS == 0 (VRAM fully
-    // SDRAM-backed, docs/VRAM_1MB_OPTIONS.md Option A). At the start of each
-    // line the card requests the NEXT visible line's words; mdc_scan_fetch
-    // streams them back on scan_wr/scan_wdata into the internal 2-line
-    // ping-pong buffer that scanout reads instead of port B.
-    output            scan_start,   // 1-clk pulse: fetch a line
-    output     [19:0] scan_base,    // card word address of the line start
-    output     [9:0]  scan_words,   // words to fetch
-    input             scan_wr,      // 1-clk: scan_wdata = next word of the line
-    input      [15:0] scan_wdata,
-    input             scan_wr2,     // pair lane: scan_wdata2 = the word after
-    input      [15:0] scan_wdata2,  //   (even/odd sub-banks absorb 2 words/clk)
-    output     [15:0] dbg_scan_underrun,  // lines scanned out before their fetch completed
 
     // IOCTL Interface for ROM Download
     input        ioctl_wr,
@@ -254,20 +230,10 @@ module nubus_video_mdc824 #(
 
     // bpp / pixel mode from RAMDAC control field (bits [4:1])
     wire [3:0] rmode = ramdac_ctrl[4:1];
-    // Map to the pipeline mode (0=1bpp,1=2bpp,2=4bpp,3=8bpp,4=24bpp).
-    // 24bpp renders only on the VRAM_WORDS==0 scanout (the line-buffer path
-    // can gather 3 bytes/pixel); BRAM port-B configs keep the 0xD->8bpp
-    // fallback they always had.
-    /* verilator lint_off UNSIGNED */
-    /* verilator lint_off CMPCONST */
-    wire [2:0] mode = (rmode == 4'h0) ? 3'd0 :
-                      (rmode == 4'h4) ? 3'd1 :
-                      (rmode == 4'h8) ? 3'd2 :
-                      ((rmode == 4'hD) && (VRAM_WORDS == 0)) ? 3'd4 :
-                      3'd3;  // 0xC (and 0xD on BRAM configs) -> 8bpp
-    /* verilator lint_on CMPCONST */
-    /* verilator lint_on UNSIGNED */
-    wire mode24 = (mode == 3'd4);
+    // Map to the 2-bit pipeline mode (0=1bpp,1=2bpp,2=4bpp,3=8bpp).
+    wire [1:0] mode = (rmode == 4'h0) ? 2'd0 :
+                      (rmode == 4'h4) ? 2'd1 :
+                      (rmode == 4'h8) ? 2'd2 : 2'd3;  // 0xC/0xD -> 8bpp (24bpp later)
 
     // ========================================================================
     // Pixel clock (fractional accumulator). clk here is THIS core's clk_sys =
@@ -376,223 +342,23 @@ module nubus_video_mdc824 #(
     // Scanout VRAM address calculation
     //   fb_byte = base_reg*32 + v*stride_bytes + h_byte
     //   stride_bytes = stride_reg << 2  (<<3 for 24bpp, deferred)
-    //
-    // Two scanout backends, selected by VRAM_WORDS (compile-time):
-    //   != 0 : legacy BRAM port B — word fetched per pixel clock (unchanged).
-    //   == 0 : SDRAM-backed (Option A) — a prefetch engine fetches the NEXT
-    //          visible line into a 2x512-word ping-pong line buffer while the
-    //          current line scans out of the other bank. base/stride are
-    //          32-byte/4-byte units, so a line always starts byte-even and
-    //          the in-line byte select reduces to h_byte[0].
     // ========================================================================
-    // Direct (24bpp) units per MAME jmfb update_screen: base is 64-byte
-    // increments (<<6) and stride 8-byte increments (<<3); indexed modes
-    // keep the historical 32-byte / 4-byte units.
-    wire [24:0] base_bytes   = mode24 ? {base_reg[18:0], 6'b000000}
-                                      : {base_reg[19:0], 5'b00000};
-    wire [13:0] stride_bytes = mode24 ? {stride_reg[10:0], 3'b000}
-                                      : {stride_reg[11:0], 2'b00};
+    wire [24:0] base_bytes   = {base_reg[19:0], 5'b00000};   // * 32
+    wire [13:0] stride_bytes = {stride_reg[11:0], 2'b00};    // * 4
 
     wire [9:0] h_byte =
-        (mode == 3'd0) ? {3'd0, h_cnt[9:3]} :     // 1bpp: h/8
-        (mode == 3'd1) ? {2'd0, h_cnt[9:2]} :     // 2bpp: h/4
-        (mode == 3'd2) ? {1'd0, h_cnt[9:1]} :     // 4bpp: h/2
-                         h_cnt[9:0];              // 8bpp: h (24bpp has its own math)
+        (mode == 2'd0) ? {3'd0, h_cnt[9:3]} :     // 1bpp: h/8
+        (mode == 2'd1) ? {2'd0, h_cnt[9:2]} :     // 2bpp: h/4
+        (mode == 2'd2) ? {1'd0, h_cnt[9:1]} :     // 4bpp: h/2
+                         h_cnt[9:0];              // 8bpp: h
 
-    wire        fetch_byte_sel;
-    wire [15:0] scan_word_q;      // scanout word (registered, 1 clk_video_en late)
-    wire [7:0]  scan24_r, scan24_g, scan24_b;  // 24bpp gathered pixel (same latency)
+    wire [24:0] v_byte_offset  = v_cnt[9:0] * stride_bytes;
+    wire [24:0] fetch_byte_addr = base_bytes + v_byte_offset + {15'd0, h_byte};
+    wire [23:0] fetch_word_addr = fetch_byte_addr[24:1];
+    wire fetch_byte_sel = fetch_byte_addr[0];
 
-    generate if (VRAM_WORDS != 0) begin : scan_bram
-
-        wire [24:0] v_byte_offset  = v_cnt[9:0] * stride_bytes;
-        wire [24:0] fetch_byte_addr = base_bytes + v_byte_offset + {15'd0, h_byte};
-        wire [23:0] fetch_word_addr = fetch_byte_addr[24:1];
-        assign fetch_byte_sel = fetch_byte_addr[0];
-
-        assign vram_scan_addr = VRAM_BASE + {1'b0, fetch_word_addr};
-        assign vram_scan_rd   = clk_video_en;
-        assign scan_word_q    = vram_scan_data;
-
-        assign scan_start = 1'b0;
-        assign scan_base  = 20'd0;
-        assign scan_words = 10'd0;
-        assign dbg_scan_underrun = 16'd0;
-        assign scan24_r = 8'd0;   // 24bpp never renders on the BRAM path
-        assign scan24_g = 8'd0;
-        assign scan24_b = 8'd0;
-
-    end else begin : scan_sdram
-
-        assign vram_scan_addr = 25'd0;
-        assign vram_scan_rd   = 1'b0;
-        assign fetch_byte_sel = h_byte[0];   // line starts are always byte-even
-
-        // words per visible line for the current depth (24bpp: 3 bytes per
-        // pixel packed -> h_res*3/2 words; 640 -> 960, 512 -> 768)
-        wire [9:0] half_res = h_res[10:1];   // h_res is even
-        wire [9:0] line_words = (mode == 3'd0) ? {4'b0, h_res[9:4]} :
-                                (mode == 3'd1) ? {3'b0, h_res[9:3]} :
-                                (mode == 3'd2) ? {2'b0, h_res[9:2]} :
-                                mode24         ? (half_res + half_res + half_res) :
-                                                 {1'b0, h_res[9:1]};
-
-        // the line to prefetch: TWO lines ahead of the one starting now
-        // (v2, 2026-08-07 HW finding — one line time was not enough budget
-        // under a saturating CPU; two line-times + the released-window
-        // supply in sdram.v covers 8bpp with margin), wrapping so lines
-        // 0 and 1 are fetched while raster lines v_total-2 / v_total-1 scan
-        wire [9:0]  next2_line = (v_cnt == v_total - 11'd2) ? 10'd0 :
-                                 (v_cnt == v_total - 11'd1) ? 10'd1 :
-                                 (v_cnt[9:0] + 10'd2);
-        wire        next2_visible = ({1'b0, next2_line} < v_res) &&
-                                    (v_cnt < v_res - 11'd2 || v_cnt >= v_total - 11'd2);
-        wire [24:0] next_line_bytes = base_bytes + next2_line * stride_bytes;
-        // guard: only fetch lines that lie entirely inside the card's 1MB
-        // (a garbage base_reg during setup must not matter — reads would be
-        // harmless, but keep the address math honest)
-        wire        fetch_ok = ({1'b0, next_line_bytes[24:1]} + {15'd0, line_words})
-                               <= TOTAL_WORDS;
-
-        // 3-line rotating buffer (fills run up to two lines ahead of scan).
-        // Banks rotate 0->1->2 on the fill side per SCHEDULED fetch and on
-        // the scan side per visible line, both forced to bank 0 at line 0 /
-        // the line-0 schedule, so the two rotations re-sync every frame and
-        // stay aligned for any v_total (525 and 407 are not both mod-3
-        // friendly — arithmetic on line numbers is not). Banks are 1024
-        // words so a 24bpp line (960 words) fits, stored as EVEN/ODD word
-        // sub-arrays: the 24bpp gather needs two adjacent words per pixel
-        // tick (3 bytes always span exactly one even and one odd word), and
-        // at 96% pixel-clock duty there is no headroom to serialize two
-        // reads. Each sub-array is one M10K read port; legacy modes read
-        // both and mux by the delayed word parity — bit-identical to the
-        // old single-array read. 2x 2048x16 = 8 M10K (was 4).
-        (* ramstyle = "M10K" *) reg [15:0] lb_ev [0:2047];  // even card words
-        (* ramstyle = "M10K" *) reg [15:0] lb_od [0:2047];  // odd  card words
-        reg [15:0] lb_q_ev, lb_q_od;
-        reg [9:0]  fill_ptr;
-        reg [1:0]  fill_bank;
-        reg [1:0]  scan_bank;
-        reg [9:0]  fill_words;
-        reg        fill_busy;
-        reg [15:0] underrun_cnt;
-        reg        r_start;
-        reg [19:0] r_base;
-        reg [9:0]  r_words;
-
-        assign scan_start = r_start;
-        assign scan_base  = r_base;
-        assign scan_words = r_words;
-        assign dbg_scan_underrun = underrun_cnt;
-
-        wire [1:0] fill_bank_nxt = (next2_line == 10'd0) ? 2'd0 :
-                                   (fill_bank == 2'd2)   ? 2'd0 : fill_bank + 2'd1;
-
-        always @(posedge clk) begin
-            r_start <= 1'b0;
-            if (reset) begin
-                fill_ptr <= 10'd0; fill_bank <= 2'd0; fill_words <= 10'd0;
-                fill_busy <= 1'b0; underrun_cnt <= 16'd0;
-                r_base <= 20'd0; r_words <= 10'd0;
-                scan_bank <= 2'd0;
-            end else begin
-                if (scan_wr && fill_busy) begin
-                    // one word or an adjacent pair per clk: the pair's two
-                    // words always land in opposite sub-banks (one write
-                    // port each), whatever the current alignment
-                    if (fill_ptr[0]) begin
-                        lb_od[{fill_bank, fill_ptr[9:1]}] <= scan_wdata;
-                        if (scan_wr2)
-                            lb_ev[{fill_bank, fill_ptr[9:1] + 9'd1}] <= scan_wdata2;
-                    end else begin
-                        lb_ev[{fill_bank, fill_ptr[9:1]}] <= scan_wdata;
-                        if (scan_wr2)
-                            lb_od[{fill_bank, fill_ptr[9:1]}] <= scan_wdata2;
-                    end
-                    fill_ptr <= fill_ptr + (scan_wr2 ? 10'd2 : 10'd1);
-                    if (fill_ptr + (scan_wr2 ? 10'd2 : 10'd1) >= fill_words)
-                        fill_busy <= 1'b0;
-                end
-                if (clk_video_en && h_cnt == 11'd0) begin
-                    // scan-side bank rotation for the line starting NOW
-                    if (v_cnt == 11'd0)
-                        scan_bank <= 2'd0;
-                    else if (v_cnt < v_res)
-                        scan_bank <= (scan_bank == 2'd2) ? 2'd0 : scan_bank + 2'd1;
-                    // schedule the fetch of the line TWO ahead
-                    if (next2_visible && stride_reg != 32'd0) begin
-                        if (fill_busy) underrun_cnt <= underrun_cnt + 16'd1;
-                        if (fetch_ok && line_words != 10'd0) begin
-                            r_start    <= 1'b1;
-                            r_base     <= next_line_bytes[20:1];
-                            r_words    <= line_words;
-                            fill_bank  <= fill_bank_nxt;
-                            fill_ptr   <= 10'd0;
-                            fill_words <= line_words;
-                            fill_busy  <= 1'b1;
-                        end
-                    end
-                end
-            end
-        end
-
-        // scanout read — same registered-1-enable-late timing as port B had.
-        // scan_bank updates on the h==0 tick of each line; the h==0 pixel's
-        // read (stale by design, see the line-buffer note) may use the old
-        // bank for one access — the pixel was never derived from live data.
-        //
-        // Legacy modes: the target word is rd_w0 = h_byte>>1; both sub-arrays
-        // are read at the pair index and the delayed parity muxes — the same
-        // word the old single array returned. 24bpp: pixel x needs bytes
-        // 3x..3x+2, which span words w0=(3x)>>1 and w0+1 — always one even
-        // and one odd word, read in parallel:
-        //   w0 even: ev[w0/2]={R,G}, od[w0/2]={B,-}
-        //   w0 odd:  od[w0/2]={-,R}, ev[w0/2+1]={G,B}
-        wire [10:0] px3   = {1'b0, h_cnt[9:0]} + {h_cnt[9:0], 1'b0};  // 3*h
-        wire [9:0]  rd_w0 = mode24 ? px3[10:1] : {1'b0, h_byte[9:1]};
-        wire [8:0]  od_idx = rd_w0[9:1];
-        wire [8:0]  ev_idx = (mode24 && rd_w0[0]) ? (rd_w0[9:1] + 9'd1)
-                                                  : rd_w0[9:1];
-        reg         rd_w0par;
-        reg  [1:0]  rd_ph;    // px3[1:0]: R byte's lane AND word parity — they
-                              // are independent (byte 4k+2 is the HIGH lane of
-                              // an ODD word), so the byte pick needs both bits
-        always @(posedge clk)
-            if (clk_video_en) begin
-                lb_q_ev  <= lb_ev[{scan_bank, ev_idx}];
-                lb_q_od  <= lb_od[{scan_bank, od_idx}];
-                rd_w0par <= rd_w0[0];
-                rd_ph    <= px3[1:0];
-            end
-        assign scan_word_q = rd_w0par ? lb_q_od : lb_q_ev;
-        // R/G/B by the R byte's address phase (bytes 4k+ph, +1, +2):
-        //   ph 0: R=ev.hi G=ev.lo B=od.hi        ph 1: R=ev.lo G=od.hi B=od.lo
-        //   ph 2: R=od.hi G=od.lo B=ev.hi (ev = the NEXT even word)
-        //   ph 3: R=od.lo G=ev.hi B=ev.lo
-        assign scan24_r = (rd_ph == 2'd0) ? lb_q_ev[15:8] :
-                          (rd_ph == 2'd1) ? lb_q_ev[7:0]  :
-                          (rd_ph == 2'd2) ? lb_q_od[15:8] :
-                                            lb_q_od[7:0];
-        assign scan24_g = (rd_ph == 2'd0) ? lb_q_ev[7:0]  :
-                          (rd_ph == 2'd1) ? lb_q_od[15:8] :
-                          (rd_ph == 2'd2) ? lb_q_od[7:0]  :
-                                            lb_q_ev[15:8];
-        assign scan24_b = (rd_ph == 2'd0) ? lb_q_od[15:8] :
-                          (rd_ph == 2'd1) ? lb_q_od[7:0]  :
-                          (rd_ph == 2'd2) ? lb_q_ev[15:8] :
-                                            lb_q_ev[7:0];
-
-`ifdef SIMULATION
-        reg [15:0] underrun_last = 16'd0;
-        always @(posedge clk)
-            if (vbl_pulse && underrun_cnt != underrun_last) begin
-                $display("[MDC] scanline fetch underruns: %0d (+%0d)",
-                         underrun_cnt, underrun_cnt - underrun_last);
-                underrun_last <= underrun_cnt;
-            end
-`endif
-
-    end endgenerate
+    assign vram_scan_addr = VRAM_BASE + {1'b0, fetch_word_addr};
+    assign vram_scan_rd   = clk_video_en;
 
     // ========================================================================
     // SDRAM/BRAM state machine — CPU access only (scanout uses port B)
@@ -605,8 +371,6 @@ module nubus_video_mdc824 #(
     localparam S_CPU_RMW_READ      = 4'd7;
     localparam S_CPU_RMW_READ_WAIT = 4'd8;
     localparam S_CPU_RMW_WRITE     = 4'd9;
-    localparam S_PK_ISSUE          = 4'd10;  // packed aperture: raise strobe
-    localparam S_PK_WAIT           = 4'd11;  // packed aperture: wait ready
 
     reg [3:0] state;
     reg [15:0] cpu_write_data;
@@ -618,64 +382,15 @@ module nubus_video_mdc824 #(
     // BRAM/cold-tail steer: one FSM, two targets. ext_sel_r is latched at
     // cycle accept; the FSM's generic rd/wr/ready plumbing fans out to
     // whichever port owns the word. RMW partial writes work identically
-    // over both (read-merge-write through the same mux). With VRAM_WORDS=0
-    // (SDRAM-backed VRAM) every word steers ext.
-    /* verilator lint_off UNSIGNED */
-    /* verilator lint_off CMPCONST */
-    wire cpu_word_in_bram = (VRAM_WORDS != 0) && (cpu_vram_word < VRAM_WORDS);
-    /* verilator lint_on CMPCONST */
-    /* verilator lint_on UNSIGNED */
+    // over both (read-merge-write through the same mux).
     reg  ext_sel_r;
     reg  port_rd_r, port_wr_r;
-    reg [1:0] port_ds_r;    // write byte strobes; 2'b11 for all linear writes
     assign vram_rd = port_rd_r & ~ext_sel_r;
     assign vram_wr = port_wr_r & ~ext_sel_r;
     assign ext_rd  = port_rd_r &  ext_sel_r;
     assign ext_wr  = port_wr_r &  ext_sel_r;
-    assign vram_ds = port_ds_r;
-    assign ext_ds  = port_ds_r;
     wire        port_ready = ext_sel_r ? ext_ready : vram_ready;
     wire [15:0] port_din   = ext_sel_r ? ext_din   : vram_din;
-
-    // ---- packed-RGB aperture (ctrl bit 2; MAME jmfb rgb_pack/rgb_unpack) ---
-    // Aperture longword p (local_addr[20:2]) is one pixel, stored as bytes
-    // 3p+0/1/2 = R/G/B. On our 16-bit bus each half maps to 0-2 storage
-    // byte ops: half 0 = {X,R} (X dropped on write, reads back $00), half 1
-    // = {G,B}. A same-word G/B pair collapses to one full-word op; the rest
-    // are single-byte ops via the byte strobes (no RMW). Bytes past the 1MB
-    // card are dropped on write and read $FF — which also reproduces the
-    // partial last pixel MAME exposes at the packed tail (1MB%3 = 1 byte).
-    wire pack_mode = ctrl[2];
-    wire [18:0] pk_pixel = local_addr[20:2];
-    wire [20:0] pk_sb = {2'd0, pk_pixel} + {1'd0, pk_pixel, 1'b0};  // 3*pixel
-    wire [20:0] pk_b0 = pk_sb;                 // R
-    wire [20:0] pk_b1 = pk_sb + 21'd1;         // G
-    wire [20:0] pk_b2 = pk_sb + 21'd2;         // B
-    // Presented-size gate: storage bytes at or past the card's VRAM end are
-    // dropped on write / read $FF — the aperture scales with TOTAL_WORDS
-    // exactly as the real card's packed view scales with fitted VRAM (MAME
-    // installs it as vramsize/3*4 bytes). Was a hardcoded 1MB bit test.
-    localparam [20:0] PK_BYTES = TOTAL_WORDS * 2;
-    wire pk_b0_ok = (pk_b0 < PK_BYTES);
-    wire pk_b1_ok = (pk_b1 < PK_BYTES);
-    wire pk_b2_ok = (pk_b2 < PK_BYTES);
-    reg        pk_we;        // current packed op is a write
-    reg        pk_second;    // a second op is queued
-    reg        pk_full;      // read op returns the whole word (same-word G,B)
-    reg        pk_take_hi;   // read op: target byte is port_din's high lane
-    reg        pk_put_hi;    // read op: place byte into data_out[15:8]
-    reg [19:0] pk_word2;     // second op: storage word
-    reg [1:0]  pk_ds2;       //            write strobes
-    reg [15:0] pk_data2;     //            write data
-    reg        pk_take_hi2, pk_put_hi2;
-
-    /* verilator lint_off UNSIGNED */
-    /* verilator lint_off CMPCONST */
-    function automatic pk_word_in_bram(input [19:0] w);
-        pk_word_in_bram = (VRAM_WORDS != 0) && ({12'd0, w} < VRAM_WORDS);
-    endfunction
-    /* verilator lint_on CMPCONST */
-    /* verilator lint_on UNSIGNED */
 
     // NuBus ack timing
     reg [2:0] ack_delay;
@@ -782,11 +497,6 @@ module nubus_video_mdc824 #(
             cpu_write_data <= 16'd0;
             cpu_write_merged <= 16'd0;
             cpu_write_strobes <= 2'b00;
-            port_ds_r <= 2'b11;
-            pk_we <= 1'b0; pk_second <= 1'b0; pk_full <= 1'b0;
-            pk_take_hi <= 1'b0; pk_put_hi <= 1'b0;
-            pk_word2 <= 20'd0; pk_ds2 <= 2'b00; pk_data2 <= 16'd0;
-            pk_take_hi2 <= 1'b0; pk_put_hi2 <= 1'b0;
             ack_n <= 1'b1;
             ack_delay <= 3'd0;
             rom_read_pending <= 1'b0;
@@ -839,100 +549,12 @@ module nubus_video_mdc824 #(
                         ack_uds_lds <= uds_lds;
                         ack_rw_n <= rw_n;
 
-                        // ---- packed-RGB VRAM write (ctrl bit 2 set) ----
-                        if (!rw_n && addr_is_vram && pack_mode) begin
-                            pk_we <= 1'b1;
-                            pk_full <= 1'b0;
-                            pk_second <= 1'b0;
-                            if (!local_addr[1]) begin
-                                // {X,R}: X dropped; R -> storage byte 3p
-                                if (uds_lds[0] && pk_b0_ok) begin
-                                    vram_addr <= VRAM_BASE + {5'd0, pk_b0[20:1]};
-                                    vram_dout <= {data_in[7:0], data_in[7:0]};
-                                    port_ds_r <= pk_b0[0] ? 2'b01 : 2'b10;
-                                    ext_sel_r <= !pk_word_in_bram(pk_b0[20:1]);
-                                    state     <= S_PK_ISSUE;
-                                end else
-                                    ack_delay <= 3'd2;  // X-only or out of range
-                            end else begin
-                                // {G,B} -> storage bytes 3p+1, 3p+2
-                                if (uds_lds[1] && uds_lds[0]
-                                    && !pk_b1[0] && pk_b1_ok) begin
-                                    // G even: both bytes live in one word
-                                    vram_addr <= VRAM_BASE + {5'd0, pk_b1[20:1]};
-                                    vram_dout <= data_in;
-                                    port_ds_r <= 2'b11;
-                                    ext_sel_r <= !pk_word_in_bram(pk_b1[20:1]);
-                                    state     <= S_PK_ISSUE;
-                                end else if (uds_lds[1] && pk_b1_ok) begin
-                                    // G now; B (if strobed and in range) queued
-                                    vram_addr <= VRAM_BASE + {5'd0, pk_b1[20:1]};
-                                    vram_dout <= {data_in[15:8], data_in[15:8]};
-                                    port_ds_r <= pk_b1[0] ? 2'b01 : 2'b10;
-                                    ext_sel_r <= !pk_word_in_bram(pk_b1[20:1]);
-                                    pk_second <= uds_lds[0] && pk_b2_ok;
-                                    pk_word2  <= pk_b2[20:1];
-                                    pk_ds2    <= pk_b2[0] ? 2'b01 : 2'b10;
-                                    pk_data2  <= {data_in[7:0], data_in[7:0]};
-                                    state     <= S_PK_ISSUE;
-                                end else if (uds_lds[0] && pk_b2_ok) begin
-                                    // B only
-                                    vram_addr <= VRAM_BASE + {5'd0, pk_b2[20:1]};
-                                    vram_dout <= {data_in[7:0], data_in[7:0]};
-                                    port_ds_r <= pk_b2[0] ? 2'b01 : 2'b10;
-                                    ext_sel_r <= !pk_word_in_bram(pk_b2[20:1]);
-                                    state     <= S_PK_ISSUE;
-                                end else
-                                    ack_delay <= 3'd2;
-                            end
-                        end
-                        // ---- packed-RGB VRAM read ----
-                        else if (rw_n && addr_is_vram && pack_mode) begin
-                            pk_we <= 1'b0;
-                            pk_full <= 1'b0;
-                            pk_second <= 1'b0;
-                            if (!local_addr[1]) begin
-                                // {X,R}: X reads $00; R from storage byte 3p
-                                data_out <= 16'h00FF;
-                                if (pk_b0_ok) begin
-                                    vram_addr  <= VRAM_BASE + {5'd0, pk_b0[20:1]};
-                                    pk_take_hi <= !pk_b0[0];
-                                    pk_put_hi  <= 1'b0;
-                                    ext_sel_r  <= !pk_word_in_bram(pk_b0[20:1]);
-                                    state      <= S_PK_ISSUE;
-                                end else
-                                    ack_delay <= 3'd2;
-                            end else begin
-                                // {G,B}; bytes past the card read $FF
-                                data_out <= 16'hFFFF;
-                                if (!pk_b1[0] && pk_b1_ok) begin
-                                    // same word: {G,B} verbatim
-                                    vram_addr <= VRAM_BASE + {5'd0, pk_b1[20:1]};
-                                    pk_full   <= 1'b1;
-                                    ext_sel_r <= !pk_word_in_bram(pk_b1[20:1]);
-                                    state     <= S_PK_ISSUE;
-                                end else if (pk_b1[0] && pk_b1_ok) begin
-                                    // straddle: G = low lane of its word, B =
-                                    // high lane of the next (queued if in range)
-                                    vram_addr  <= VRAM_BASE + {5'd0, pk_b1[20:1]};
-                                    pk_take_hi <= 1'b0;
-                                    pk_put_hi  <= 1'b1;
-                                    ext_sel_r  <= !pk_word_in_bram(pk_b1[20:1]);
-                                    pk_second  <= pk_b2_ok;
-                                    pk_word2   <= pk_b2[20:1];
-                                    pk_take_hi2<= 1'b1;
-                                    pk_put_hi2 <= 1'b0;
-                                    state      <= S_PK_ISSUE;
-                                end else
-                                    ack_delay <= 3'd2;  // both out of range
-                            end
-                        end
                         // ---- VRAM write (raw, no inversion) ----
                         // word < VRAM_WORDS -> BRAM; < TOTAL_WORDS -> cold
                         // tail (ext port); beyond -> ack-and-drop as before.
-                        else if (!rw_n && addr_is_vram) begin
+                        if (!rw_n && addr_is_vram) begin
                             if (cpu_vram_word < TOTAL_WORDS) begin
-                                ext_sel_r <= !cpu_word_in_bram;
+                                ext_sel_r <= (cpu_vram_word >= VRAM_WORDS);
                                 vram_addr <= VRAM_BASE + {5'd0, cpu_vram_word};
                                 cpu_write_data <= data_in;
                                 cpu_write_strobes <= uds_lds;
@@ -952,7 +574,7 @@ module nubus_video_mdc824 #(
                         // ---- VRAM read (raw) ----
                         else if (rw_n && addr_is_vram) begin
                             if (cpu_vram_word < TOTAL_WORDS) begin
-                                ext_sel_r <= !cpu_word_in_bram;
+                                ext_sel_r <= (cpu_vram_word >= VRAM_WORDS);
                                 vram_addr <= VRAM_BASE + {5'd0, cpu_vram_word};
                                 state <= S_CPU_READ;
                             end else begin
@@ -996,7 +618,6 @@ module nubus_video_mdc824 #(
                 end
 
                 S_CPU_WRITE: begin
-                    port_ds_r <= 2'b11;
                     port_wr_r <= 1'b1;
                     state <= S_CPU_WRITE_WAIT;
                 end
@@ -1041,49 +662,8 @@ module nubus_video_mdc824 #(
 
                 S_CPU_RMW_WRITE: begin
                     vram_dout <= cpu_write_merged;
-                    port_ds_r <= 2'b11;
                     port_wr_r <= 1'b1;
                     state <= S_CPU_WRITE_WAIT;
-                end
-
-                S_PK_ISSUE: begin
-                    if (pk_we) port_wr_r <= 1'b1;
-                    else       port_rd_r <= 1'b1;
-                    state <= S_PK_WAIT;
-                end
-
-                S_PK_WAIT: begin
-                    if (port_ready) begin
-                        port_wr_r <= 1'b0;
-                        port_rd_r <= 1'b0;
-                        if (!pk_we) begin
-                            if (pk_full)
-                                data_out <= port_din;
-                            else if (pk_put_hi)
-                                data_out[15:8] <= pk_take_hi ? port_din[15:8]
-                                                             : port_din[7:0];
-                            else
-                                data_out[7:0]  <= pk_take_hi ? port_din[15:8]
-                                                             : port_din[7:0];
-                        end
-                        if (pk_second) begin
-                            // strobes are low for exactly one cycle here, so
-                            // the ext backend's level-ready clears before the
-                            // second op's rising edge (contract in
-                            // mdc_vram_ddr.sv)
-                            pk_second  <= 1'b0;
-                            vram_addr  <= VRAM_BASE + {5'd0, pk_word2};
-                            vram_dout  <= pk_data2;
-                            port_ds_r  <= pk_ds2;
-                            ext_sel_r  <= !pk_word_in_bram(pk_word2);
-                            pk_take_hi <= pk_take_hi2;
-                            pk_put_hi  <= pk_put_hi2;
-                            state      <= S_PK_ISSUE;
-                        end else begin
-                            ack_delay <= 3'd2;
-                            state <= S_IDLE;
-                        end
-                    end
                 end
 
                 default: state <= S_IDLE;
@@ -1113,13 +693,13 @@ module nubus_video_mdc824 #(
     end
 
     // Big-endian: byte_sel=0 -> [15:8], byte_sel=1 -> [7:0]
-    wire [7:0] vram_byte = byte_sel_d ? scan_word_q[7:0] : scan_word_q[15:8];
+    wire [7:0] vram_byte = byte_sel_d ? vram_scan_data[7:0] : vram_scan_data[15:8];
 
     reg [7:0] pixel_idx;
     always @(*) begin
         pixel_idx = 8'd0;
         case (mode)
-            3'd0: begin  // 1bpp
+            2'd0: begin  // 1bpp
                 case (h_cnt_d)
                     3'd0: pixel_idx = {7'd0, vram_byte[7]};
                     3'd1: pixel_idx = {7'd0, vram_byte[6]};
@@ -1131,7 +711,7 @@ module nubus_video_mdc824 #(
                     3'd7: pixel_idx = {7'd0, vram_byte[0]};
                 endcase
             end
-            3'd1: begin  // 2bpp
+            2'd1: begin  // 2bpp
                 case (h_cnt_d[1:0])
                     2'd0: pixel_idx = {6'd0, vram_byte[7:6]};
                     2'd1: pixel_idx = {6'd0, vram_byte[5:4]};
@@ -1139,34 +719,23 @@ module nubus_video_mdc824 #(
                     2'd3: pixel_idx = {6'd0, vram_byte[1:0]};
                 endcase
             end
-            3'd2: begin  // 4bpp
+            2'd2: begin  // 4bpp
                 pixel_idx = h_cnt_d[0] ? {4'd0, vram_byte[3:0]}
                                        : {4'd0, vram_byte[7:4]};
             end
-            default: begin  // 8bpp (24bpp bypasses pixel_idx entirely)
+            2'd3: begin  // 8bpp
                 pixel_idx = vram_byte;
             end
         endcase
     end
 
     wire pixel_valid = !blanking_d;
-    wire mono_mode = DEFAULT_MONOCHROME || monochrome || (mode == 3'd0);
+    wire mono_mode = DEFAULT_MONOCHROME || monochrome || (mode == 2'd0);
     // 1bpp (and forced mono): bit clear -> light (0xEE), set -> dark (0x22).
     wire [7:0] mono_pixel = pixel_idx[0] ? 8'h22 : 8'hEE;
-    // 24bpp is direct colour — no CLUT (MAME jmfb renders the raw bytes; a
-    // mono monitor takes the blue channel, matching update_screen<0xd>).
-    wire [7:0] px24_r = mono_mode ? scan24_b : scan24_r;
-    wire [7:0] px24_g = mono_mode ? scan24_b : scan24_g;
-    wire [7:0] px24_b = scan24_b;
-    assign vga_r = !pixel_valid ? 8'd0 :
-                   mode24       ? px24_r :
-                   mono_mode    ? mono_pixel : clut[pixel_idx][7:0];
-    assign vga_g = !pixel_valid ? 8'd0 :
-                   mode24       ? px24_g :
-                   mono_mode    ? mono_pixel : clut[pixel_idx][15:8];
-    assign vga_b = !pixel_valid ? 8'd0 :
-                   mode24       ? px24_b :
-                   mono_mode    ? mono_pixel : clut[pixel_idx][23:16];
+    assign vga_r = pixel_valid ? (mono_mode ? mono_pixel : clut[pixel_idx][7:0])   : 8'd0;
+    assign vga_g = pixel_valid ? (mono_mode ? mono_pixel : clut[pixel_idx][15:8])  : 8'd0;
+    assign vga_b = pixel_valid ? (mono_mode ? mono_pixel : clut[pixel_idx][23:16]) : 8'd0;
 
     // ========================================================================
     // JTAG debug exposures
