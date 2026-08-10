@@ -1440,7 +1440,16 @@ module emu
 `ifdef ONBOARD_DISPLAY
 	localparam MDC_VRAM_WORDS = 65536;    // 128KB boot config, BRAM scanout
 `else
-	localparam MDC_VRAM_WORDS = 0;        // 1MB, all SDRAM-backed (Option A)
+	// 2026-08-09 bisect retreat (misc-fixes): BOTH streamed-scanout backends
+	// misbehave on HW (DDR: game crashes; SDRAM: display corruption at 256
+	// colours) — scan out of BRAM again, the months-proven port-B shape.
+	// 300KB hot = EXACTLY 640x480@8bpp (words 0..153599; 512x384 fits
+	// inside); the cold tail to 1MB stays CPU-accessible in the SDRAM
+	// window (PrimaryInit's sizing probe at word $7A580 lands there).
+	// Millions now displays as the 8bpp fallback (decode gates 0xD on
+	// VRAM_WORDS==0) — the packed aperture stays correct, so no stray
+	// writes; proper 24bpp display returns with a debugged fast backend.
+	localparam MDC_VRAM_WORDS = 153600;   // 300KB hot BRAM, port-B scanout
 `endif
 	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(MDC_VRAM_WORDS),
 	                     .TOTAL_WORDS(524288)) nubus_card (

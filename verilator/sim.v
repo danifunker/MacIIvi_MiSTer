@@ -733,7 +733,9 @@ module emu
 	// byte $F4B00 included), and scanout runs from the card's internal
 	// 2x512-word line buffer via mdc_scan_fetch + sim_ram's video burst
 	// port twin. Matches MacIIvi.sv default shape (keep in sync).
-	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(0),
+	localparam MDC_VRAM_WORDS = 153600;  // 300KB hot BRAM — keep in sync
+	                                     // with MacIIvi.sv (bisect retreat)
+	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(MDC_VRAM_WORDS),
 	                     .TOTAL_WORDS(524288)) nubus_card (
 		.clk(clk_sys),
 		.reset(!_cpuReset),
@@ -786,9 +788,21 @@ module emu
 
 	// No BRAM card VRAM in the SDRAM-backed shape (VRAM_WORDS=0): the FSM
 	// steers every access ext, scanout runs from the card's line buffer.
-	assign mdc_vram_din       = 16'h0000;
-	assign mdc_vram_ready     = 1'b1;
-	assign mdc_vram_scan_data = 16'h0000;
+	// 300KB hot BRAM (twin of MacIIvi.sv g_mdc_vram; the tie-offs below it
+	// covered the VRAM_WORDS==0 streamed-scanout shape)
+	vram_ram #(.WORDS(MDC_VRAM_WORDS)) mdc_vram (
+		.clk(clk_sys),
+		.addr(mdc_vram_addr),
+		.din(mdc_vram_dout),
+		.ds(mdc_vram_ds),
+		.dout(mdc_vram_din),
+		.rd(mdc_vram_rd),
+		.wr(mdc_vram_wr),
+		.ready(mdc_vram_ready),
+		.addr_b(mdc_vram_scan_addr),
+		.rd_b(mdc_vram_scan_rd),
+		.dout_b(mdc_vram_scan_data)
+	);
 
 	// Scanline fetch client: card line requests -> the VRAM backend's video
 	// port (keep in sync with MacIIvi.sv). Unlike the FPGA build's

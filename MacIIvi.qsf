@@ -357,7 +357,11 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/vram_ram.sv
 # 8bpp drawing may reappear, which is expected and part of the signal.
 # set_global_assignment -name VERILOG_MACRO "MDC_VRAM_DDR=1"
 set_global_assignment -name VERILOG_MACRO "SDRAM_NO_WIN_RELEASE=1"
-# set_global_assignment -name VERILOG_MACRO "SDRAM_NO_VID_PORT=1"
+set_global_assignment -name VERILOG_MACRO "SDRAM_NO_VID_PORT=1"
+# ^ bisect-retreat shape (2026-08-09, misc-fixes): card scans out of 300KB
+# hot BRAM (MDC_VRAM_WORDS=153600 in MacIIvi.sv), so the SDRAM video port
+# is dead weight again — compiled out along with the window-release. DDR
+# stays off. The cold tail to 1MB still rides the SDRAM cpu slot.
 set_global_assignment -name VERILOG_FILE rtl/floppy_track_encoder.v
 set_global_assignment -name VERILOG_FILE rtl/floppy.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ps2_kbd.sv
