@@ -419,7 +419,20 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 # 2 -> +0.078 PADDED all met FIRST ROLL; ALM 94%. SEED stays 2.
 # bisect netlist (misc-fixes: DDR out, SDRAM vid port back, release
 # still out): 2 -> -0.196 TNS -2.4 (HDMI-only), 5 -> +0.060 PADDED all
-# met; ALM 94%. SEED 5 on this branch.
+# met; ALM 94%.
+# ROLLBACK netlist (aac79b6 = proven BRAM scanout, 300KB hot / 512KB
+# presented, + soft-reboot + 4:3 + egret): 2 -> +0.078 PADDED all met
+# FIRST ROLL; ALM 94%, RAM 436/553 (79% — the framebuffer is back in
+# M10K, which is the proof vram_ram infers again). SEED 2.
+#
+# BUILD NOTE (2026-08-10): db/ in the repo holds 3 stale version-
+# incompatible files locked by dead quartus_map handles, so Quartus
+# fails with error 132001 ("Can't remove incompatible database file")
+# and no flow can run here until a reboot clears them. Workaround used
+# for this build: copy the tracked tree elsewhere and compile there —
+# a fresh db, identical sources. NEVER run a standalone quartus_map
+# while scripts/build.sh has a flow open: that collision is what
+# corrupted this db.
 # Per-fit law: every netlist change is a fresh roll — re-sweep, don't assume.
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION OFF
