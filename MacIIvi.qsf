@@ -59,7 +59,7 @@ set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 # 880, cdrom_target 4.8k vs 5.8k, egret ~5.1k both) — the overflow is device
 # fullness, not a port regression. HIGH = maximum register packing density.
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT HIGH
-set_global_assignment -name SEED 5
+set_global_assignment -name SEED 2
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -336,8 +336,6 @@ set_global_assignment -name VERILOG_FILE rtl/scsi.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cd_audio.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ncr5380.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/nubus_video_mdc824.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/mdc_scan_fetch.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/mdc_vram_ddr.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/vram_ram.sv
 # Option B (docs/VRAM_1MB_OPTIONS.md): card VRAM lives on the HPS DDR3
 # channel instead of the SDRAM window. The THREE macros move TOGETHER (a
@@ -349,15 +347,12 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/vram_ram.sv
 # Comment all three out to fall back to Option A.
 # BISECT (2026-08-09, branch misc-fixes): owner reports game crashes with
 # the DDR VRAM build — this build takes ONLY the DDR change out and puts
-# card VRAM back on the SDRAM window (Option A v1, the HW-proven 8c60798
-# shape: video port IN, window-release still compiled OUT — the release
-# mechanism stays retired, it wedged v2.2). Millions CANNOT work on this
-# shape (the sdram port supplies ~0.5 words/clk of the 24bpp need — do
-# not select it while bisecting); the v1 right-edge band under heavy
-# 8bpp drawing may reappear, which is expected and part of the signal.
-# set_global_assignment -name VERILOG_MACRO "MDC_VRAM_DDR=1"
-set_global_assignment -name VERILOG_MACRO "SDRAM_NO_WIN_RELEASE=1"
-set_global_assignment -name VERILOG_MACRO "SDRAM_NO_VID_PORT=1"
+# Card VRAM shape (2026-08-10 rollback): 300KB hot BRAM + cold tail to the
+# presented 512KB in the SDRAM window — the months-proven port-B scanout,
+# restored after BOTH streamed backends (DDR3 and the SDRAM burst port)
+# misbehaved on hardware. The streamed experiment (24bpp Millions, the
+# window-release mechanism, mdc_scan_fetch/mdc_vram_ddr) lives in this
+# branch's history from 8c60798 through eeb3393 if it is ever revisited.
 # ^ bisect-retreat shape (2026-08-09, misc-fixes): card scans out of 300KB
 # hot BRAM (MDC_VRAM_WORDS=153600 in MacIIvi.sv), so the SDRAM video port
 # is dead weight again — compiled out along with the window-release. DDR

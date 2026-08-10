@@ -70,25 +70,6 @@ set_multicycle_path -hold  -end 1 \
     -to   [get_keepers {*sdram:sdram|sd_data[*]~reg0*}]
 
 # ----------------------------------------------------------------------------
-# Window-release sampling registers (Option A v2, rtl/sdram.v rls_*) — same
-# physical argument as sd_data above: rls_addr_q/rls_din_q sample the
-# clk_sys-launched addr/din cones into the 65MHz domain, and those buses only
-# change on clk_sys edges (>= 2 clk_mem periods apart), so a 1-period-late
-# capture latches the same settled value. The downstream release pipeline was
-# DESIGNED for capture skew: a window is only released after three
-# consecutive served verdicts on an op that is held stable for its whole
-# multi-window lifetime, so +/-1 cycle of sampling latency cannot create a
-# wrong release (a new op's first window always executes — rtl/sdram.v
-# comment block). Command/control and every other sdram path stay
-# single-cycle.
-set_multicycle_path -setup -end 2 \
-    -from [get_clocks {*|pll|pll_inst|altera_pll_i|general[1].*|divclk}] \
-    -to   [get_keepers {*sdram:sdram|rls_addr_q[*] *sdram:sdram|rls_din_q[*]}]
-set_multicycle_path -hold  -end 1 \
-    -from [get_clocks {*|pll|pll_inst|altera_pll_i|general[1].*|divclk}] \
-    -to   [get_keepers {*sdram:sdram|rls_addr_q[*] *sdram:sdram|rls_din_q[*]}]
-
-# ----------------------------------------------------------------------------
 # Peripheral (VPA) read-data register — SCSI read-path fit-stabilization.
 # ----------------------------------------------------------------------------
 # periph_din_reg (MacIIvi.sv) captures the peripheral read mux (dataControllerDataOut)

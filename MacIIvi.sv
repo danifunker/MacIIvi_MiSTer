@@ -47,8 +47,16 @@ module emu
 		.VGA_DE_IN(VGA_DE),
 		.VGA_DE(),
 
-		.ARX((!ar) ? 12'd256 : (ar - 1'd1)),
-		.ARY((!ar) ? 12'd171 : 12'd0),
+		// "Original" aspect is TRUE 4:3: both machine modes are 4:3 sources
+		// (mdc824 640x480 sense-6 and 512x384 12" RGB). The 256:171 that sat
+		// here until 2026-08-08 was the Mac Plus 512x342 screen, inherited
+		// through the LC-family import — it asked integer-scale modes for a
+		// 1.497:1 picture, which OVERFLOWS 5:4 panels (V-Integer at
+		// 1280x1024: htarget 960*256/171 = 1437 px -> blank screen) and
+		// squishes 1080p. Do not "restore" it; scripts/aspect_check.py is
+		// the offline gate over sys/video_freak.sv's scaler math.
+		.ARX((!ar) ? 12'd4 : (ar - 1'd1)),
+		.ARY((!ar) ? 12'd3 : 12'd0),
 		.CROP_SIZE(0),
 		.CROP_OFF(0),
 		.SCALE(status[13:12])
@@ -1079,6 +1087,23 @@ module emu
 	wire        cpu_en_p      = clk16_en_p;
 	wire        cpu_en_n      = clk16_en_n;
 	assign      _cpuReset_o   = tg68_reset_n;
+
+	// RESET-instruction soft peripheral reset (2026-08-08, ported from the
+	// MacLC release-warm-restart-fix branch): both guest restart flavors
+	// execute RESET + jump with NO Egret reset, and on real hardware that
+	// instruction drives the external reset line. Stretch the CPU's pulse
+	// to 16 clk for via6522 + the TIP latch (dataController), the pseudovia
+	// INTERRUPT state, the ASC, and the SWIM (the LC's decisive wedge: a
+	// warm boot inheriting ISM mode spins forever in the ROM's ISM->IWM
+	// switch-back poll). Deliberately NOT the system reset (see the rst_cnt
+	// NOTE above) and NOT the NCR/SCC (their setup must survive the ROM's
+	// own T+4s RESET; resetting them regressed cold boot on the LC).
+	reg [3:0] softrst_cnt = 4'd0;
+	always @(posedge clk_sys) begin
+		if (!_cpuReset_o)           softrst_cnt <= 4'hF;
+		else if (softrst_cnt != 0)  softrst_cnt <= softrst_cnt - 1'd1;
+	end
+	wire soft_periph_rst = (softrst_cnt != 0);
 	// The 68k RESET instruction resets chip-level peripherals (NCR5380+SCSI
 	// targets, SCC — see dataController._resetInstr_n) and the pseudo-VIA,
 	// but NOT the CPU/system (reset-source NOTE above: feeding it into
@@ -1327,6 +1352,7 @@ module emu
 	pseudovia pvia(
 		.clk_sys(clk_sys),
 		.reset(~n_reset),
+		.soft_rst(soft_periph_rst),
 		.addr({cpuAddr[12:1], tg68_a[0]}),
 		.data_in(cpuDataOut[7:0]),
 		.data_out(pseudovia_dout),
@@ -1391,10 +1417,16 @@ module emu
 `ifdef ONBOARD_DISPLAY
 	localparam MDC_VRAM_WORDS = 65536;    // 128KB boot config
 `else
-	localparam MDC_VRAM_WORDS = 196608;   // 384KB, 8bpp @ 640x480
+	// 300KB hot BRAM (2026-08-10): EXACTLY 640x480@8bpp (153600 words);
+	// 512x384 fits inside. Was 384KB — the extra 84KB was never scanned.
+	localparam MDC_VRAM_WORDS = 153600;   // 300KB, 8bpp @ 640x480 exactly
 `endif
+	// TOTAL_WORDS 262144 = present 512KB to the OS (owner call 2026-08-09):
+	// the MDC ROM sizes VRAM by probing, and at 512KB it offers up to 256
+	// colours at both resolutions (the 4•8-class config — MAME's 8•24
+	// device carries "512 kB (4•8)" as a legitimate option of this ROM).
 	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(MDC_VRAM_WORDS),
-	                     .TOTAL_WORDS(524288)) nubus_card (
+	                     .TOTAL_WORDS(262144)) nubus_card (
 		.clk(clk_sys),
 		.reset(!_cpuReset),
 		// Real A0 required: the declaration ROM lives on byte lane 3
@@ -1797,7 +1829,9 @@ module emu
 	// V8 schematic SND[0:2]/DFAC_CLK/CULTDAC0: see rtl/asc.sv / rtl/ariel_ramdac.sv
 	asc asc_inst(
 		.clk(clk_sys),
-		.reset(~n_reset),
+		// soft_periph_rst: the RESET instruction resets the ASC (real reset
+		// line) — the warm chime-phase quiet-wait fix; twin in sim.v.
+		.reset(~n_reset || soft_periph_rst),
 		.cs(selectASC),
 		// cpuAddr[0] is forced 0 in this core, so the ASC register A0 (which
 		// selects MODE/FIFOMODE/CLOCK — the odd-numbered regs) gets dropped and
@@ -1887,6 +1921,7 @@ module emu
 		.E_rising(E_rising),
 		.E_falling(E_falling),
 		._systemReset(n_reset),
+		.softRst(soft_periph_rst),
 		.pseudovia_irq(pseudovia_irq),
 		._cpuReset(_cpuReset),
 		._cpuIPL(_cpuIPL_dc),

@@ -38,8 +38,8 @@ module mdc_bench;
     wire [15:0] ext_din;
     wire        ext_ready;
 
-    nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(196608),
-                         .TOTAL_WORDS(524288)) card (
+    nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(153600),
+                         .TOTAL_WORDS(262144)) card (   // shipped shape: 300KB hot, 512KB presented
         .clk(clk), .reset(reset),
         .addr(addr), .data_in(data_in), .uds_lds(uds_lds),
         .cpu_longword(1'b0), .rw_n(rw_n), .cpu_as_n(cpu_as_n),
@@ -82,7 +82,7 @@ module mdc_bench;
     assign ext_din   = ext_mem[vram_addr[19:0]];
     assign ext_ready = ext_ready_r;
 
-    vram_ram #(.WORDS(196608)) vram (
+    vram_ram #(.WORDS(153600)) vram (
         .clk(clk),
         .addr(vram_addr), .din(vram_dout), .dout(vram_din),
         .rd(vram_rd), .wr(vram_wr), .ready(vram_ready),
@@ -248,19 +248,21 @@ module mdc_bench;
             bus_read_q(32'hFE200302, 2'b11);
             expect16(32'hFE200302, 16'h0000, "reg300-lo");
 
-            // (3) THE VRAM SIZING PROBE: write $AAAAAAAA at byte offset
-            //     $F4B00 (~979KB) and read it back — PrimaryInit's 1MB
-            //     presence test. We model the card's default 1MB config, so
-            //     this must succeed. With the old 384KB VRAM_WORDS the
-            //     readback returned $FFFF, PrimaryInit failed, the Slot
-            //     Manager dropped the video sResources and the ROM
-            //     sad-Macced $0F/$33 (smRecNotFnd) hunting a boot display.
+            // (3) THE VRAM SIZING PROBES (512KB presented, 2026-08-10).
+            //     Near-1MB ($F4B00, word $7A580 >= the presented 262144):
+            //     acked but DROPPED, reads open-bus — that MISS is how
+            //     PrimaryInit rules out the 1MB config and settles on 512KB.
             bus_write_q(32'hFE0F4B00, 16'hAAAA, 2'b11);
-            bus_write_q(32'hFE0F4B02, 16'hAAAA, 2'b11);
             bus_read_q(32'hFE0F4B00, 2'b11);
-            expect16(32'hFE0F4B00, 16'hAAAA, "vram-size-probe-hi");
-            bus_read_q(32'hFE0F4B02, 2'b11);
-            expect16(32'hFE0F4B02, 16'hAAAA, "vram-size-probe-lo");
+            expect16(32'hFE0F4B00, 16'hFFFF, "vram-1mb-probe-miss");
+            //     In-tail probe below 512KB (byte $74B00 = word $3A580):
+            //     must HIT — this is the size the ROM discovers.
+            bus_write_q(32'hFE074B00, 16'hAAAA, 2'b11);
+            bus_write_q(32'hFE074B02, 16'h5555, 2'b11);
+            bus_read_q(32'hFE074B00, 2'b11);
+            expect16(32'hFE074B00, 16'hAAAA, "vram-512k-probe-hi");
+            bus_read_q(32'hFE074B02, 2'b11);
+            expect16(32'hFE074B02, 16'h5555, "vram-512k-probe-lo");
 
             // (4) VRAM low-address readback (framebuffer clear region)
             bus_write_q(32'hFE000000, 16'h5678, 2'b11);
@@ -270,21 +272,21 @@ module mdc_bench;
             bus_read_q(32'hFE000002, 2'b11);
             expect16(32'hFE000002, 16'h9ABC, "vram-low-lo");
 
-            // (4b) BRAM/tail boundary straddle: word 196607 (byte $5FFFE) is
-            //      the last BRAM word, word 196608 (byte $60000) the first
+            // (4b) BRAM/tail boundary straddle: word 153599 (byte $4AFFE) is
+            //      the last BRAM word, word 153600 (byte $4B000) the first
             //      tail word — both must hold values independently.
-            bus_write_q(32'hFE05FFFE, 16'h1122, 2'b11);
-            bus_write_q(32'hFE060000, 16'h3344, 2'b11);
-            bus_read_q(32'hFE05FFFE, 2'b11);
-            expect16(32'hFE05FFFE, 16'h1122, "boundary-bram");
-            bus_read_q(32'hFE060000, 2'b11);
-            expect16(32'hFE060000, 16'h3344, "boundary-ext");
+            bus_write_q(32'hFE04AFFE, 16'h1122, 2'b11);
+            bus_write_q(32'hFE04B000, 16'h3344, 2'b11);
+            bus_read_q(32'hFE04AFFE, 2'b11);
+            expect16(32'hFE04AFFE, 16'h1122, "boundary-bram");
+            bus_read_q(32'hFE04B000, 2'b11);
+            expect16(32'hFE04B000, 16'h3344, "boundary-ext");
 
             // (4c) RMW byte write INTO the tail (odd byte -> LDS strobe):
             //      merges over the ext port's read-modify-write path.
-            bus_write_q(32'hFE060001, 16'h0055, 2'b01);
-            bus_read_q(32'hFE060000, 2'b11);
-            expect16(32'hFE060000, 16'h3355, "ext-rmw-byte");
+            bus_write_q(32'hFE04B001, 16'h0055, 2'b01);
+            bus_read_q(32'hFE04B000, 2'b11);
+            expect16(32'hFE04B000, 16'h3355, "ext-rmw-byte");
 
             // (5) beyond-VRAM reads stay open-bus ($FFFF): the sizing probe
             //     must FAIL cleanly past the installed size (here: at 2MB-1,
