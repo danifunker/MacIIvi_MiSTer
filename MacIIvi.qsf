@@ -420,6 +420,12 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 # bisect netlist (misc-fixes: DDR out, SDRAM vid port back, release
 # still out): 2 -> -0.196 TNS -2.4 (HDMI-only), 5 -> +0.060 PADDED all
 # met; ALM 94%.
+# 320KB netlist (framebuffer grown to clear the driver's base offset):
+# would NOT close — 2 -> -0.143, 5 -> -0.142, 4 -> -0.302, 3 -> -0.039,
+# 6 -> -0.162 (all HDMI-scaler-only, padded). The +16 M10K over 300KB
+# costs ~0.2ns there. Trimmed to 308KB instead.
+# 308KB netlist (157,696 words = 308 M10K, the SHIPPED size): 2 -> +0.072
+# PADDED all met FIRST ROLL; ALM 94%, RAM 440/553. SEED 2.
 # ROLLBACK netlist (aac79b6 = proven BRAM scanout, 300KB hot / 512KB
 # presented, + soft-reboot + 4:3 + egret): 2 -> +0.078 PADDED all met
 # FIRST ROLL; ALM 94%, RAM 436/553 (79% — the framebuffer is back in

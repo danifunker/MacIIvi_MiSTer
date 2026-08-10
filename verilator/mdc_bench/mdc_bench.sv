@@ -38,8 +38,8 @@ module mdc_bench;
     wire [15:0] ext_din;
     wire        ext_ready;
 
-    nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(153600),
-                         .TOTAL_WORDS(262144)) card (   // shipped shape: 300KB hot, 512KB presented
+    nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(163840),
+                         .TOTAL_WORDS(262144)) card (   // shipped shape: 320KB hot, 512KB presented
         .clk(clk), .reset(reset),
         .addr(addr), .data_in(data_in), .uds_lds(uds_lds),
         .cpu_longword(1'b0), .rw_n(rw_n), .cpu_as_n(cpu_as_n),
@@ -82,7 +82,7 @@ module mdc_bench;
     assign ext_din   = ext_mem[vram_addr[19:0]];
     assign ext_ready = ext_ready_r;
 
-    vram_ram #(.WORDS(153600)) vram (
+    vram_ram #(.WORDS(163840)) vram (
         .clk(clk),
         .addr(vram_addr), .din(vram_dout), .dout(vram_din),
         .rd(vram_rd), .wr(vram_wr), .ready(vram_ready),
@@ -272,21 +272,21 @@ module mdc_bench;
             bus_read_q(32'hFE000002, 2'b11);
             expect16(32'hFE000002, 16'h9ABC, "vram-low-lo");
 
-            // (4b) BRAM/tail boundary straddle: word 153599 (byte $4AFFE) is
-            //      the last BRAM word, word 153600 (byte $4B000) the first
+            // (4b) BRAM/tail boundary straddle: word 163839 (byte $4FFFE) is
+            //      the last BRAM word, word 163840 (byte $50000) the first
             //      tail word — both must hold values independently.
-            bus_write_q(32'hFE04AFFE, 16'h1122, 2'b11);
-            bus_write_q(32'hFE04B000, 16'h3344, 2'b11);
-            bus_read_q(32'hFE04AFFE, 2'b11);
-            expect16(32'hFE04AFFE, 16'h1122, "boundary-bram");
-            bus_read_q(32'hFE04B000, 2'b11);
-            expect16(32'hFE04B000, 16'h3344, "boundary-ext");
+            bus_write_q(32'hFE04FFFE, 16'h1122, 2'b11);
+            bus_write_q(32'hFE050000, 16'h3344, 2'b11);
+            bus_read_q(32'hFE04FFFE, 2'b11);
+            expect16(32'hFE04FFFE, 16'h1122, "boundary-bram");
+            bus_read_q(32'hFE050000, 2'b11);
+            expect16(32'hFE050000, 16'h3344, "boundary-ext");
 
             // (4c) RMW byte write INTO the tail (odd byte -> LDS strobe):
             //      merges over the ext port's read-modify-write path.
-            bus_write_q(32'hFE04B001, 16'h0055, 2'b01);
-            bus_read_q(32'hFE04B000, 2'b11);
-            expect16(32'hFE04B000, 16'h3355, "ext-rmw-byte");
+            bus_write_q(32'hFE050001, 16'h0055, 2'b01);
+            bus_read_q(32'hFE050000, 2'b11);
+            expect16(32'hFE050000, 16'h3355, "ext-rmw-byte");
 
             // (5) beyond-VRAM reads stay open-bus ($FFFF): the sizing probe
             //     must FAIL cleanly past the installed size (here: at 2MB-1,

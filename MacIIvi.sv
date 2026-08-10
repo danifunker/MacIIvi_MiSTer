@@ -1417,9 +1417,19 @@ module emu
 `ifdef ONBOARD_DISPLAY
 	localparam MDC_VRAM_WORDS = 65536;    // 128KB boot config
 `else
-	// 300KB hot BRAM (2026-08-10): EXACTLY 640x480@8bpp (153600 words);
-	// 512x384 fits inside. Was 384KB — the extra 84KB was never scanned.
-	localparam MDC_VRAM_WORDS = 153600;   // 300KB, 8bpp @ 640x480 exactly
+	// 308KB hot BRAM (2026-08-10). 640x480@8bpp needs 307,200 visible bytes,
+	// but the DRIVER PLACES THE FRAMEBUFFER AT A BASE OFFSET: sizing this to
+	// exactly 307,200 put the last 4 scanlines past the end of the array and
+	// they scanned out white on hardware (base_bytes = 4*640 = 2,560). The
+	// old 384KB shape hid this behind 86KB of slack. 308KB = 157,696 words =
+	// a clean 308 M10K blocks, covering base+framebuffer with ~9 rows spare.
+	// 320KB was tried first (owner's pick) but would NOT close the HDMI
+	// scaler domain across five seeds (2/5/4/3/6: -0.143/-0.142/-0.302/
+	// -0.039/-0.162 padded) where 300KB closed first roll at +0.078 — the
+	// extra 16 M10K cost ~0.2ns there. Scanout can only reach THIS array —
+	// the cold tail up to the presented 512KB is CPU-visible but not
+	// scannable, so headroom here is what absorbs the driver's base.
+	localparam MDC_VRAM_WORDS = 157696;   // 308KB hot BRAM (308 M10K)
 `endif
 	// TOTAL_WORDS 262144 = present 512KB to the OS (owner call 2026-08-09):
 	// the MDC ROM sizes VRAM by probing, and at 512KB it offers up to 256

@@ -678,6 +678,21 @@ module nubus_video_mdc824 #(
     end
 
     // ========================================================================
+    // Geometry trace (sim only): what base/stride the driver actually programs.
+    // The BRAM framebuffer must cover base_bytes + v_res*stride_bytes; sizing it
+    // to exactly the visible bytes left no room for a non-zero base.
+`ifdef SIMULATION
+    reg [31:0] base_d = 32'hFFFFFFFF, stride_d = 32'hFFFFFFFF;
+    always @(posedge clk) begin
+        if (base_reg !== base_d || stride_reg !== stride_d) begin
+            $display("[MDC-GEOM] base_reg=%08x -> %0d bytes | stride_reg=%08x -> %0d bytes | need %0d bytes",
+                     base_reg, {base_reg[19:0], 5'b0}, stride_reg, {stride_reg[11:0], 2'b0},
+                     {base_reg[19:0], 5'b0} + 480 * {stride_reg[11:0], 2'b0});
+            base_d <= base_reg; stride_d <= stride_reg;
+        end
+    end
+`endif
+
     // Pixel output pipeline (raw VRAM -> index -> palette / mono)
     // ========================================================================
     reg [2:0] h_cnt_d;

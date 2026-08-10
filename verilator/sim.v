@@ -729,7 +729,7 @@ module emu
 	// boot-display hunt dies smRecNotFnd, sad Mac $0F/$33. The tail
 	// answers the probe; nothing is ever scanned out from it (8bpp @
 	// 640x480 = 300KB fits BRAM). Matches MacIIvi.sv (keep in sync).
-	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(153600),   // 300KB — keep in sync with MacIIvi.sv
+	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(157696),   // 308KB — keep in sync with MacIIvi.sv
 	                     .TOTAL_WORDS(262144)) nubus_card (   // 512KB presented
 		.clk(clk_sys),
 		.reset(!_cpuReset),
@@ -770,7 +770,7 @@ module emu
 		.dbg_irq_cnt(), .dbg_ack_cnt(), .dbg_vblank_enable()
 	);
 
-	vram_ram #(.WORDS(153600)) mdc_vram (   // 300KB BRAM — must match VRAM_WORDS above
+	vram_ram #(.WORDS(157696)) mdc_vram (   // 308KB BRAM — must match VRAM_WORDS above
 		.clk(clk_sys),
 		.addr(mdc_vram_addr),
 		.din(mdc_vram_dout),
