@@ -59,7 +59,7 @@ set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 # 880, cdrom_target 4.8k vs 5.8k, egret ~5.1k both) — the overflow is device
 # fullness, not a port regression. HIGH = maximum register packing density.
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT HIGH
-set_global_assignment -name SEED 2
+set_global_assignment -name SEED 3
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -426,6 +426,10 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 # costs ~0.2ns there. Trimmed to 308KB instead.
 # 308KB netlist (157,696 words = 308 M10K, the SHIPPED size): 2 -> +0.072
 # PADDED all met FIRST ROLL; ALM 94%, RAM 440/553. SEED 2.
+# scsi-fix netlist (9694cd2 prefetch invalidate, +1 reg-less else arm):
+# 2 -> -0.054, 3 -> +0.042 PADDED all met. Block memory bits and M10K
+# count are IDENTICAL to the pre-fix netlist (3,568,384 / 440) — the fix
+# adds no storage; the ALM delta is fitter noise. SEED 3.
 # ROLLBACK netlist (aac79b6 = proven BRAM scanout, 300KB hot / 512KB
 # presented, + soft-reboot + 4:3 + egret): 2 -> +0.078 PADDED all met
 # FIRST ROLL; ALM 94%, RAM 436/553 (79% — the framebuffer is back in
