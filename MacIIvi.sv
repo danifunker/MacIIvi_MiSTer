@@ -25,7 +25,8 @@ module emu
 	`include "sys/emu_ports.vh"
 );
 	assign ADC_BUS  = 'Z;
-	assign USER_OUT = '1;
+	// USER_OUT is driven by the mt32pi instance (user-port MIDI + I2C);
+	// unused user-port pins are held at '1 inside sys/mt32pi.sv.
 
 	assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
 	assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
@@ -64,7 +65,11 @@ module emu
 	
 	`include "build_id.v"
 	localparam CONF_STR = {
-		"MacIIvi;UART57600:115200;",
+		// UART token: 57600/115200 for MidiLink+PPP, plus MIDI (31250) — the
+		// SCC reaches 31250 through its own WR11/TRxC path (rtl/scc.v), and
+		// the token is what makes Main offer the MIDI mode that gates the
+		// user-port MIDI-in merge below.
+		"MacIIvi;UART57600:115200,MIDI;",
 		"-;",
 		// One floppy only: the real Mac IIvi has a single internal SuperDrive
 		// and no external floppy port. The old "Sec Floppy" (F2, ioctl index 2)
@@ -100,6 +105,31 @@ module emu
 		// caps any stale selection). With an unknown/32MB module only 8/20MB show.
 		"H0O234,Memory,8MB,20MB;",
 		"h0O234,Memory,8MB,20MB,36MB,48MB;",
+		"-;",
+		// MT32-pi (user port). Status bits 22-31 were entirely free here, so
+		// these use the SAME assignments as MacLC — and because MiSTer status
+		// bits are explicitly numbered in the string, adding this page does
+		// NOT shift any existing option or invalidate saved MacIIvi.cfg files.
+		"P1,MT32-pi;",
+		"P1-;",
+		"P1OO,Use MT32-pi,Yes,No;",
+		"P1OQ,Synth,Munt,FluidSynth;",
+		"P1ORS,Munt ROM,MT-32 v1,MT-32 v2,CM-32L;",
+		"P1OTV,SoundFont,0,1,2,3,4,5,6,7;",
+		"P1OMN,Show Info,No,Yes,LCD-On,LCD-Auto;",
+		"I,",
+		"MT32-pi: SoundFont #0,",
+		"MT32-pi: SoundFont #1,",
+		"MT32-pi: SoundFont #2,",
+		"MT32-pi: SoundFont #3,",
+		"MT32-pi: SoundFont #4,",
+		"MT32-pi: SoundFont #5,",
+		"MT32-pi: SoundFont #6,",
+		"MT32-pi: SoundFont #7,",
+		"MT32-pi: MT-32 v1,",
+		"MT32-pi: MT-32 v2,",
+		"MT32-pi: CM-32L,",
+		"MT32-pi: Unknown mode;",
 		"-;",
 		"R5,Interrupt (NMI / MacsBug);",
 		"R6,Reset PRAM & Core;",
@@ -500,6 +530,10 @@ module emu
 
 		.buttons(buttons),
 		.status(status),
+
+		// MT32-pi "Show Info = Yes" OSD popup (CONF_STR "I," strings, 1-based)
+		.info_req(mt32_info_req),
+		.info({4'd0, mt32_info_disp}),
 		.status_menumask(status_menumask),
 		.sdram_sz(sdram_sz),
 
@@ -529,7 +563,12 @@ module emu
 		.ps2_kbd_led_use(3'b001),
 		.ps2_kbd_led_status({2'b00, capslock}),
 
-		.ps2_mouse(ps2_mouse)
+		.ps2_mouse(ps2_mouse),
+
+		// OSD "UART mode" as Main reports it to the core: 0=None, 1=PPP
+		// (Main maps its modem modes to 1 before sending), 2=Console, 3=MIDI.
+		// Gates the user-port MIDI-in merge at the serialIn assign below.
+		.uart_mode(uart_mode)
 	);
 
 	// ------------------------------------------------------------------------
@@ -563,10 +602,18 @@ module emu
 	assign CLK_VIDEO = clk_sys;
 	assign CE_PIXEL  = mdc_ce_pixel;
 
-	// Video Output — the 8*24 card's scanout (vga_blank is a display enable).
-	assign VGA_R  = mdc_r;
-	assign VGA_G  = mdc_g;
-	assign VGA_B  = mdc_b;
+	// Video Output — the 8*24 card's scanout (vga_blank is a display enable),
+	// with the MT32-pi LCD overlay composited on the FINAL VGA_R/G/B.
+	// ao486 convention: inside the LCD box the video dims to the low 6 bits
+	// and the white text pixel is OR'd into the top 2 bits. mt32_lcd_en/pix
+	// are generated inside sys/mt32pi.sv from the CLK_VIDEO we hand it —
+	// here clk_sys, the card's own scanout domain, so same-domain.
+	// (The ONBOARD_DISPLAY fallback branch above is left un-composited:
+	// it is a bring-up shape, and the overlay is purely cosmetic.)
+	wire       mt32_lcd   = mt32_lcd_en & mt32_lcd_on;
+	assign VGA_R  = mt32_lcd ? {{2{mt32_lcd_pix}}, mdc_r[7:2]} : mdc_r;
+	assign VGA_G  = mt32_lcd ? {{2{mt32_lcd_pix}}, mdc_g[7:2]} : mdc_g;
+	assign VGA_B  = mt32_lcd ? {{2{mt32_lcd_pix}}, mdc_b[7:2]} : mdc_b;
 	assign VGA_DE = mdc_blank;
 	assign VGA_VS = mdc_vs;
 	assign VGA_HS = mdc_hs;
@@ -689,14 +736,19 @@ module emu
 	// interpolated inside cd_audio.sv so the sys/audio_out 48 kHz pickup
 	// doesn't add stair-step imaging.
 	wire signed [15:0] cd_snd_l, cd_snd_r;
-	wire signed [16:0] audio_mix_l = {asc_sample_l[15], asc_sample_l}
-	                               + {cd_snd_l[15], cd_snd_l};
-	wire signed [16:0] audio_mix_r = {asc_sample_r[15], asc_sample_r}
-	                               + {cd_snd_r[15], cd_snd_r};
-	assign AUDIO_L = (audio_mix_l > 17'sd32767)  ? 16'sd32767 :
-	                 (audio_mix_l < -17'sd32768) ? -16'sd32768 : audio_mix_l[15:0];
-	assign AUDIO_R = (audio_mix_r > 17'sd32767)  ? 16'sd32767 :
-	                 (audio_mix_r < -17'sd32768) ? -16'sd32768 : audio_mix_r[15:0];
+	// MT32-pi I2S return joins at unity gain, gated by mt32_use (a Pi is
+	// present AND "Use MT32-pi" is Yes); exact zeros otherwise, so the mix is
+	// bit-identical with no Pi attached or the device disabled from the OSD.
+	wire signed [17:0] audio_mix_l = {{2{asc_sample_l[15]}}, asc_sample_l}
+	                               + {{2{cd_snd_l[15]}}, cd_snd_l}
+	                               + (mt32_use ? {{2{mt32_i2s_l[15]}}, mt32_i2s_l} : 18'sd0);
+	wire signed [17:0] audio_mix_r = {{2{asc_sample_r[15]}}, asc_sample_r}
+	                               + {{2{cd_snd_r[15]}}, cd_snd_r}
+	                               + (mt32_use ? {{2{mt32_i2s_r[15]}}, mt32_i2s_r} : 18'sd0);
+	assign AUDIO_L = (audio_mix_l > 18'sd32767)  ? 16'sd32767 :
+	                 (audio_mix_l < -18'sd32768) ? -16'sd32768 : audio_mix_l[15:0];
+	assign AUDIO_R = (audio_mix_r > 18'sd32767)  ? 16'sd32767 :
+	                 (audio_mix_r < -18'sd32768) ? -16'sd32768 : audio_mix_r[15:0];
 	assign AUDIO_S = 1;
 	assign AUDIO_MIX = 0;
 
@@ -731,6 +783,7 @@ module emu
 	// Serial Ports
 	wire serialOut;
 	wire serialIn;
+	wire [7:0] uart_mode;  // OSD "UART mode" from hps_io (3 = MIDI)
 	wire serialCTS = 1'b1; // Idle/deasserted when no serial device connected
 	wire serialRTS;
 
@@ -761,8 +814,109 @@ module emu
 	// (Previously forced to 1'b1 to dodge a suspected ROM "Break detection loop";
 	// that was a symptom of earlier boot issues, since resolved, not the RX path.)
 	// The line idles high; rxuart double-syncs UART_RXD internally.
-	assign serialIn = UART_RXD;
+	// RX sources:
+	//  - ALWAYS the HPS UART (UART_RXD) — MidiLink / console / PPP.
+	//  - MIDI IN: in OSD UART mode = MIDI ONLY, the user-port MIDI-in line
+	//    (mt32_midi_rx from sys/mt32pi.sv: the Pi's TX pin when an MT32-pi is
+	//    detected, USER_IN[0] otherwise) is AND-merged in. Both lines idle
+	//    high, so the merge is inert until a source transmits; a start bit
+	//    from either reaches the SCC.
+	// The uart_mode gate is load-bearing (MacLC 5ae7589): an unconditional
+	// `mt32_available ? mt32_midi_rx : UART_RXD` mux repointed guest RX at the
+	// Pi whenever one was plugged in, killing EVERY guest-receive path (TX
+	// still worked, so it looked one-directional) — PPP's LCP exposed it.
+	// Outside MIDI mode serialIn is UART_RXD alone; PPP/console unaffected.
+	wire userport_midi_in = (uart_mode == 8'd3) ? mt32_midi_rx : 1'b1;
+	assign serialIn = UART_RXD & userport_midi_in;
 	assign UART_TXD = serialOut;
+
+	// ------------------------------------------------------------------------
+	// MT32-pi on the user port (framework module sys/mt32pi.sv): serial MIDI
+	// out on USER_OUT[1] at the SCC's programmed rate, I2S synth audio back on
+	// USER_IN[2/4/5], I2C detection/control on USER_IN[0]/[3]. The synth path
+	// runs in the fixed 24.576 MHz CLK_AUDIO domain; the LCD-overlay raster
+	// tracker runs on the video clock we pass it (clk_sys = the mdc824 card's
+	// scanout domain) and its box is composited into VGA_R/G/B above.
+	// Mode/ROM/SoundFont come from the OSD "MT32-pi" page (CONF_STR P1,
+	// status[31:24]); "Show Info" (status[23:22]) selects the readout:
+	// 1=Yes -> framework OSD info popup, 2/3=LCD-On/LCD-Auto -> LCD overlay.
+	// ------------------------------------------------------------------------
+	wire [15:0] mt32_i2s_l, mt32_i2s_r;
+	wire        mt32_available;
+	wire        mt32_midi_rx;
+	wire        mt32_disable = status[24];                 // "Use MT32-pi" = No
+	wire        mt32_mute    = mt32_available & mt32_disable;
+	wire        mt32_use     = mt32_available & ~mt32_disable;
+	wire  [1:0] mt32_info    = status[23:22];              // Show Info: No/Yes/LCD-On/LCD-Auto
+	wire  [7:0] mt32_mode, mt32_rom, mt32_sf;
+	wire        mt32_newmode;
+	wire        mt32_lcd_en, mt32_lcd_pix, mt32_lcd_update;
+	mt32pi mt32pi
+	(
+		.CLK_AUDIO(CLK_AUDIO),
+		.CLK_VIDEO(clk_sys),        // card scanout domain (see CLK_VIDEO above)
+		.CE_PIXEL(mdc_ce_pixel),
+		.VGA_VS(mdc_vs),
+		.VGA_DE(mdc_blank),
+		.USER_IN(USER_IN),
+		.USER_OUT(USER_OUT),
+		.reset(~n_reset),
+		.midi_tx(serialOut | mt32_mute),   // idle the Pi's MIDI-in when disabled
+		.midi_rx(mt32_midi_rx),
+		.mt32_i2s_r(mt32_i2s_r),
+		.mt32_i2s_l(mt32_i2s_l),
+		.mt32_available(mt32_available),
+		.mt32_mode_req(status[26]),          // Synth: 0=Munt, 1=FluidSynth
+		.mt32_rom_req(status[28:27]),        // Munt ROM: MT-32 v1/v2/CM-32L
+		.mt32_sf_req({5'd0, status[31:29]}), // SoundFont 0-7
+		.mt32_mode(mt32_mode),
+		.mt32_rom(mt32_rom),
+		.mt32_sf(mt32_sf),
+		.mt32_newmode(mt32_newmode),
+		.mt32_lcd_en(mt32_lcd_en),
+		.mt32_lcd_pix(mt32_lcd_pix),
+		.mt32_lcd_update(mt32_lcd_update)
+	);
+
+	// "Show Info = Yes": on a Pi-acknowledged mode change (mt32_newmode
+	// toggles), flash the mode name via the framework info popup (hps_io
+	// info_req/info -> CONF_STR "I," strings). Block is ao486-verbatim.
+	reg       mt32_info_req;
+	reg [3:0] mt32_info_disp;
+	always @(posedge clk_sys) begin
+		reg old_mode;
+
+		old_mode <= mt32_newmode;
+		mt32_info_req <= (old_mode ^ mt32_newmode) && (mt32_info == 1);
+
+		mt32_info_disp <= (mt32_mode == 'hA2) ? (4'd1 + mt32_sf[2:0]) :
+		                  (mt32_mode == 'hA1 && mt32_rom == 0) ?  4'd9 :
+		                  (mt32_mode == 'hA1 && mt32_rom == 1) ?  4'd10 :
+		                  (mt32_mode == 'hA1 && mt32_rom == 2) ?  4'd11 : 4'd12;
+	end
+
+	// LCD overlay visibility (ao486 pattern): "LCD-On" pins it up, "LCD-Auto"
+	// shows it while the Pi pushes LCD updates and drops it after a timeout.
+	// The timeout counts clk_sys ticks (32.5 MHz here) — ~1.5 s. Cosmetic.
+	reg mt32_lcd_on;
+	always @(posedge clk_sys) begin
+		int to;
+		reg old_update;
+
+		old_update <= mt32_lcd_update;
+		if(to) to <= to - 1;
+
+		if(mt32_info == 2) mt32_lcd_on <= 1;
+		else if(mt32_info != 3) mt32_lcd_on <= 0;
+		else begin
+			if(!to) mt32_lcd_on <= 0;
+			if(old_update ^ mt32_lcd_update) begin
+				mt32_lcd_on <= 1;
+				to <= 50_000_000;
+			end
+		end
+	end
+
 	assign UART_RTS = serialRTS ;
 	assign UART_DTR = UART_DSR;
 
