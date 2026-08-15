@@ -106,3 +106,4 @@ verilator/vram_bench/obj_*/
 verilator/vram_bench/sdram_split.v
 verilator/mdc_bench/obj_*/
 sim*_speed/
+SingleStepTests/*/make*.log
