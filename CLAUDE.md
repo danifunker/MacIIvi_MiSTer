@@ -189,8 +189,18 @@ rows, MAME-captured + IIcx-silicon-adjudicated). The tg68k Verilator bench:
 - ROM: 1MB `4957eb49` (CRC32 61be06e5) = `rom/MacIIvx-IIvi-Performa600.rom`;
   loads at CPU $40000000; overlay mirrors it at $0 until first ROM-region read.
 - Box ID: $5FFFFFFC reads $A55A2016 (Mac IIvi) or $A55A2017 (Performa 600,
-  OSD "Machine" select; ROM masks #$7 → BoxFlag table $4084AB4A). Both
-  machines run 16MHz for now; P600 32MHz CPU mode is a tracked follow-up.
+  OSD "Machine" select O1, reset-latched like Memory; ROM masks #$7 →
+  BoxFlag table $4084AB4A). P600 mode also runs the CPU at "32 MHz":
+  tg68k.v cpu_turbo pulses kernel clkena on BOTH phi edges for off-bus
+  beats (internal micro-cycles + cache hits) — bus cycles, phi grid, E/VIA
+  pacing and every peripheral rate are untouched (the real P600 shape:
+  32 MHz 68030 on the IIvi's 16 MHz bus).
+- 68030 on-chip I+D caches (256B each, TG68K_Cache_030) ENABLED 2026-08-15:
+  logical-tagged, physical line fill, CACR-controlled. Cacheable = fitted
+  RAM + ROM only (IIvi 32-bit map decode in tg68k.v); FC=7 (CPU space,
+  the ROM's must-BERR moves probes) and PMMU-busy/fault windows excluded;
+  line-fill reads borrow the parked bus and are sdram_ram_ready-gated in
+  the DTACK glue exactly like PMMU walker reads (stale-dout class).
 - RAM: contiguous at $0 — OSD options 8/20/36/48MB, gated by the fitted
   SDRAM module (hps_io sdram_sz; 36MB+48MB need a 64MB+ module — undersized
   selections clamp; sim: `--ram 4|8|20|36|48|68`, `--sdram-module 32|64|128`
