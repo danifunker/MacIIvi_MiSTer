@@ -243,9 +243,15 @@ architecture rtl of TG68K_PMMU_030 is
   signal saved_rw           : std_logic := '0';
   signal req_prev           : std_logic := '0';
   signal translation_pending : std_logic := '0';
-  -- ATC (Address Translation Cache), 22 entries per MC68030 hardware
-  -- Uses pseudo-LRU replacement: MRU bit per entry, reset all when full
-  constant ATC_ENTRIES : integer := 22;
+  -- ATC (Address Translation Cache), 22 entries per MC68030 hardware.
+  -- Uses pseudo-LRU replacement: MRU bit per entry, reset all when full.
+  -- MacIIvi-local AREA parameter (2026-08-15): reduced 22 -> 8 to relieve a
+  -- 98%-ALM fit whose STA-met builds misbehaved on hardware (this core's
+  -- documented high-utilization marginality class). Purely a TLB size — a
+  -- smaller ATC walks more, never translates differently. All logic loops
+  -- this constant; the fixed [21:0] debug ports are zero-padded below.
+  -- RE-APPLY THIS ON EVERY Minimig-AGA kernel re-sync (upstream keeps 22).
+  constant ATC_ENTRIES : integer := 8;
   type atc_attr_t is array(0 to ATC_ENTRIES-1) of std_logic_vector(3 downto 0);  -- {U_ACC, CI, M, WP} where U_ACC=NOT(S)=user accessible
   type atc_val_t  is array(0 to ATC_ENTRIES-1) of std_logic;
   type atc_base_t is array(0 to ATC_ENTRIES-1) of std_logic_vector(31 downto 0);
@@ -1509,10 +1515,16 @@ begin
   debug_wstate <= std_logic_vector(to_unsigned(walk_state_t'pos(wstate), 5));
   debug_walk_desc_addr <= desc_addr_reg;
   debug_walk_desc_data <= last_mem_rdat;
-  -- ATC debug: expose buserr and valid flags for all 22 entries
+  -- ATC debug: expose buserr and valid flags for the fitted entries; the
+  -- ports stay [21:0] (probe-deck ABI), tail bits pad to 0 when
+  -- ATC_ENTRIES < 22 (null range when at the full 22).
   gen_atc_debug: for i in 0 to ATC_ENTRIES-1 generate
     debug_atc_buserr(i) <= atc_buserr(i);
     debug_atc_valid(i)  <= atc_valid(i);
+  end generate;
+  gen_atc_debug_pad: for i in ATC_ENTRIES to 21 generate
+    debug_atc_buserr(i) <= '0';
+    debug_atc_valid(i)  <= '0';
   end generate;
   debug_fault_status <= debug_fault_status_latch;
   debug_saved_addr   <= saved_addr_log;

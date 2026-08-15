@@ -188,9 +188,12 @@ rows, MAME-captured + IIcx-silicon-adjudicated). The tg68k Verilator bench:
 
 - ROM: 1MB `4957eb49` (CRC32 61be06e5) = `rom/MacIIvx-IIvi-Performa600.rom`;
   loads at CPU $40000000; overlay mirrors it at $0 until first ROM-region read.
-- Box ID: $5FFFFFFC reads $A55A2016 (Mac IIvi) or $A55A2017 (Performa 600,
-  OSD "Machine" select O1, reset-latched like Memory; ROM masks #$7 →
-  BoxFlag table $4084AB4A). P600 mode also runs the CPU at "32 MHz":
+- Box ID: $5FFFFFFC reads $A55A2016 (Mac IIvi) or $A55A2015 (IIvx — the
+  OSD "Machine" O1 32MHz option, reset-latched like Memory; ROM masks #$7
+  → BoxFlag table $4084AB4A). MAME defines ONLY 2015/2016 on this ROM;
+  the old $A55A2017 "Performa 600" guess was HW-falsified 2026-08-15
+  (every System rejects it — the real P600 is a rebadged IIvx and boots
+  with the IIvx ID). The 32MHz machine also runs the CPU at "32 MHz":
   tg68k.v cpu_turbo pulses kernel clkena on BOTH phi edges for off-bus
   beats (internal micro-cycles + cache hits) — bus cycles, phi grid, E/VIA
   pacing and every peripheral rate are untouched (the real P600 shape:

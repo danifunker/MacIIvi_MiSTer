@@ -94,11 +94,13 @@ module emu
 		"OA,Monitor,640x480 VGA,512x384 12in RGB;",
 		"-;",
 		// Machine (O1 = status[1], reset-latched like Memory): selects the
-		// box-ID longword ($5FFFFFFC = $A55A2016 IIvi / $A55A2017 P600) AND the
-		// CPU speed — P600 runs the kernel's off-bus beats on both phi edges
-		// ("32 MHz" core on the 16 MHz bus, the real P600 shape; tg68k.v
+		// box-ID longword ($5FFFFFFC = $A55A2016 IIvi / $A55A2015 IIvx — the
+		// Performa 600 is a rebadged IIvx and the invented $2017 ID was
+		// HW-falsified, see dataController) AND the CPU speed — the 32 MHz
+		// machine runs the kernel's off-bus beats on both phi edges ("32 MHz"
+		// core on the 16 MHz bus, the real IIvx/P600 shape; tg68k.v
 		// cpu_turbo). Takes effect at the next reset only (R0 below).
-		"O1,Machine,Mac IIvi (16MHz),Performa 600 (32MHz);",
+		"O1,Machine,Mac IIvi (16MHz),IIvx-P600 (32MHz);",
 		// Memory: one line per SDRAM-module tier (O234 = status[4:2]), so only
 		// sizes the fitted module can back are offered. menumask bit 0 = module
 		// >=64MB (from hps_io sdram_sz; H hides when the bit is SET, h when CLEAR).
