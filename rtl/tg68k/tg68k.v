@@ -689,6 +689,19 @@ end
 	generate if (USE_68030_CACHE) begin : gen_cache
 
 		wire        is_030      = (cpu == 2'b10);
+		// D-cache disabled for AREA (2026-08-15): with both caches the design
+		// needs 4353 LABs on a 4191-LAB device (fitter 170012). The measured
+		// boot win is entirely I-side (the ROM enables only CACR.IE; dhit=0
+		// across the whole 40-frame window), while the D side carries the
+		// heaviest fabric — 2.5k array regs + the 16-line alias-invalidate
+		// comparators. Tying DE off INTO the cache instance sweeps the whole
+		// D side at synthesis with zero VHDL changes (kernel sync law intact);
+		// the kernel's CACR register still accepts and reads back DE writes,
+		// so software-visible semantics are unchanged (a D-cache that never
+		// hits is architecturally transparent). Re-enable path: M10K-backed
+		// cache arrays (follow-up), then flip this localparam.
+		localparam  USE_68030_DCACHE = 1'b0;
+		wire        cacr_de_eff = cacr_de & USE_68030_DCACHE;
 		// Translation freshness: the cache module latches i/d_fill_addr from
 		// cache_addr_phys AT MISS-DETECT TIME. While the PMMU is busy (the 1-2
 		// clk ATC-hit freshness window after the kernel presents a new address,
@@ -706,7 +719,7 @@ end
 		// at ordinary RAM addresses that MUST terminate in a bus error (the top
 		// suppresses DTACK). A cached FC=7 line would complete a later probe
 		// from the cache — no bus cycle, no BERR, machine-config corruption.
-		wire d_req = is_030 & cacr_de & (tg68_busstate == 2'b10 || tg68_busstate == 2'b11)
+		wire d_req = is_030 & cacr_de_eff & (tg68_busstate == 2'b10 || tg68_busstate == 2'b11)
 		             & (fc != 3'b111) & xlate_ready;
 		wire d_we  = (tg68_busstate == 2'b11);
 
@@ -778,7 +791,7 @@ end
 			.clk             ( clk             ),
 			.nreset          ( ~reset          ),
 			.cacr_ie         ( cacr_ie         ),
-			.cacr_de         ( cacr_de         ),
+			.cacr_de         ( cacr_de_eff     ),   // tied 0: D side swept (area; see above)
 			.cacr_ifreeze    ( cacr_ifreeze    ),
 			.cacr_dfreeze    ( cacr_dfreeze    ),
 			.cacr_wa         ( cacr_wa         ),
