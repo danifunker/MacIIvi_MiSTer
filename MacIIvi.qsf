@@ -19,7 +19,12 @@ set_global_assignment -name GENERATE_RBF_FILE ON
 set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
 set_global_assignment -name NUM_PARALLEL_PROCESSORS ALL
 set_global_assignment -name SAVE_DISK_SPACE OFF
-set_global_assignment -name SMART_RECOMPILE ON
+# SMART_RECOMPILE stays OFF (was ON from the original import): on 2026-08-08
+# it declared a 4-second "successful" compile that silently reused the
+# previous netlist's db — sources, macros and sdc had all changed. A release
+# flow must never be able to report success without compiling; every gate
+# downstream (STA check, deploy md5) trusted that exit code.
+set_global_assignment -name SMART_RECOMPILE OFF
 set_global_assignment -name MIN_CORE_JUNCTION_TEMP "-40"
 set_global_assignment -name MAX_CORE_JUNCTION_TEMP 100
 set_global_assignment -name POWER_PRESET_COOLING_SOLUTION "23 MM HEAT SINK WITH 200 LFPM AIRFLOW"
@@ -54,7 +59,7 @@ set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 # 880, cdrom_target 4.8k vs 5.8k, egret ~5.1k both) — the overflow is device
 # fullness, not a port regression. HIGH = maximum register packing density.
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT HIGH
-set_global_assignment -name SEED 2
+set_global_assignment -name SEED 7
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -97,7 +102,7 @@ set_global_assignment -name VERILOG_MACRO "USE_ASC_AUDIO=1"
 # rtl/adb_device.sv. Read live in Tools > In-System Sources and Probes Editor
 # (instance "ADB"): last ADB command, mouse/kbd address, last Listen-R3 payload.
 # Keep COMMENTED for release builds.
-set_global_assignment -name VERILOG_MACRO "USE_ADB_ISSP=1"
+# set_global_assignment -name VERILOG_MACRO "USE_ADB_ISSP=1"
 
 # DEBUG (JTAG): uncomment to add an In-System Sources & Probes instance "AUD" in
 # MacIIvi.sv on the ASC sample + a sample-tick counter, to confirm on hardware
@@ -332,6 +337,26 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/cd_audio.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ncr5380.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/nubus_video_mdc824.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nubus/vram_ram.sv
+# Option B (docs/VRAM_1MB_OPTIONS.md): card VRAM lives on the HPS DDR3
+# channel instead of the SDRAM window. The THREE macros move TOGETHER (a
+# tripwire in MacIIvi.sv enforces the pairing): with card VRAM on DDR3,
+# sdram.v's window-release mechanism buys nothing and is unvalidated on
+# hardware (the v2.2 wedge — docs/resume_2026-08-07_vram_1mb.md), and its
+# video port is dead weight (ALMs + muxes on the clk_64 arbitration), so
+# B builds compile both out and run the pre-release controller shape.
+# Comment all three out to fall back to Option A.
+# BISECT (2026-08-09, branch misc-fixes): owner reports game crashes with
+# the DDR VRAM build — this build takes ONLY the DDR change out and puts
+# Card VRAM shape (2026-08-10 rollback): 300KB hot BRAM + cold tail to the
+# presented 512KB in the SDRAM window — the months-proven port-B scanout,
+# restored after BOTH streamed backends (DDR3 and the SDRAM burst port)
+# misbehaved on hardware. The streamed experiment (24bpp Millions, the
+# window-release mechanism, mdc_scan_fetch/mdc_vram_ddr) lives in this
+# branch's history from 8c60798 through eeb3393 if it is ever revisited.
+# ^ bisect-retreat shape (2026-08-09, misc-fixes): card scans out of 300KB
+# hot BRAM (MDC_VRAM_WORDS=153600 in MacIIvi.sv), so the SDRAM video port
+# is dead weight again — compiled out along with the window-release. DDR
+# stays off. The cold tail to 1MB still rides the SDRAM cpu slot.
 set_global_assignment -name VERILOG_FILE rtl/floppy_track_encoder.v
 set_global_assignment -name VERILOG_FILE rtl/floppy.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ps2_kbd.sv
@@ -380,6 +405,49 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 # clk_sys +1.65); sweep hit first roll: 2 -> +0.109 all met, 522/553 M10K.
 # family-sync netlist (ae54950): 2 -> +0.205 worst all met FIRST ROLL (HDMI
 # setup +0.313, clk_sys +1.77); ALM 94%->97% (vol LUT + interp + anchor).
+# option-B netlist (8bc03cb, DDR card VRAM + release swept): 2 -> -0.175
+# TNS -3.3, 5 -> -0.106 TNS -0.106, 4 -> +0.123 ALL MET. HDMI-scaler-only
+# throughout; clk_sys stayed >= +2.1. SEED left at 4.
+# 24bpp netlist (5a6592d, no pad): 4 -> -0.048, 2 -> -0.008. Superseded.
+# RELEASE netlist (8b43331 = B-shape trim + tripwire + 4:3 aspect, 50ps
+# HDMI pad now ACTIVE in the sdc): 2 -> +0.003 PADDED (~+0.053 raw) all
+# met FIRST ROLL; ALM 96% (port trim bought ~400), RAM 144/553. SEED 2.
+# egret no_rw_check netlist (intram finally infers, -2,994 registers):
+# 2 -> +0.096 PADDED (~+0.146 raw) all met FIRST ROLL; ALM 94%. The
+# headroom visibly de-knifed the HDMI edge. SEED stays 2.
+# soft-reboot netlist (e653e74 RESET-instruction peripheral reset):
+# 2 -> +0.078 PADDED all met FIRST ROLL; ALM 94%. SEED stays 2.
+# bisect netlist (misc-fixes: DDR out, SDRAM vid port back, release
+# still out): 2 -> -0.196 TNS -2.4 (HDMI-only), 5 -> +0.060 PADDED all
+# met; ALM 94%.
+# 320KB netlist (framebuffer grown to clear the driver's base offset):
+# would NOT close — 2 -> -0.143, 5 -> -0.142, 4 -> -0.302, 3 -> -0.039,
+# 6 -> -0.162 (all HDMI-scaler-only, padded). The +16 M10K over 300KB
+# costs ~0.2ns there. Trimmed to 308KB instead.
+# 308KB netlist (157,696 words = 308 M10K, the SHIPPED size): 2 -> +0.072
+# PADDED all met FIRST ROLL; ALM 94%, RAM 440/553. SEED 2.
+# scsi-fix netlist (9694cd2 prefetch invalidate, +1 reg-less else arm):
+# 2 -> -0.054, 3 -> +0.042 PADDED all met. Block memory bits and M10K
+# count are IDENTICAL to the pre-fix netlist (3,568,384 / 440) — the fix
+# adds no storage; the ALM delta is fitter noise. SEED 3.
+# MIDI/mt32-pi netlist (c94d9cd: scc.v wholesale + MT32-pi + MIDI-in):
+# 3 -> -0.168, 7 -> +0.175 PADDED all met — the BEST margin recorded on
+# this core. ALM 93% (39,105): the rewritten scc.v retires more logic
+# than mt32pi adds, so the whole MT32-pi subsystem came in net-negative.
+# RAM 441/553. SEED 7 (the seed MacLC shipped their MIDI release on).
+# ROLLBACK netlist (aac79b6 = proven BRAM scanout, 300KB hot / 512KB
+# presented, + soft-reboot + 4:3 + egret): 2 -> +0.078 PADDED all met
+# FIRST ROLL; ALM 94%, RAM 436/553 (79% — the framebuffer is back in
+# M10K, which is the proof vram_ram infers again). SEED 2.
+#
+# BUILD NOTE (2026-08-10): db/ in the repo holds 3 stale version-
+# incompatible files locked by dead quartus_map handles, so Quartus
+# fails with error 132001 ("Can't remove incompatible database file")
+# and no flow can run here until a reboot clears them. Workaround used
+# for this build: copy the tracked tree elsewhere and compile there —
+# a fresh db, identical sources. NEVER run a standalone quartus_map
+# while scripts/build.sh has a flow open: that collision is what
+# corrupted this db.
 # Per-fit law: every netlist change is a fresh roll — re-sweep, don't assume.
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION OFF

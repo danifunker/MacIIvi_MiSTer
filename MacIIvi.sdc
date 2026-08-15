@@ -57,12 +57,17 @@ set_multicycle_path -hold  -end 1 -from [get_keepers {*TG68KdotC_Kernel*}] -to [
 # settled value, so -setup -end 2 is safe. Scope is -from clk_sys -to the
 # sd_data registers only: it does NOT touch the clk_mem->sd_data load-enable
 # (we_latch) path nor the address/command paths, which stay single-cycle.
+# The keeper pattern must also catch fitter-created DUPLICATES of the output
+# register (sd_data[N]~reg0_Duplicate_M): the 2026-08-07 VRAM work added
+# fanout on the din cone and the fitter began cloning sd_data regs — the
+# clone carried this exact already-waived path but its name escaped the
+# original ~reg0 pattern, resurfacing the known -1.9ns as a "new" violation.
 set_multicycle_path -setup -end 2 \
     -from [get_clocks {*|pll|pll_inst|altera_pll_i|general[1].*|divclk}] \
-    -to   [get_keepers {*sdram:sdram|sd_data[*]~reg0}]
+    -to   [get_keepers {*sdram:sdram|sd_data[*]~reg0*}]
 set_multicycle_path -hold  -end 1 \
     -from [get_clocks {*|pll|pll_inst|altera_pll_i|general[1].*|divclk}] \
-    -to   [get_keepers {*sdram:sdram|sd_data[*]~reg0}]
+    -to   [get_keepers {*sdram:sdram|sd_data[*]~reg0*}]
 
 # ----------------------------------------------------------------------------
 # Peripheral (VPA) read-data register — SCSI read-path fit-stabilization.
@@ -114,3 +119,14 @@ set_clock_groups -asynchronous -group [get_clocks {emu|pllv|*|divclk}]
 # clock group above, harmless).
 set_false_path -to [get_keepers {*vmode_meta* *monid_meta* *tbyp_meta* *tsel_meta*}]
 set_false_path -to [get_keepers {*vidrst_meta* *vbl_meta* *hbl_meta*}]
+
+# HDMI-scaler closure margin (2026-08-08): the pll_hdmi divclk domain is the
+# core's documented knife-edge — seed sweeps land between roughly -0.2 and
+# +0.2 ns on it while every Mac-side domain holds >= +2. Pad its intra-domain
+# setup uncertainty by 50 ps so a sweep only ever accepts a seed with real
+# margin: a "met" report here means met by more than temperature/aging luck.
+# (-add stacks on top of derive_clock_uncertainty's jitter numbers.)
+set_clock_uncertainty -add -setup \
+    -from [get_clocks {pll_hdmi|pll_hdmi_inst|altera_pll_i|cyclonev_pll|counter[0].output_counter|divclk}] \
+    -to   [get_clocks {pll_hdmi|pll_hdmi_inst|altera_pll_i|cyclonev_pll|counter[0].output_counter|divclk}] \
+    0.050

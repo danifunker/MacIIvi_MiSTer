@@ -253,7 +253,12 @@ Two resolutions are selectable in the OSD:
 - **640×480 VGA**
 - **512×384 12" RGB**
 
-Aspect ratio and scaling options are available in the OSD.
+Aspect ratio and scaling options are available in the OSD. The "Original"
+aspect is true **4:3** for both monitor modes (fixed 2026-08-08 — it was
+256:171, a Mac Plus 512×342 leftover from the LC-family import, which
+overflowed integer scaling on 5:4 panels into a blank screen and squished
+forced-1080p output; `scripts/aspect_check.py` is the offline regression
+gate for the scaler math).
 
 ## Keyboard & mouse
 
@@ -292,7 +297,10 @@ development workflow.
 Please be aware this core was developed with heavy use of AI tooling, including Claude (Fable, Opus, Sonnet Models) and GPT (Codex), and does borrow from MAME.
 
 ## Known Inaccuracies
-- VRAM is limited to 384KB on the emulated NuBus video card
+- The NuBus video card presents **512KB of VRAM** (the 4•8-class
+  configuration of the MDC ROM), so the Monitors panel offers up to 256
+  colors at both resolutions and does not list the 24-bit "Millions" mode.
+  300KB of it is scannable framebuffer — exactly 640×480 at 256 colors.
 - TG68K CPU is not cycle accurate, however the CPU test suite included in this repository
   was used to verify CPU instruction accuracy against real 68030 silicon
 - No FPU is emulated — correct for a stock Mac IIvi, but software that requires a 68882

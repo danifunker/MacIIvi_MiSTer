@@ -41,6 +41,16 @@
 module pseudovia(
     input clk_sys,
     input reset,
+    // RESET-instruction soft reset (2026-08-08, ported from MacLC's
+    // warm-restart fix): both guest restart flavors execute RESET + jump
+    // with NO Egret reset; on real hardware that instruction drives the
+    // external reset line, resetting the chipset's interrupt state. Left
+    // live, the dying OS's slot_ier/ier survive into the warm boot and the
+    // frame-recomputed slot summary parks the ROM in the slot-interrupt
+    // handler with video still blanked. Clears INTERRUPT state only —
+    // video_config and the reg0/reg1 machine state survive, exactly as on
+    // real hardware.
+    input soft_rst,
 
     // CPU interface - full offset within the $2000 window
     input [12:0] addr,
@@ -119,6 +129,7 @@ always @(posedge clk_sys) begin
         asc_irq_d <= 1'b0;
         vblank_irq_d <= 1'b0;
         data_out <= 8'h00;
+        // (soft_rst arm below restores the INTERRUPT subset of these)
         // Reg $00/$01 initial values from the RUNNING MAME 0.264 oracle
         // (tap capture /tmp/mame_pvia_rw.txt, 2026-07-12): reg0 reads $4F
         // before any write, reg1 (config) reads $06. The local ../mame
@@ -131,6 +142,18 @@ always @(posedge clk_sys) begin
         // (sad Mac $0F/$33).
         reg_b <= 8'h4F;
         reg_config <= 8'h06;
+    end else if (soft_rst) begin
+        // RESET instruction: interrupt state only (see the port comment) —
+        // the same values the hard reset gives these registers (0.264
+        // oracle), with video_config/reg_b/reg_config left running.
+        slot_ier      <= 8'h00;
+        ier           <= 8'h00;
+        vbl_pending_n <= 1'b1;
+        ifr_asc       <= 1'b1;
+        ifr_b2        <= 1'b0;
+        ifr_b5        <= 1'b0;
+        ifr_b6        <= 1'b0;
+        irq_out       <= 1'b0;
     end else begin
         asc_irq_d <= asc_irq;
         vblank_irq_d <= vblank_irq;

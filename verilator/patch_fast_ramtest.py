@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Patch the Mac LC/LC II ROM to make the POST RAM test *fast* without skipping it.
+"""Patch the Mac ROM to make the POST RAM test *fast* without skipping it.
+
+Retargeted 2026-08-07: instead of the LC II's fixed offset $46858, the march
+engine is now FOUND by its full instruction signature (movem.l pats /
+movea.l a0,a2 / suba.w #$78,a1 / bra.s) — the IIvi/IIvx 1MB ROM carries the
+identical engine at $46958 (+0x100). Exactly one match is required.
 
 Unlike patch_skip_ramtest.py (which forces the warm-start path and thereby
 bypasses the cold-boot bookkeeping that computes the post-MMU continuation
@@ -28,7 +33,10 @@ recomputed so the ROM-checksum POST test still passes.
 import struct
 import sys
 
-PATCH_OFFSET = 0x46858
+# march-engine entry signature: movem.l <pats>(pc),d0-d5 / movea.l a0,a2 /
+# suba.w #$78,a1 / bra.s — the patch replaces the suba.w (4 bytes in).
+SIGNATURE = bytes.fromhex("4cfa003f00fa244892fc00786020")
+SIG_TO_PATCH = 8                 # offset of the suba.w within the signature
 OLD = bytes.fromhex("92fc0078")  # suba.w #$78,a1
 NEW = bytes.fromhex("43e80078")  # lea    $78(a0),a1
 
@@ -45,15 +53,21 @@ def main() -> None:
     dst = sys.argv[2] if len(sys.argv) > 2 else "boot0_fastmem.rom"
 
     data = bytearray(open(src, "rb").read())
-    if data[PATCH_OFFSET : PATCH_OFFSET + len(OLD)] != OLD:
-        sys.exit(f"{src}: bytes at {PATCH_OFFSET:#x} don't match the expected "
-                 f"suba.w #$78,a1 — wrong or already-patched ROM")
+    hits = []
+    at = data.find(SIGNATURE)
+    while at != -1:
+        hits.append(at)
+        at = data.find(SIGNATURE, at + 1)
+    if len(hits) != 1:
+        sys.exit(f"{src}: march-engine signature matched {len(hits)} times "
+                 f"(need exactly 1) — wrong or already-patched ROM")
+    patch_offset = hits[0] + SIG_TO_PATCH
 
-    data[PATCH_OFFSET : PATCH_OFFSET + len(NEW)] = NEW
+    data[patch_offset : patch_offset + len(NEW)] = NEW
     struct.pack_into(">I", data, 0, checksum(data))
 
     open(dst, "wb").write(data)
-    print(f"{dst}: patched @ {PATCH_OFFSET:#x} (suba.w->lea), "
+    print(f"{dst}: patched @ {patch_offset:#x} (suba.w->lea), "
           f"new header checksum {checksum(data):08X}")
 
 

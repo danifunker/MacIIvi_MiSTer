@@ -388,6 +388,23 @@ module emu
 	wire        cpu_en_p      = clk16_en_p;
 	wire        cpu_en_n      = clk16_en_n;
 	assign      _cpuReset_o   = tg68_reset_n;
+
+	// RESET-instruction soft peripheral reset (2026-08-08, ported from the
+	// MacLC release-warm-restart-fix branch): both guest restart flavors
+	// execute RESET + jump with NO Egret reset, and on real hardware that
+	// instruction drives the external reset line. Stretch the CPU's pulse
+	// to 16 clk for via6522 + the TIP latch (dataController), the pseudovia
+	// INTERRUPT state, the ASC, and the SWIM (the LC's decisive wedge: a
+	// warm boot inheriting ISM mode spins forever in the ROM's ISM->IWM
+	// switch-back poll). Deliberately NOT the system reset (see the reset
+	// NOTE above) and NOT the NCR/SCC (their setup must survive the ROM's
+	// own T+4s RESET; resetting them regressed cold boot on the LC).
+	reg [3:0] softrst_cnt = 4'd0;
+	always @(posedge clk_sys) begin
+		if (!_cpuReset_o)           softrst_cnt <= 4'hF;
+		else if (softrst_cnt != 0)  softrst_cnt <= softrst_cnt - 1'd1;
+	end
+	wire soft_periph_rst = (softrst_cnt != 0);
 	assign      _cpuRW        = tg68_rw;
 	assign      _cpuAS        = tg68_as_n;
 	assign      _cpuUDS       = tg68_uds_n;
@@ -664,6 +681,7 @@ module emu
 	pseudovia pvia(
 		.clk_sys(clk_sys),
 		.reset(~n_reset),
+		.soft_rst(soft_periph_rst),
 		.addr({cpuAddr[12:1], tg68_a[0]}),
 		.data_in(cpuDataOut[7:0]),
 		.data_out(pseudovia_dout),
@@ -711,8 +729,8 @@ module emu
 	// boot-display hunt dies smRecNotFnd, sad Mac $0F/$33. The tail
 	// answers the probe; nothing is ever scanned out from it (8bpp @
 	// 640x480 = 300KB fits BRAM). Matches MacIIvi.sv (keep in sync).
-	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(196608),
-	                     .TOTAL_WORDS(524288)) nubus_card (
+	nubus_video_mdc824 #(.SLOT_ID(4'hE), .VRAM_WORDS(157696),   // 308KB — keep in sync with MacIIvi.sv
+	                     .TOTAL_WORDS(262144)) nubus_card (   // 512KB presented
 		.clk(clk_sys),
 		.reset(!_cpuReset),
 		// Real A0 required (decl ROM = byte lane 3); see MacIIvi.sv note.
@@ -752,7 +770,7 @@ module emu
 		.dbg_irq_cnt(), .dbg_ack_cnt(), .dbg_vblank_enable()
 	);
 
-	vram_ram #(.WORDS(196608)) mdc_vram (   // 384KB BRAM — must match VRAM_WORDS above
+	vram_ram #(.WORDS(157696)) mdc_vram (   // 308KB BRAM — must match VRAM_WORDS above
 		.clk(clk_sys),
 		.addr(mdc_vram_addr),
 		.din(mdc_vram_dout),
@@ -857,7 +875,9 @@ module emu
 
 	asc asc_inst(
 		.clk(clk_sys),
-		.reset(~n_reset),
+		// soft_periph_rst: RESET instruction resets the ASC — keep in sync
+		// with MacIIvi.sv (warm-restart fix).
+		.reset(~n_reset || soft_periph_rst),
 		.cs(selectASC),
 		// cpuAddr[0] is forced 0; reconstruct the real A0 (tg68_a[0]) so the
 		// odd ASC registers (MODE/FIFOMODE/CLOCK) don't alias onto the even reg
@@ -995,6 +1015,7 @@ module emu
 		.E_rising(E_rising),
 		.E_falling(E_falling),
 		._systemReset(n_reset),
+		.softRst(soft_periph_rst),
 		._cpuReset(_cpuReset),
 		._cpuIPL(_cpuIPL_dc),
 		.pseudovia_irq(pseudovia_irq),
