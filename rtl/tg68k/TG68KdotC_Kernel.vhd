@@ -119,6 +119,14 @@ entity TG68KdotC_Kernel is
 	port(clk						: in std_logic;
 		nReset					: in std_logic;			--low active
 		clkena_in				: in std_logic:='1';
+		-- TRUE ready-ack qualifier for the current bus beat. cpu_wrapper
+		-- releases clkena_in on pmmu_fault so the exception can dispatch;
+		-- such force-completed beats carry stale bus garbage. beat_valid='0'
+		-- marks them: the core advances but consumes NO data (stream latches,
+		-- extension capture, directPC, opcode retire all gate on it).
+		-- Defaults to '1' so instantiations without a wrapper qualifier keep
+		-- the historical behavior.
+		beat_valid				: in std_logic:='1';
 		data_in					: in std_logic_vector(15 downto 0);
 		IPL						: in std_logic_vector(2 downto 0):="111";
 		IPL_autovector			: in std_logic:='0';
@@ -229,6 +237,7 @@ entity TG68KdotC_Kernel is
 		debug_pmmu_ea_mode_latched : out std_logic_vector(5 downto 0);
 		debug_exec_direct_delta : out std_logic;
 		debug_exec_directPC : out std_logic;
+		debug_bus_beat_poisoned : out std_logic;
 		debug_exec_mem_addsub : out std_logic;
 		debug_set_addrlong : out std_logic;
 		debug_mdelta_src : out std_logic_vector(7 downto 0);
@@ -331,10 +340,12 @@ entity TG68KdotC_Kernel is
 		debug_rte_mmu_fix_ssw    : out std_logic_vector(15 downto 0);
 		debug_rte_mmu_fix_opcode : out std_logic_vector(15 downto 0);
 		debug_rte_mmu_fix_write  : out std_logic;
-		debug_rte_format_b_version_error : out std_logic;
-		debug_berr_frame_pc      : out std_logic_vector(31 downto 0);
-		debug_exe_opcode         : out std_logic_vector(15 downto 0);
-		debug_berr_opcode        : out std_logic_vector(15 downto 0)
+		debug_rte_fmt_a_state1 : out std_logic_vector(15 downto 0);
+		debug_rte_fmt_a_ssw : out std_logic_vector(15 downto 0);
+		debug_rte_fmt_a_fault_addr : out std_logic_vector(31 downto 0);
+		debug_rte_fmt_a_data_out : out std_logic_vector(31 downto 0);
+		debug_rte_fmt_a_replay_needed : out std_logic;
+		debug_rte_format_b_version_error : out std_logic
 			);
 end TG68KdotC_Kernel;
 
@@ -367,9 +378,6 @@ architecture logic of TG68KdotC_Kernel is
 	signal exe_pc				: std_logic_vector(31 downto 0);--TH
 	signal opcode_pc			: std_logic_vector(31 downto 0);
 	signal last_opc_pc		: std_logic_vector(31 downto 0);--TH
-	-- End-of-instruction PC captured during operand setup, for the bus-error
-	-- stack frame (Format-$B continue-past fix). See the latch + use below.
-	signal instr_boundary_pc	: std_logic_vector(31 downto 0) := (others => '0');
 	signal last_opc_read		: std_logic_vector(15 downto 0);
 	signal registerin			: std_logic_vector(31 downto 0);
 	signal reg_QA				: std_logic_vector(31 downto 0);
@@ -384,6 +392,34 @@ architecture logic of TG68KdotC_Kernel is
 	signal regin				: std_logic_vector(31 downto 0);
 	type   regfile_t is array(0 to 15) of std_logic_vector(31 downto 0);
 	signal regfile				: regfile_t := (OTHERS => (OTHERS => '0')); -- mikej stops sim X issues;
+	-- MMU RESTART (MMU_RESTART_DESIGN.md phase 1): MC68060-style instruction
+	-- restart for PMMU DATA faults that are not Format-$A/LASTWRITE-eligible
+	-- (reads, mid-MOVEM writes).  regfile_shadow snapshots the merged register
+	-- file at each instruction's decodeOPC edge (capturing the previous
+	-- instruction's same-edge deferred writeback); on fault dispatch the whole
+	-- file is rolled back so plain RTE (NetBSD demand paging) re-executes the
+	-- instruction with clean state.  LASTWRITE write faults keep the replay path.
+	signal regfile_shadow		: regfile_t := (OTHERS => (OTHERS => '0'));
+	signal flags_shadow		: std_logic_vector(7 downto 0) := (OTHERS => '0');
+	signal berr_restart_pc		: std_logic_vector(31 downto 0) := (OTHERS => '0');
+	signal mmu_restart_pending	: std_logic;  -- armed at data-fault first-fire, cleared at dispatch
+	signal mmu_restart_restore	: std_logic;  -- re-applies the rollback one edge after dispatch (straggler writeback)
+	signal mmu_restart_active	: std_logic;  -- combinational: pending OR same-edge (undispatched) restart fault
+	signal mmu_restart_restore_now	: std_logic;  -- same-edge rollback request plus the one-edge hold
+	signal pmmu_fault_restart_live	: std_logic;
+	signal insn_fetch_consumer	: std_logic;  -- decode is consuming the in-flight stream fetch (extension/immediate)
+	signal berr_stack_fetch_squash	: std_logic;  -- bus-error frame push/vector states: suppress parasitic stale-PC prefetch
+	signal rte_b_resume_refetch	: std_logic := '0';  -- after a $B-frame RTE: first opcode retire must come from a FRESH fetch
+	-- Init '1': the reset bootstrap retires PRESET buffer values (opcode
+	-- 2E79 / last_opc_read 4EF9) through the buffered-word path before any
+	-- real fetch completes; '0' here stalls that flow and boots with A7=0.
+	signal opc_buf_valid		: std_logic := '1';  -- last_opc_read holds a beat_valid-acked word (invalid after a force-completed fetch)
+	signal mmu_restart_soft	: std_logic;  -- insn-consumer restart: arm rollback/frame WITHOUT the bus squash (the instruction must drain to the boundary so the deferred insn dispatch can fire)
+	signal pmmu_fault_restart_dispatch : std_logic;
+	-- LASTWRITE eligibility is latched at fault first-fire because the live
+	-- pmmu_fault_lastwrite_ok exclusion terms move with the pipeline.
+	signal berr_pmmu_fault_lastwrite : std_logic;
+	signal berr_pmmu_fault_from_rte_replay : std_logic; -- Saved-write cycle of a Format-A RTE
 	signal RDindex_A			: integer range 0 to 15;
 	signal RDindex_B			: integer range 0 to 15;
 	signal WR_AReg				: std_logic;
@@ -456,6 +492,9 @@ architecture logic of TG68KdotC_Kernel is
 	signal set_exec_tas		: std_logic;
 	signal exec_cas			: std_logic;
 	signal set_exec_cas		: std_logic;
+	signal locked_rmw_active : std_logic;
+	signal pmmu_fault_effective_rw : std_logic;  -- WinUAE-parity Format $A/B: live-vs-latched RW for this fault
+	signal pmmu_fault_lastwrite_ok : std_logic;  -- WinUAE-parity Format $A/B: this write is LASTWRITE-eligible
 
 	signal exe_condition		: std_logic;
 	signal ea_only				: bit;
@@ -545,12 +584,26 @@ architecture logic of TG68KdotC_Kernel is
 	signal rte_mmu_fix_ccr_value : std_logic_vector(7 downto 0) := (others => '0');
 	signal rte_mmu_fix_dest : std_logic_vector(2 downto 0) := (others => '0');
 	signal rte_mmu_fix_size : std_logic_vector(1 downto 0) := (others => '0');
-	-- CONTINUE-PAST CCR FIX (2026-07-02): opcode classes + static-BTST bit number
-	-- recovered from the frame at rte5 (stacked in the +$14 high word).
-	signal rte_mmu_fix_bitnr : std_logic_vector(2 downto 0) := (others => '0');
-	signal rte_mmu_fix_is_move : std_logic;
-	signal rte_mmu_fix_is_tst  : std_logic;
-	signal rte_mmu_fix_is_btst : std_logic;
+	signal rte_mmu_fix_len  : std_logic_vector(2 downto 0) := "010";  -- committed insn byte length (2/4/6)
+	signal rte_mmu_fix_is_tst : std_logic := '0';  -- TST form: commit = CCR + skip only
+	-- DIB substitution (instruction-agnostic software completion): when a
+	-- DF-cleared read frame's opcode is NOT register-committable (memory
+	-- destinations, arithmetic-from-memory, ... - MuForce completes ANY
+	-- instruction shape), arm a one-shot {fault addr, DIB}: the plain-RTE
+	-- restart re-executes the instruction, its read REFAULTS at the same
+	-- address, and instead of dispatching we inject the DIB as the read
+	-- data - the instruction then completes naturally (its own stores,
+	-- flags, side effects). Scope: one instruction (cleared at retire).
+	signal rte_mmu_fix_faddr	: std_logic_vector(31 downto 0) := (others => '0');
+	signal dib_sub_valid		: std_logic := '0';
+	signal dib_sub_fresh		: std_logic := '0';
+	signal bus_beat_poisoned	: std_logic := '0';
+	signal bus_datum_dirty		: std_logic := '0';  -- a beat of the CURRENT in-flight datum was released invalid
+	signal ea_to_pc_datum_invalid : std_logic := '0';  -- full-format memory-indirect pointer read was fault-released
+	signal directpc_retry_hold : std_logic := '0'; -- retry an unacknowledged directPC data beat
+	signal dib_sub_addr		: std_logic_vector(31 downto 0) := (others => '0');
+	signal dib_sub_data		: std_logic_vector(31 downto 0) := (others => '0');
+	signal dib_sub_hit		: std_logic;
 	signal rte_format_b_version_error : std_logic := '0';
 	signal rte_fmt_a_capture_active : std_logic := '0';
 	signal rte_fmt_a_long_index : integer range 0 to 7 := 0;
@@ -572,6 +625,14 @@ architecture logic of TG68KdotC_Kernel is
 	signal trapmake			: bit;
 	signal trapd				: bit;
 	signal trap_SR				: std_logic_vector(7 downto 0);
+	-- Frame-PC latch for short-format (writePC_add) pushes. The push mux
+	-- previously sampled the LIVE TG68_PC_add many cycles after the dispatch
+	-- decision; on hardware the adder inputs move on during the frame-push
+	-- sequence and the interrupt frame stacked PC=0 (frozen slot-watch
+	-- capture at the exec-return boundary: trap3 pushed PC-hi=0 while
+	-- TG68_PC correctly held $572C). Latched once per boundary/dispatch,
+	-- stable across trap0-6.
+	signal trap_pc_latched		: std_logic_vector(31 downto 0) := (others => '0');
 	signal make_trace			: std_logic;
 	signal make_trace_t0		: std_logic;  -- T0 change-of-flow trace mode active for current instruction
 	signal dbcc_t0_suppress	: std_logic := '0';  -- DBcc expired without branching, so no T0 trace
@@ -586,51 +647,23 @@ architecture logic of TG68KdotC_Kernel is
 	-- BUG #414/#415: Latched fault info for Format $A bus error frame
 	signal berr_fault_addr   : std_logic_vector(31 downto 0);  -- Faulting logical address
 	signal berr_frame_pc     : std_logic_vector(31 downto 0);  -- PC stacked in the 68030 bus-fault frame
+	signal stream_consumed_pc : std_logic_vector(31 downto 0) := (others => '0'); -- address of the newest stream word consumed by decode
+	signal insn_next_pc : std_logic_vector(31 downto 0) := (others => '0'); -- continuation PC of the instruction currently in execute: opcode address + 2 per consumed stream word
+	signal berr_pmmu_fault_next_pc : std_logic_vector(31 downto 0) := (others => '0'); -- insn_next_pc latched at PMMU-fault first-fire (the faulted instruction is still the executing one there)
 	signal berr_opcode_saved : std_logic_vector(15 downto 0);  -- Faulted instruction opcode for Format $B replay state
-	-- CONTINUE-PAST FIX v2 (2026-06-21): the FAULTING instruction's opcode + start PC,
-	-- latched at operand setup (setstate="01") BEFORE the data fault / prefetch advance /
-	-- 4E71 opcode-clobber. The external-data-fault frame build stacks PC = exe_pc + the
-	-- decoded instruction length (from this opcode's source EA mode) and this opcode at
-	-- $14, so a DF-cleared "continue-past" RTE resumes on the true next instruction AND
-	-- the rte_mmu_fix register writeback gate decodes the right opcode.
-	signal berr_setup_opcode : std_logic_vector(15 downto 0) := (others => '0');
-	signal berr_setup_exe_pc : std_logic_vector(31 downto 0) := (others => '0');
-	-- CONTINUE-PAST FIX v3 (2026-07-01): berr_bench proved the v2 setstate="01"
-	-- latches go STALE for the real OS probe sequences (lea/moveq/move.l back to
-	-- back: register-only instructions never pass setstate="01", so the latches
-	-- still hold an older instruction -> stacked PC one instruction short -> the
-	-- DF-cleared RTE re-runs the probe -> vector-2 storm; and the $14 opcode
-	-- stash held the stale opcode -> rte_mmu_fix writeback gate never fired).
-	-- v3 captures opcode + opcode_pc at the external-BERR FIRST-FIRE cycle
-	-- (same latch point as berr_external_rw/fc/addr, BUG #431/#434): at that
-	-- moment the faulting instruction is still the EXECUTING one — the 4E71
-	-- opcode-clobber only happens later, when the trap dispatches.
-	signal berr_capture_opcode : std_logic_vector(15 downto 0) := (others => '0');
-	signal berr_capture_pc     : std_logic_vector(31 downto 0) := (others => '0');
-	-- CONTINUE-PAST FIX v4 (2026-07-02): the prefetch pointer TG68_PC captured at
-	-- external-BERR first-fire. berr_bench proved v3's EA-mode length reconstruction
-	-- is wrong for two-word opcodes (btst #imm,(An) is 4 bytes but EA mode 010 ->
-	-- v3 stacked +2 -> resumed mid-instruction -> derail). At first-fire TG68_PC is
-	-- EXACTLY the next-instruction PC + 2 (one prefetched word) for every faulting
-	-- read form the OS validators use, so resume = berr_capture_nextpc - 2, with no
-	-- length decode. (See docs/findings_fline_71_oracle_2026-07-01.md.)
-	signal berr_capture_nextpc : std_logic_vector(31 downto 0) := (others => '0');
-	-- CONTINUE-PAST CCR FIX (2026-07-02): static BTST #imm,<mem> bit number,
-	-- latched from sndOPC at fault first-fire (the immediate is still there:
-	-- nothing refetches sndOPC between the ext-word fetch and the EA read).
-	-- Stacked into the frame +$14 high word (bits 18:16) and recovered at rte5,
-	-- so it round-trips through the frame like the opcode (nesting-safe).
-	signal berr_capture_bitnr : std_logic_vector(2 downto 0) := (others => '0');
 	signal berr_ssw          : std_logic_vector(15 downto 0);  -- Special Status Word
 	signal berr_data_out_saved : std_logic_vector(31 downto 0);  -- Data output buffer saved at berr dispatch
+	signal berr_pmmu_write_data : std_logic_vector(31 downto 0); -- Presented write data latched at PMMU fault first-fire (data_write_muxin covers the exec(write_reg) register-forwarding path that bypasses data_write_tmp)
 	signal berr_long_frame   : std_logic;  -- MC68030 bus fault frame choice: 0=Format $A, 1=Format $B
 	signal berr_external_rw       : std_logic;                       -- BUG #431 FIX: RW latched at external BERR first-fire (state="11")
 	signal berr_external_fc       : std_logic_vector(2 downto 0);   -- BUG #431 FIX: FC latched at external BERR first-fire
 	signal berr_external_datatype : std_logic_vector(1 downto 0);   -- BUG #433b FIX: datatype latched at external BERR first-fire for SSW.SIZE
+	signal berr_external_rmw      : std_logic;                       -- Locked RMW state latched at external BERR first-fire
 	signal berr_pmmu_datatype     : std_logic_vector(1 downto 0);   -- PMMU datatype latched at first-fire for SSW.SIZE
 	signal berr_pmmu_fault_addr   : std_logic_vector(31 downto 0);  -- PMMU fault address latched at first-fire
 	signal berr_pmmu_fault_fc     : std_logic_vector(2 downto 0);   -- PMMU fault FC latched at first-fire
 	signal berr_pmmu_fault_rw     : std_logic;                      -- PMMU fault R/W latched at first-fire
+	signal berr_pmmu_fault_rmw    : std_logic;                      -- PMMU locked-RMW state latched at first-fire
 	signal berr_pmmu_fault_is_insn : std_logic;                     -- PMMU fault type latched at first-fire
 	signal berr_pmmu_fault_valid  : std_logic;                      -- Latched PMMU fault metadata is pending frame construction
 	signal berr_external_addr    : std_logic_vector(31 downto 0);  -- BUG #434 FIX: fault addr latched at external BERR first-fire (addr at state="00" is PC-based)
@@ -776,23 +809,7 @@ architecture logic of TG68KdotC_Kernel is
 	signal pmmu_fault_is_insn_out : std_logic;                    -- BUG #414: Instruction fetch flag from PMMU
 	signal pmmu_pending_flags : std_logic_vector(15 downto 0);
 	signal pmmu_tc_en       : std_logic;
-
-	-- MC68030 instruction-prefetch grace across MMU enable.
-	-- Real HW: when "pmove TC" enables the MMU, instruction words already in the
-	-- prefetch queue / logical instruction cache (fetched while the MMU was off)
-	-- execute WITHOUT being re-translated. The canonical "pmove TC; jmp <alias>"
-	-- relies on this: the jmp itself is prefetched, executes, and only its target
-	-- is translated. TG68K is uncached and refetches the next opcode after the
-	-- pmove, so it would re-translate the still-physical ROM PC and bus-error when
-	-- the ROM execution region is intentionally unmapped (LC II boot bug #3).
-	-- Model the prefetch: while the CPU keeps fetching from the page it was
-	-- executing in when the MMU came on, bypass translation (identity); the first
-	-- instruction fetch that leaves that page (the jmp target) re-arms translation.
-	signal pmmu_tc_en_d       : std_logic := '0';
-	signal mmu_fetch_grace    : std_logic := '0';
-	signal mmu_grace_page     : std_logic_vector(11 downto 0) := (others => '0');
-	signal mmu_grace_suppress : std_logic;
-
+	
 	-- PMMU instruction control signals
 	signal pmmu_ptest_req   : std_logic;
 	signal pmmu_pflush_req  : std_logic;
@@ -1176,37 +1193,52 @@ BEGIN
   pmmu_src_data   <= data_read when (micro_state = pmove_mem_to_mmu_hi or micro_state = pmove_mem_to_mmu_lo) else
                      pmmu_dn_data;
 
-  -- Instruction-prefetch grace (see signal declarations): suppress translation
-  -- for instruction fetches that are still inside the page the CPU was executing
-  -- when the MMU was enabled. addr_out falls back to identity for these (below).
-  -- Two terms: (1) the very cycle the MMU enable goes live (mmu_fetch_grace is only
-  -- registered the next clkena, so without this the first prefetched fetch would
-  -- race ahead and translate); (2) the persistent grace window for the rest of the
-  -- prefetched page. Only instruction fetches (state="00") are graced.
-  mmu_grace_suppress <= '1' when (state = "00" and
-      ( (pmmu_tc_en = '1' and pmmu_tc_en_d = '0')
-        or (mmu_fetch_grace = '1'
-            and pmmu_addr_log_int(31 downto 20) = mmu_grace_page) ))
-                            else '0';
-
   -- Drive PMMU request metadata
   -- Suppress pmmu_req for odd instruction fetches, because vector 3 must win
-  -- before the MMU or external bus sees the cycle. Also suppress during the
-  -- instruction-prefetch grace window so the post-pmove(TC) opcode fetch is not
-  -- re-translated (LC II boot bug #3).
-  -- $00DD4000-$00DD5FFF is the MiSTer shared-memory trapdoor used by upstream
-  -- (Amiga) extra/MiSTerFileSystem.c; board-private I/O that must stay reachable
-  -- even when guest page tables don't map it. Harmless no-op on the Mac (which
-  -- never accesses that range) — kept ANDed in for byte-parity with upstream.
+  -- before the MMU or external bus sees the cycle.
+  -- $00DD4000-$00DD5FFF is the MiSTer shared-memory trapdoor used by
+  -- extra/MiSTerFileSystem.c. It is board-private I/O rather than Amiga RAM,
+  -- so it must remain reachable even when the guest page tables do not map it.
+  -- BUG #458 FIX: a squashed parasitic state="00" prefetch must not reach the
+  -- PMMU either - busstate="01" only silences the external bus, while the
+  -- internal walker would still re-walk the dead page and re-assert
+  -- pmmu_fault inside the bus-error window (double-fault HALT). Frame pushes
+  -- are state="11" and the trap3 handler-PC pop is state="10", so gating only
+  -- state="00" cycles cannot starve the stacking sequence.
   pmmu_req      <= '1' when (state /= "01" and pmmu_tc_en = '1'
+                             and (mmu_restart_pending = '0' or mmu_restart_soft = '1')
                              and not (state = "00" and TG68_PC(0) = '1')
-                             and mmu_grace_suppress = '0'
+                             and not (state = "00" and berr_stack_fetch_squash = '1')
                              and not (pmmu_addr_log_int(31 downto 16) = x"00DD" and
                                       pmmu_addr_log_int(15 downto 13) = "010")) else '0';
   pmmu_is_insn  <= '1' when state = "00" else '0';
   pmmu_rw       <= '0' when state = "11" else '1';
-  pmmu_rmw      <= exec_tas OR exec_cas;
-  pmmu_fc       <= rte_fmt_a_ssw(2 downto 0) when micro_state = rte_mmu_replay else fc_internal;
+  -- exec_tas/exec_cas are decode/execute pulses, while CAS performs its bus
+  -- access in later microstates. Keep locked-cycle identity for the whole
+  -- operand sequence, but never leak it into exception-frame accesses.
+  locked_rmw_active <= '1' when berr_exception_active = '0' and
+                                (exec_tas = '1' or set_exec_tas = '1' or
+                                 exec_cas = '1' or set_exec_cas = '1' or
+                                 micro_state = cas1 or micro_state = cas2 or
+                                 micro_state = cas21 or micro_state = cas22 or
+                                 micro_state = cas23 or micro_state = cas24 or
+                                 micro_state = cas25 or micro_state = cas26 or
+                                 micro_state = cas27 or micro_state = cas28)
+                       else '0';
+  -- RM qualifies only the locked data read/write cycles, never opcode or
+  -- extension-word fetches that happen while a CAS/TAS instruction is active.
+  pmmu_rmw      <= '1' when locked_rmw_active = '1' and state(1) = '1' else '0';
+  -- MOVES FIX: the Format $A replay write must use the fault's stacked SSW.FC
+  -- (e.g. DFC/user for a MOVES.B copyout), NOT the ambient supervisor fc_internal.
+  -- Keep stacked FC off the final rte5 frame-pop beat. The registered bus state
+  -- is still a supervisor read while rte5/rot_cnt=1 schedules the replay write;
+  -- selecting the replay FC in that cycle translates the supervisor stack via
+  -- CRP. Hardware captured the resulting endless RTE fault loop at the final
+  -- stack longword. Once micro_state advances to rte_mmu_replay, state is the
+  -- registered write cycle and the stacked FC is safe to apply.
+  pmmu_fc       <= rte_fmt_a_ssw(2 downto 0)
+                     when micro_state = rte_mmu_replay
+                     else fc_internal;
 
   -- FC from Dn for PTEST/PLOAD/PFLUSH: Read Dn register specified by brief(2:0), extract FC from bits [2:0]
   -- MC68030 spec: When brief(4:3) = "01", FC comes from Dn(2:0) where n = brief(2:0)
@@ -1223,31 +1255,6 @@ BEGIN
   pmmu_mem_rdat    <= pmmu_walker_data;
   pmmu_mem_berr    <= pmmu_walker_berr;  -- MC68030: Bus error from external memory
 
-  -- Instruction-prefetch grace state machine (LC II boot bug #3). Arm on the
-  -- rising edge of the MMU enable, capturing the page the CPU is executing in
-  -- (its prefetched/cached instruction stream); disarm on the first instruction
-  -- fetch that leaves that page (the jmp/branch target), which is translated
-  -- normally. Data accesses are never graced (only state="00" fetches).
-  process(clk)
-  begin
-    if rising_edge(clk) then
-      if nReset = '0' then
-        pmmu_tc_en_d   <= '0';
-        mmu_fetch_grace <= '0';
-        mmu_grace_page  <= (others => '0');
-      elsif clkena_in = '1' then
-        pmmu_tc_en_d <= pmmu_tc_en;
-        if pmmu_tc_en = '1' and pmmu_tc_en_d = '0' then
-          mmu_fetch_grace <= '1';
-          mmu_grace_page  <= TG68_PC(31 downto 20);
-        elsif mmu_fetch_grace = '1' and state = "00"
-              and pmmu_addr_log_int(31 downto 20) /= mmu_grace_page then
-          mmu_fetch_grace <= '0';
-        end if;
-      end if;
-    end if;
-  end process;
-
 	-- BUG #418 FIX: CCR restore disabled. MC68030 UM 6.4.2 says format error
 	-- exception frame must contain the SR loaded from the RTE stack frame,
 	-- including the CCR low byte. Former BUG #397 incorrectly restored the
@@ -1259,8 +1266,10 @@ BEGIN
 	-- MC68030 UM 8.2.2: The status register value in the format error exception
 	-- stack frame is the value in the status register before the RTE instruction
 	-- was executed.
-  restore_ccr_sig <= '1' WHEN trap_format_error='1' OR rte_mmu_fix_ccr_update='1' ELSE '0';
-  restore_ccr_value_mux <= rte_mmu_fix_ccr_value WHEN rte_mmu_fix_ccr_update='1' ELSE rte_saved_ccr;
+  restore_ccr_sig <= '1' WHEN mmu_restart_restore_now='1' OR trap_format_error='1' OR rte_mmu_fix_ccr_update='1' ELSE '0';
+  restore_ccr_value_mux <= flags_shadow WHEN mmu_restart_restore_now='1' ELSE
+                           rte_mmu_fix_ccr_value WHEN rte_mmu_fix_ccr_update='1' ELSE
+                           rte_saved_ccr;
 
 ALU: TG68K_ALU   
 	generic map(
@@ -1334,8 +1343,12 @@ ALU: TG68K_ALU
 		-- BUG #318 FIX: Use latched moves_direction instead of brief(11).
 		-- For indexed/absolute EA modes, brief gets overwritten with the EA extension
 		-- word before moves1 executes, so brief(11) is no longer the MOVES direction bit.
-		process(fc_internal, moves_fc_override, moves_direction, SFC, DFC, micro_state, rte_fmt_a_ssw)
+		process(fc_internal, moves_fc_override, moves_direction, SFC, DFC, micro_state, rte_fmt_a_ssw, rot_cnt, rte_fmt_a_replay_needed)
 		begin
+			-- MOVES FIX: match the pmmu_fc gate above. The Format $A replay write is
+			-- rte5 still owns the final supervisor frame-pop read while it schedules
+			-- the replay. Apply stacked SSW.FC only after the registered replay state
+			-- becomes active, matching pmmu_fc above.
 			if micro_state = rte_mmu_replay then
 				FC <= rte_fmt_a_ssw(2 downto 0);
 			elsif moves_fc_override = '1' then
@@ -1480,6 +1493,16 @@ ALU: TG68K_ALU
 				-- Holding it until idle contaminates rf_dest_addr/rf_source_addr for
 				-- the next instruction, which is exactly what breaks the post-MOVES
 				-- MOVEA/MOVE.L sequence in the mmu.library enable probe.
+				elsif moves_bus_pending = '1' and pmmu_fault = '1' then
+					-- MOVES FIX: MOVES bus access aborted by a PMMU fault. The normal
+					-- completion condition below never fires (clkena_lw is gated during
+					-- the fault and the bus beat never lands memmaskmux(3)='1'), and
+					-- micro_state advances to exception dispatch rather than idle - so
+					-- without this moves_bus_pending stays set through the whole
+					-- exception, leaking moves_fc_override (SFC/DFC) into the supervisor
+					-- frame pushes and handler. Clear it here; the Format $A replay uses
+					-- the frame SSW.FC instead.
+					moves_bus_pending <= '0';
 				elsif moves_bus_pending = '1' and clkena_lw = '1' and memmaskmux(3) = '1' and
 				      (state = "10" or state = "11") then
 					moves_bus_pending <= '0';
@@ -1509,6 +1532,10 @@ ALU: TG68K_ALU
 					-- BUG #318 FIX: Use latched moves_direction instead of brief(11)
 					if micro_state = moves1 and moves_direction = '0' then
 						moves_writeback_pending <= '1';
+					elsif moves_writeback_pending = '1' and pmmu_fault = '1' then
+						-- MOVES read aborted by the PMMU before data returned.  Do not
+						-- let a stale pending writeback fire on a later supervisor read.
+						moves_writeback_pending <= '0';
 					-- BUG #323 FIX: Clear when direct register write fires (state="10"
 					-- with last word of transfer). memmaskmux(3)='1' matches clkena_lw='1'
 					-- which is when the register file process performs the direct write.
@@ -1558,19 +1585,43 @@ ALU: TG68K_ALU
    regin_out <= regin;
 
 
-	-- BUG #428 FIX (completed 2026-07-11): also gate nWr with pmmu_fault, matching
-	-- nUDS/nLDS below. The original BUG #428 fix masked the DATA strobes on a
-	-- faulting write but left nWr asserting, so a pmmu_fault mid-write drove a
-	-- write command onto the bus with both byte lanes masked = the intended write
-	-- SILENTLY DROPPED (memory keeps its stale value) instead of the cycle aborting
-	-- cleanly to berr-and-retry. When the dropped write is a stack push (a return
-	-- address), the later RTS returns to a stale/garbage PC and the CPU derails
-	-- into low-RAM garbage = the POP palette-burst death-flash. Gating nWr too
-	-- suppresses the whole faulting write cycle so the 68030 retries it after the
-	-- fault clears and it commits correctly.
-	nWr <= '0' WHEN state="11" AND pmmu_busy='0' AND pmmu_fault='0' ELSE '1';
+	nWr <= '0' WHEN state="11" AND pmmu_busy='0' AND (mmu_restart_pending='0' OR mmu_restart_soft='1') ELSE '1';
 	-- Suppress bus cycles only for odd instruction fetch address errors before AS* assertion.
-	busstate <= "01" WHEN (state="00" AND TG68_PC(0)='1') OR pmmu_busy='1' ELSE state;
+	-- MMU RESTART squash window: after a restartable data fault, no further bus
+	-- cycles from the aborted instruction may reach memory - the pipeline drains
+	-- to the instruction boundary and every side effect is rolled back there.
+	-- Bus-error stacking fetch squash: from dispatch until trap3's directPC
+	-- redirects TG68_PC, any state="00" instruction fetch is a PARASITIC
+	-- prefetch at the STALE (faulted) PC. On hardware (DDR wait states) it
+	-- re-presents the dead page between frame pushes: fault_reg clears on
+	-- each push's new translation, pmmu_fault_was_cleared latches during the
+	-- stall, the prefetch re-walk re-asserts pmmu_fault -> the double-fault
+	-- guard HALTs on the fault being stacked (NetBSD fork child, boundary
+	-- fetch fault: halt at first push, ATC churned to 22/22 fault entries,
+	-- pushes strobe-gated by the pmmu_fault pulses). Zero-wait sim never
+	-- opens the window, so this is gated on REGISTERED micro_state only
+	-- (see [[sta-loop-artifact]] - no exec-cone signals in bus gates).
+	-- BUG #458 FIX: the window opened one cycle TOO LATE. In the DISPATCH cycle
+	-- itself (setinterrupt registered -> interrupt='1', trap_berr/trap_mmu_berr
+	-- just latched, micro_state still the PRE-trap value with next_micro_state=
+	-- berr_fill) the default state="00" prefetch at the stale PC is already live.
+	-- With a deferred insn-space fault (MOVEM mask word: fault record cleared by
+	-- the instruction's own later store translations -> pmmu_fault_was_cleared
+	-- latched), that prefetch re-walks the SAME dead page, re-asserts pmmu_fault
+	-- inside the just-opened berr window and the double-fault guard HALTs
+	-- (tb_movem_mask_pagefault: fetch $0404 re-walks invalid page $0400-$07FF at
+	-- the idle->berr_fill edge). interrupt/trap_berr/trap_mmu_berr are all
+	-- REGISTERED, so the [[sta-loop-artifact]] rule (no exec-cone signals in bus
+	-- gates) is preserved.
+	berr_stack_fetch_squash <= '1' WHEN micro_state = berr_fill OR micro_state = berr1 OR
+	                                     micro_state = berr2 OR micro_state = berr3 OR
+	                                     micro_state = berr4 OR micro_state = berr5 OR
+	                                     micro_state = berr6 OR micro_state = berr7 OR
+	                                     micro_state = berr8 OR micro_state = trap3 OR
+	                                     (interrupt = '1' AND (trap_berr = '1' OR trap_mmu_berr = '1'))
+	                           ELSE '0';
+	busstate <= "01" WHEN (state="00" AND TG68_PC(0)='1') OR pmmu_busy='1' OR (mmu_restart_pending='1' AND mmu_restart_soft='0')
+	                      OR (state="00" AND berr_stack_fetch_squash='1') ELSE state;
 	nResetOut <= '0' WHEN exec(opcRESET)='1' ELSE '1';
 	
 
@@ -1580,10 +1631,126 @@ ALU: TG68K_ALU
 	-- BUG #428 FIX: Gate bus strobes with pmmu_fault to prevent faulting writes from
 	-- reaching the bus. With the busy='0' override during fault (PMMU fix), UDS/LDS
 	-- would otherwise assert for one cycle before the CPU transitions to berr handling.
-	nUDS <= memmaskmux(5) OR pmmu_busy OR pmmu_fault;
-	nLDS <= memmaskmux(4) OR pmmu_busy OR pmmu_fault;
-	clkena_lw <= '1' WHEN clkena_in='1' AND memmaskmux(3)='1' AND pmmu_busy='0' ELSE '0';
+	nUDS <= memmaskmux(5) OR pmmu_busy OR pmmu_fault OR (mmu_restart_pending AND NOT mmu_restart_soft);
+	nLDS <= memmaskmux(4) OR pmmu_busy OR pmmu_fault OR (mmu_restart_pending AND NOT mmu_restart_soft);
+	-- A force-released final directPC beat is not a completed longword. Keep
+	-- every final-datum consumer (PC, A7, rot_cnt, micro-state) stopped until
+	-- the retry receives a real ack.
+	clkena_lw <= '1' WHEN clkena_in='1' AND memmaskmux(3)='1' AND pmmu_busy='0' AND
+	                       directpc_retry_hold='0' ELSE '0';
+	-- A parasitic instruction-side fault can release clkena_in while an RTE/RTS
+	-- data longword is in flight. That release is not a memory ack:
+	-- hold memmask/state so the same stack word retries. Do not hold the pop's
+	-- own data fault or an external/walker bus error; those must dispatch.
+	-- BUG #459 FIX: also hold directSR/directCCR pop beats (RTE SR word, RTR
+	-- CCR word; exec(directSR) persists rte1-rte5, so this covers every RTE
+	-- frame pop). Pre-fix, a parasitic insn-side fault released the SR-word
+	-- beat and FlagsSR/trap_SR/make_trace/SVmode loaded bus garbage - the
+	-- restart shadow only rolls back the 8-bit CCR, never SR-high, so a
+	-- handler RTE then restored a garbage SR (e.g. S=0 -> pops from USP).
+	-- Signal keeps its historical name; it now guards all direct-pop beats.
+	directpc_retry_hold <= '1' WHEN (exec(directPC)='1' OR exec(directSR)='1' OR
+	                                 exec(directCCR)='1') AND state="10" AND
+	                                  beat_valid='0' AND
+	                                  dib_sub_hit='0' AND berr='0' AND
+	                                  pmmu_walker_berr='0' AND
+	                                  (pmmu_fault='0' OR pmmu_fault_is_insn_out='1') AND
+	                                  (make_berr='0' OR
+	                                   (berr_pmmu_fault_valid='1' AND
+	                                    berr_pmmu_fault_is_insn='1'))
+	                       ELSE '0';
 	clr_berr <= '1' WHEN setopcode='1' AND trap_berr='1' ELSE '0';
+
+	-- MMU RESTART qualifier.  Non-LASTWRITE PMMU DATA faults restart the
+	-- whole instruction; Format $A/LASTWRITE writes keep the existing replay
+	-- path.  Instruction-SPACE faults restart ONLY when the decode is actively
+	-- consuming the faulted stream word (extension/immediate mid-instruction):
+	-- without restart the instruction completes using STALE prefetch data as
+	-- its extension (silent corruption - NetBSD init died on a page-straddling
+	-- immediate).  Speculative readahead faults (no consumer) keep the old
+	-- refetch path - restarting those caused the spurious-prefetch infinite
+	-- loop (MMU_RESTART_DESIGN.md section 9); the consumer strobes are the
+	-- discriminator that section said was missing.
+	-- BUG #458 FIX (part 2/2): the second-opcode-word fetch (MOVEM mask,
+	-- DIVx.L/MULx.L/CAS2/bitfield extensions) is a CONSUMED stream word - the
+	-- set(get_2ndOPC) decode strobe is the discriminator (it fires only for
+	-- opcodes that require the 2nd word; the plain post-setopcode readahead
+	-- keeps the speculative/refetch path). Without this term the mask-word
+	-- fault classified consumer-less: no restart arm, MOVEM ran its stores on
+	-- the (would-be garbage on hardware) mask and the deferred dispatch
+	-- stacked TG68_PC ($0404, PAST the next unexecuted instruction) instead
+	-- of the restart PC ($03FE) - the resume skipped a word. With the term,
+	-- mmu_restart_pending/mmu_restart_soft arm at first-fire, the register
+	-- rollback undoes A6/Dn and the frame stacks berr_restart_pc = exe_pc, so
+	-- a plain handler RTE re-executes MOVEM from scratch. Note this alone did
+	-- NOT fix the HALT - that was the dispatch-cycle squash gap (part 1/2 at
+	-- berr_stack_fetch_squash/pmmu_req): the stale-PC prefetch re-walked the
+	-- dead page in the one uncovered cycle between setinterrupt and
+	-- micro_state=berr_fill, and pmmu_fault_was_cleared (latched by MOVEM's
+	-- own store translations) armed the double-fault guard.
+	insn_fetch_consumer <= '1' WHEN getbrief='1' OR setnextpass='1' OR exec(update_ld)='1' OR
+	                                 set(get_2ndOPC)='1' OR
+	                                 micro_state = ld_nn  OR micro_state = st_nn  OR
+	                                 micro_state = ld_dAn1 OR micro_state = st_dAn1 OR
+	                                 micro_state = ld_AnXn1 OR micro_state = ld_AnXn2 OR
+	                                 micro_state = st_AnXn1 OR micro_state = st_AnXn2 OR
+	                                 micro_state = ld_AnXnbd1 OR micro_state = ld_AnXnbd2 OR micro_state = ld_AnXnbd3 OR
+	                                 micro_state = ld_229_1 OR micro_state = ld_229_2 OR
+	                                 micro_state = ld_229_3 OR micro_state = ld_229_4 OR
+	                                 micro_state = st_229_1 OR micro_state = st_229_2 OR
+	                                 micro_state = st_229_3 OR micro_state = st_229_4
+	                        ELSE '0';
+	pmmu_fault_restart_live <= '1' WHEN pmmu_tc_en = '1' AND
+	                                     pmmu_fault = '1' AND
+	                                     (pmmu_fault_is_insn_out = '0' OR insn_fetch_consumer = '1') AND
+	                                     pmmu_fault_lastwrite_ok = '0'
+	                            ELSE '0';
+	-- Latched PMMU fault metadata can outlive the bus-error transaction while
+	-- the exception path stacks, fetches the handler, or services an unrelated
+	-- trap.  Do not let that stale metadata request a restart rollback; the
+	-- transaction flag is mmu_restart_pending, with this live same-cycle term for
+	-- faults dispatched before the flag is registered.
+	pmmu_fault_restart_dispatch <= '1' WHEN TG68_PC(0) = '0' AND
+	                                         ((mmu_restart_pending = '1' AND make_berr = '1') OR
+	                                          (pmmu_fault_restart_live = '1' AND
+	                                           pmmu_fault_dispatched = '0' AND
+	                                           berr_exception_active = '0' AND
+	                                           trap_berr = '0' AND trap_mmu_berr = '0'))
+	                                ELSE '0';
+	-- REGISTERED-ONLY: the live-fault terms placed this signal (via the
+	-- Group-2 trapmake suppression) in the middle of the cpu_ack->regfile
+	-- setup cone (~-7.4 worst path through mmu_restart_active~2/trapmake~34).
+	-- The suppression acts on trapmake DOWNSTREAM of the latched trap causes,
+	-- so the one-cycle-later registered window still gates every dispatchable
+	-- Group-2 trap: dispatch needs setinterrupt, which follows trapmake by a
+	-- cycle. (Same-cycle dispatch/rollback keep their live terms - those are
+	-- correctness-critical; this signal only feeds the trap squash.)
+	mmu_restart_active <= mmu_restart_pending;
+	mmu_restart_restore_now <= '1' WHEN mmu_restart_restore = '1' OR
+	                                      (setinterrupt = '1' AND pmmu_fault_restart_dispatch = '1')
+	                           ELSE '0';
+
+	-- WinUAE-derived Format $A (LASTWRITE) eligibility for a PMMU data-write
+	-- fault. Per WinUAE (Exception_mmu030 / genastore_2 / gen_set_fault_pc):
+	-- a write fault gets the short, single-write-replayable Format $A frame
+	-- when this write is the LAST (or only) bus cycle the instruction
+	-- performs; every other fault (any read - Table 8-6 - CAS's locked write,
+	-- a non-final MOVEM register, any MOVEP byte, or an instruction fetch)
+	-- gets the long Format $B frame. Effective RW follows the same
+	-- live-vs-latched precedence as the SSW(6)/RW construction below
+	-- (pmmu_fault live for same-edge dispatch, the first-fire latch for the
+	-- deferred make_mmu_berr path). Conservative by construction: MOVEM,
+	-- CAS, and MOVEP are excluded (matches WinUAE exactly - WinUAE never
+	-- calls gen_set_fault_pc for MOVEP, so every MOVEP byte-write fault is
+	-- unconditionally Format $B, unlike MOVEM which is excluded only while
+	-- more registers remain), so any case this doesn't positively recognize
+	-- falls back to the existing, already-correct long-frame path.
+	pmmu_fault_effective_rw <= pmmu_fault_rw_out WHEN pmmu_fault = '1' ELSE berr_pmmu_fault_rw;
+	pmmu_fault_lastwrite_ok <= '1' WHEN pmmu_fault_effective_rw = '0' AND locked_rmw_active = '0' AND
+	                                    NOT ((exec(movem_action) = '1' OR movem_actiond = '1') AND movem_run = '1') AND
+	                                    NOT (micro_state = movep1 OR micro_state = movep2 OR micro_state = movep3 OR
+	                                         micro_state = movep4 OR micro_state = movep5)
+	                           ELSE '0';
 	
 	PROCESS (clk, nReset)
 	BEGIN
@@ -1609,39 +1776,15 @@ ALU: TG68K_ALU
 	END PROCESS;
 
 	rte_mmu_fix_dest <= rte_mmu_fix_opcode(11 downto 9);
-	-- CONTINUE-PAST opcode classes (CCR FIX 2026-07-02): the OS BERR-probe
-	-- validators use MOVE/MOVEA (register loads), TST.B, and static BTST #imm
-	-- reads. A real 68030 replays the faulted cycle from the handler-stuffed
-	-- DIB, which also rewrites CCR; TG68 instead computed TST/BTST flags from
-	-- the junk bus data of the ABORTED cycle (berr_bench proves it), so the
-	-- validator's following Bcc took a garbage direction -> wrong hardware
-	-- verdict -> garbage handle -> wild jump (the 7.1 "bad F-Line" bomb path).
-	-- MOVE/MOVEA: register writeback (+ MOVE-rule CCR for Dn destinations).
-	-- TST: MOVE-rule CCR only. BTST: Z only, N/V/C/X keep fault-time values.
-	rte_mmu_fix_is_move <= '1' when
-		(rte_mmu_fix_opcode(8 downto 6) = "000" AND
-		 (rte_mmu_fix_opcode(15 downto 12) = "0001" OR
-		  rte_mmu_fix_opcode(15 downto 12) = "0010" OR
-		  rte_mmu_fix_opcode(15 downto 12) = "0011")) OR
-		(rte_mmu_fix_opcode(8 downto 6) = "001" AND
-		 (rte_mmu_fix_opcode(15 downto 12) = "0010" OR
-		  rte_mmu_fix_opcode(15 downto 12) = "0011"))
-		else '0';
-	-- TST.B/W/L <ea> ($4Axx, size /= "11": size 11 is TAS/ILLEGAL)
-	rte_mmu_fix_is_tst <= '1' when
-		rte_mmu_fix_opcode(15 downto 8) = x"4A" AND
-		rte_mmu_fix_opcode(7 downto 6) /= "11"
-		else '0';
-	-- static BTST #imm,<ea> only ($0800 family). The dynamic BTST Dn,<ea> form
-	-- is NOT fixed up (its bit number lives in a register not reliably
-	-- re-readable at RTE time; no ROM/OS validator uses it).
-	rte_mmu_fix_is_btst <= '1' when
-		rte_mmu_fix_opcode(15 downto 6) = "0000100000"
-		else '0';
-	rte_mmu_fix_size <=
-		rte_mmu_fix_opcode(7 downto 6) when rte_mmu_fix_is_tst = '1' else
-		"00" when rte_mmu_fix_is_btst = '1' else       -- memory bit ops are byte
-		"00" when rte_mmu_fix_opcode(15 downto 12) = "0001" else
+	-- TST.{B,W,L} <ea>: read + CCR only, no register destination. The commit
+	-- is the CCR update (identical N/Z, V=C=0 semantics to MOVE - the
+	-- existing ccr_value logic applies) plus the length-aware skip. With
+	-- MuForce resident, program launches routinely Enforcer-probe guarded
+	-- addresses with TST; without commit support every launch loops forever.
+	rte_mmu_fix_is_tst <= '1' when rte_mmu_fix_opcode(15 downto 8) = "01001010" AND
+	                                rte_mmu_fix_opcode(7 downto 6) /= "11" else '0';
+	rte_mmu_fix_size <= rte_mmu_fix_opcode(7 downto 6) when rte_mmu_fix_is_tst = '1' else
+	                   "00" when rte_mmu_fix_opcode(15 downto 12) = "0001" else
 	                   "10" when rte_mmu_fix_opcode(15 downto 12) = "0010" else
 	                   "01";
 	rte_fmt_a_replay_needed <= '1' when
@@ -1657,53 +1800,88 @@ ALU: TG68K_ALU
 	rte_mmu_fix_write <= '1' when
 		rte_mmu_fix_armed = '1' AND
 		micro_state = rte5 AND
-		rot_cnt = "000001" AND
+		-- Commit on the SECOND-TO-LAST frame pop, not the last one. The final
+		-- rte5 cycle launches the first post-RTE opcode fetch from TG68_PC on
+		-- the same edge the last-pop commit would register its +2, so a
+		-- last-pop commit resumes the stream AT the frame PC: the completed
+		-- instruction re-executes (re-faulting on the unrepaired page - the
+		-- MuForce ghost-fault/PC-walk halt) and every later frame PC is
+		-- attributed +2 off. All commit inputs (SSW pop 0, opcode pop 3, DIB
+		-- pop 9, version word pop 11) are captured well before pop 20.
+		rot_cnt = "000010" AND
 		rte_format_word(15 downto 12) = "1011" AND
-		-- CONTINUE-PAST FIX (2026-06-21): bit 9 NO LONGER gates the register
-		-- writeback. Mac OS BERR-protected probes clear DF and RTE to "continue
-		-- past" WITHOUT setting SSW bit 9 (the PMMU software-fix request), so the
-		-- faulted instruction's destination register was never written from the
-		-- handler-supplied DIB -> the probe's validity check (and.l/sub.l a6/beq on
-		-- the dest reg at $A0DC1E) ran on a garbage register -> derail -> vector-2
-		-- storm -> Sad Mac. Fire the writeback for BOTH bit9=1 (PMMU) and bit9=0
-		-- (OS) continue-past frames; PC+2 stays gated on bit9 at the TG68_PC mux so
-		-- the OS case keeps the next-instruction PC restored from the stacked frame.
+		-- Software completion triggers: the MuLibs bit-9 softfix marker, OR the
+		-- genuine MC68030 UM 8.2.2 protocol (Enforcer/MuForce): handler filled
+		-- the Data Input Buffer and CLEARED DF on a pure-DATA read frame.
+		-- All pipeline continuation/rerun bits must be clear; stage-B uses FB/RB,
+		-- and stage-C uses FC/RC while still stacking DF=0.
+		-- Validated by tb_mmu_badfeed_softfix_recovery (DF-clear, NO bit-9:
+		-- captures SSW=$0041/DIB=$BADFEED0 and must commit) - without this the
+		-- restart model re-executes Enforcer-completed reads forever (hardware:
+		-- MuForce infinite fault loop at $4006D28A reading $2C00).
+		(rte_mmu_fix_ssw(9) = '1' OR
+		 (rte_mmu_fix_ssw(15) = '0' AND rte_mmu_fix_ssw(14) = '0' AND
+		  rte_mmu_fix_ssw(13) = '0' AND rte_mmu_fix_ssw(12) = '0')) AND
 		rte_mmu_fix_ssw(8) = '0' AND
 		rte_mmu_fix_ssw(7) = '0' AND
 		rte_mmu_fix_ssw(6) = '1' AND
-		-- MOVE/MOVEA register loads + the CCR-only validator reads (TST, static
-		-- BTST). CCR FIX 2026-07-02: TST/BTST added — they take the CCR path
-		-- below, never the register writeback (that one is gated on is_move).
-		-- v6 EA-mode widening (2026-07-02): the v5 HW test proved the 7.1 bomb
-		-- survives an (An)/(d16,An)-only gate, so the OS probe deck is wider
-		-- than the two $A0DB6A forms. MOVE/MOVEA writeback: every
-		-- side-effect-free source EA — (An) 010, (d16,An) 101, (d8,An,Xn) 110,
-		-- abs/PC-rel 111 — EXCLUDING (An)+ 011 / -(An) 100 (their An update is
-		-- part of the faulted instruction, not ours to redo) and register-direct
-		-- 000/001 (cannot data-fault; refuse bogus frames). TST/BTST are
-		-- CCR-only (no writeback, no EA side effect): no mode gate needed.
-		((rte_mmu_fix_is_move = '1' AND
-		  rte_mmu_fix_opcode(5 downto 3) /= "000" AND
-		  rte_mmu_fix_opcode(5 downto 3) /= "001" AND
-		  rte_mmu_fix_opcode(5 downto 3) /= "011" AND
-		  rte_mmu_fix_opcode(5 downto 3) /= "100") OR
-		 rte_mmu_fix_is_tst = '1' OR rte_mmu_fix_is_btst = '1')
+		-- Side-effect-free FIXED-LENGTH source EA modes only: (An), (d16,An),
+		-- (xxx).W, (xxx).L, (d16,PC). The commit skips the whole
+		-- instruction (rte_mmu_fix_len below), so post-increment/pre-decrement
+		-- sources (modes 011/100) are EXCLUDED - their An side effect was
+		-- rolled back at dispatch and would be lost. MuForce completes faults
+		-- on all of these forms (hardware: infinite Enforcer loop on
+		-- MOVE.L (d16,A6),D5 = $2A6E - only mode 010 was whitelisted, the
+		-- softfix never committed, and the re-executed read refaulted on the
+		-- hot fault-ATC entry forever).
+		-- BUG #461 FIX: indexed modes 110 (d8,An,Xn) and 111/011 (d8,PC,Xn)
+		-- are EXCLUDED from the commit fast-path: they admit 68020 full-format
+		-- extensions (bd16/bd32, memory-indirect, 2-4 ext words) which the
+		-- stacked frame cannot distinguish from brief format, and
+		-- rte_mmu_fix_len assumes ONE extension word - a committed full-format
+		-- MOVE resumed INSIDE its own displacement and executed garbage.
+		-- Declining here arms the DIB-substitution re-execution path instead
+		-- (dib_sub_valid requires rte_mmu_fix_write='0'), which re-runs the
+		-- whole EA calculation and is correct for every extension format.
+		(rte_mmu_fix_opcode(5 downto 3) = "010" OR
+		 rte_mmu_fix_opcode(5 downto 3) = "101" OR
+		 (rte_mmu_fix_opcode(5 downto 3) = "111" AND
+		  (rte_mmu_fix_opcode(2 downto 0) = "000" OR
+		   rte_mmu_fix_opcode(2 downto 0) = "001" OR
+		   rte_mmu_fix_opcode(2 downto 0) = "010"))) AND
+		-- MOVE.{B,W,L} to Dn (mode 000)
+		((rte_mmu_fix_opcode(8 downto 6) = "000" AND
+		  (rte_mmu_fix_opcode(15 downto 12) = "0001" OR
+		   rte_mmu_fix_opcode(15 downto 12) = "0010" OR
+		   rte_mmu_fix_opcode(15 downto 12) = "0011")) OR
+		-- MOVEA.{W,L} to An (mode 001, no byte form)
+		 (rte_mmu_fix_opcode(8 downto 6) = "001" AND
+		  (rte_mmu_fix_opcode(15 downto 12) = "0010" OR
+		   rte_mmu_fix_opcode(15 downto 12) = "0011")) OR
+		-- TST.{B,W,L}: CCR-only commit (no register write)
+		 rte_mmu_fix_is_tst = '1')
 		else '0';
+	-- Committed-instruction length: opcode word + source EA extension words.
+	-- (An)=0 ext; (d16,An)/(d8,An,Xn)/(xxx).W/(d16,PC)/(d8,PC,Xn)=1 ext;
+	-- (xxx).L=2 ext. Dest is always Dn/An (no dest extensions).
+	rte_mmu_fix_len <= "010" when rte_mmu_fix_opcode(5 downto 3) = "010" else
+	                   "110" when (rte_mmu_fix_opcode(5 downto 3) = "111" AND
+	                               rte_mmu_fix_opcode(2 downto 0) = "001") else
+	                   "100";
 	rte_mmu_fix_commit <= rte_mmu_fix_write AND clkena_lw;
+	-- The armed substitution matches the re-executed read's live fault.
+	dib_sub_hit <= '1' when dib_sub_valid = '1' AND pmmu_fault = '1' AND
+	                         pmmu_fault_rw_out = '1' AND
+	                         (pmmu_fault_addr_out(31 downto 1) = dib_sub_addr(31 downto 1) OR
+	                          pmmu_fault_addr_out(31 downto 1) = dib_sub_addr(31 downto 1) + 1)
+	               else '0';
 	rte_mmu_fix_ccr_update <= '1' when rte_mmu_fix_commit = '1' AND
-		(rte_mmu_fix_is_tst = '1' OR rte_mmu_fix_is_btst = '1' OR
-		 (rte_mmu_fix_is_move = '1' AND rte_mmu_fix_opcode(8 downto 6) = "000")) else '0';
+		(rte_mmu_fix_opcode(8 downto 6) = "000" OR rte_mmu_fix_is_tst = '1') else '0';
 
-	PROCESS (Flags, rte_mmu_fix_size, rte_mmu_fix_input_buffer, rte_mmu_fix_is_btst, rte_mmu_fix_bitnr)
+	PROCESS (Flags, rte_mmu_fix_size, rte_mmu_fix_input_buffer)
 	BEGIN
-		IF rte_mmu_fix_is_btst = '1' THEN
-			-- BTST: Z from the DIB bit; N/V/C/X keep the fault-time values (Flags
-			-- holds the frame-restored CCR here — directSR already ran at rte1).
-			rte_mmu_fix_ccr_value <= Flags(7 downto 0);
-			rte_mmu_fix_ccr_value(2) <= NOT rte_mmu_fix_input_buffer(conv_integer(rte_mmu_fix_bitnr));
-		ELSE
 		rte_mmu_fix_ccr_value <= (others => '0');
-		rte_mmu_fix_ccr_value(4) <= Flags(4); -- MOVE/TST preserve X and clear V/C.
+		rte_mmu_fix_ccr_value(4) <= Flags(4); -- MOVE preserves X and clears V/C.
 		CASE rte_mmu_fix_size IS
 			WHEN "00" =>
 				rte_mmu_fix_ccr_value(3) <= rte_mmu_fix_input_buffer(7);
@@ -1721,10 +1899,9 @@ ALU: TG68K_ALU
 					rte_mmu_fix_ccr_value(2) <= '1';
 				END IF;
 		END CASE;
-		END IF;
 	END PROCESS;
 
-PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, memread, memmask, data_read)
+PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, memread, memmask, data_read, dib_sub_hit, dib_sub_data)
 	BEGIN
 		IF memmaskmux(4)='0' THEN
 			data_read <= last_data_in(15 downto 0)&data_in;
@@ -1733,6 +1910,11 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 		END IF;
 		IF memread(0)='1' OR (memread(1 downto 0)="10" AND memmaskmux(4)='1')THEN
 			data_read(31 downto 16) <= (OTHERS=>data_read(15));
+		END IF;
+		-- DIB substitution: the armed one-shot supplies the software-completed
+		-- read data in place of the (faulted, garbage) bus beats.
+		IF dib_sub_hit='1' THEN
+			data_read <= dib_sub_data;
 		END IF;	
 		
 		IF rising_edge(clk) THEN	
@@ -1746,15 +1928,15 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 			IF Reset='1' THEN
 				last_data_read <= (OTHERS => '0');
 			ELSIF clkena_in='1' THEN
-				-- LC II walk-exposure FIX A (2026-07-07): last_data_in is a SHIFT
-				-- register fed from the raw bus on EVERY clkena_in edge; clkena_in
-				-- keeps firing during PMMU walks, so a walk shifts walker
-				-- page-table words through it — destroying beat 1 of a
-				-- page-straddling longword read while beat 2's translation walks.
-				-- Hold both registers during any CPU-access walk (4th member of
-				-- the walk-hold family: data-addr June, memmask June-pt2,
-				-- fetch-addr v9, this).
-				IF NOT (pmmu_busy='1' AND (state="00" OR state(1)='1')) THEN
+				-- beat_valid: a clkena edge released by a PMMU fault is a
+				-- FORCE-COMPLETED beat (cpu_wrapper unblocks clkena_in on
+				-- pmmu_fault so the exception can dispatch) carrying stale
+				-- bus garbage. The wrapper's beat_valid is the TRUE ready-ack
+				-- qualifier: hold the stream latches on invalid beats. This
+				-- replaces the earlier live-fault kind-scoped gate (which
+				-- raced: pmmu_fault stays match-held across a fault's whole
+				-- drain window while REAL ready-acked beats complete).
+				IF beat_valid='1' OR dib_sub_hit='1' THEN
 					IF state="00" OR exec(update_ld)='1' THEN
 						last_data_read <= data_read;
 						IF state(1)='0' AND memmask(1)='0' THEN
@@ -1772,27 +1954,20 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 	END PROCESS;
 
 	-- RTE format word latch: Capture the format/vector word during rte3->rte4 transition.
-	-- Bus cycle pipeline: setstate/memmask from micro_state N execute during micro_state N+1.
-	-- rte2 sets up the format word read (setstate="10", datatype="01"), which executes
-	-- during rte3's bus cycle. Use clkena_in (not clkena_lw) so the latch captures
-	-- data_in on every bus clock while in rte3 - this ensures the format word is
-	-- captured even if memmaskmux(3) gates clkena_lw on certain hardware paths.
-	-- Use raw data_in (16-bit bus input) which is guaranteed valid at clkena_in time.
+	-- clkena_in is also asserted when a PMMU fault force-completes a bus cycle, so
+	-- only a real accepted beat (or an explicit DIB substitution) may update it.
 	PROCESS (clk)
 	BEGIN
 		IF rising_edge(clk) THEN
 			IF Reset='1' THEN
 				rte_format_word <= (others => '0');
 			ELSIF clkena_in='1' THEN
-				-- POP death-flash FIX (2026-07-11, walk-hold family): micro_state is
-				-- clkena_lw-frozen, so if the rte3 format-word read stalls on a PMMU
-				-- walk this latch re-fires every walk edge with data_in = walker
-				-- descriptor words, and rte4 consumes it at the completion edge
-				-- before the same-edge true re-latch → garbage frame format →
-				-- misunwound RTE. Hold during CPU-access walk stalls.
-				IF micro_state = rte3 AND next_micro_state = rte4
-				   AND NOT (pmmu_busy='1' AND (state="00" OR state(1)='1')) THEN
-					rte_format_word <= data_in;
+				IF micro_state = rte3 AND next_micro_state = rte4 THEN
+					IF dib_sub_hit='1' THEN
+						rte_format_word <= dib_sub_data(15 downto 0);
+					ELSIF beat_valid='1' THEN
+						rte_format_word <= data_in;
+					END IF;
 				END IF;
 			END IF;
 		END IF;
@@ -1836,8 +2011,20 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 					a7_is_msp <= '0';
 				END IF;
 				-- Track M-bit swaps via exec(to_SR) (MOVE to SR, ANDI/ORI/EORI to SR)
-				IF exec(to_SR)='1' AND cpu(1)='1' AND FlagsSR(5)='1' AND SRin(5)='1' AND SRin(4) /= FlagsSR(4) THEN
+				-- BUG #467 FIX: qualify on preSVmode (same as the A7 regfile swap in
+				-- the regfile process), not FlagsSR(5). In a deferred S-change window
+				-- the two can disagree, letting the alias flag update without the
+				-- A7/shadow exchange (or vice versa) and desyncing later
+				-- MOVEC $803/$804 A7-aliasing decisions.
+				IF exec(to_SR)='1' AND cpu(1)='1' AND preSVmode='1' AND SRin(5)='1' AND SRin(4) /= FlagsSR(4) THEN
 					a7_is_msp <= SRin(4);
+				END IF;
+				-- STOP #imm loads the whole immediate into SR (set_stop path). Its
+				-- new S/M (data_read(13)/data_read(12)) selects the active A7 just as
+				-- MOVE-to-SR does. Track the shadow A7 aliases when it changes M while
+				-- staying supervisor. (BUG #467: preSVmode, matching the A7 load.)
+				IF set_stop='1' AND cpu(1)='1' AND preSVmode='1' AND data_read(13)='1' AND data_read(12) /= FlagsSR(4) THEN
+					a7_is_msp <= data_read(12);
 				END IF;
 				IF setopcode='1' THEN
 					format1_chain_active <= '0';
@@ -1849,6 +2036,87 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 					END IF;
 				ELSIF micro_state = rte5 AND rot_cnt = "000001" AND format1_chain_active='1' THEN
 					format1_chain_active <= '0';
+				END IF;
+			END IF;
+		END IF;
+	END PROCESS;
+
+	-- Sticky per-datum poison: beat_valid is sampled per clkena edge, but a
+	-- multi-beat datum (long read) is CONSUMED edges after its beats complete.
+	-- A fault-released beat (beat_valid=0) poisons data_read at the release
+	-- edge; by the consumption edge the live fault has deasserted (request-
+	-- match drops it when busstate moves on) and cpu_req is low, so beat_valid
+	-- is innocently 1 again - the id12 hardware capture showed the fork-return
+	-- RTE popping PC=0 assembled from a suppressed walk's stale zero data while
+	-- memory held the correct PC. The flag remembers the poison across edges;
+	-- it dies at the instruction boundary (restart refetches) or at dispatch
+	-- (the fault exception takes over). DIB-substituted beats carry injected
+	-- GOOD data and must not poison.
+	PROCESS (clk)
+	BEGIN
+		IF rising_edge(clk) THEN
+			IF Reset='1' THEN
+				bus_beat_poisoned <= '0';
+				bus_datum_dirty <= '0';
+				ea_to_pc_datum_invalid <= '0';
+			ELSIF clkena_in='1' THEN
+				-- Clear when the machine ENTERS exception microcode (the
+				-- abandoned datum's instruction is preempted; the vector
+				-- fetch and frame pops must not be blocked) or at the
+				-- instruction boundary. NOT on trapmake: that is only the
+				-- PENDING flag - it rises mid-instruction while the faulted
+				-- RTE still runs, which is exactly the window to protect.
+				IF setopcode='1' OR
+				   micro_state = trap0 OR micro_state = trap00 OR
+				   micro_state = berr_fill OR micro_state = berr1 OR
+				   micro_state = int1 THEN
+					bus_beat_poisoned <= '0';
+					bus_datum_dirty <= '0';
+					ea_to_pc_datum_invalid <= '0';
+				ELSIF beat_valid='0' AND dib_sub_hit='0' AND state /= "01" THEN
+					bus_beat_poisoned <= '1';
+					-- ld_229_3 consumes the longword pointer for a 68020/030
+					-- full-format memory-indirect EA. If that data read was
+					-- force-released by a PMMU fault, addr is assembled from stale
+					-- bus data. Keep this datum-specific mark until fault dispatch;
+					-- the instruction-wide poison cannot be used here because an
+					-- unrelated speculative fetch may legitimately be discarded by
+					-- the eventual control transfer.
+					IF state = "10" AND micro_state = ld_229_3 THEN
+						ea_to_pc_datum_invalid <= '1';
+					END IF;
+					-- A qualifying directPC beat is retried without advancing the
+					-- mask or the data assembler, so it has not dirtied the datum.
+					-- Preserve any older dirtiness; a clean retried non-final beat
+					-- below clears it before the final commit.
+					IF directpc_retry_hold='1' THEN
+						bus_datum_dirty <= bus_datum_dirty;
+					-- bus_beat_poisoned is instruction-wide, but the directPC
+					-- datum is a DATA read. A released instruction fetch
+					-- (state="00") must not mark that separate RTE/RTS pop
+					-- dirty: on hardware it can occur on a clkena_lw=0 edge
+					-- immediately before the clean pop completion, causing the
+					-- old dirty value to veto PC=$572C even though both stack
+					-- words were accepted. Only an invalid DATA-read beat can
+					-- corrupt the directPC datum. A datum completes at
+					-- clkena_lw; the dirty mark dies with it.
+					ELSIF state = "10" THEN
+						IF clkena_lw='1' THEN
+							bus_datum_dirty <= '0';
+						ELSE
+							bus_datum_dirty <= '1';
+						END IF;
+					END IF;
+				ELSIF state = "10" AND beat_valid='1' AND clkena_lw='0' THEN
+					-- A valid non-final beat after a force release starts the
+					-- longword again. Clear the old dirtiness now so the later
+					-- final-beat commit sees a clean two-beat datum. If the
+					-- invalid first half is followed directly by only the final
+					-- half, this transition never occurs and the commit remains
+					-- blocked.
+					bus_datum_dirty <= '0';
+				ELSIF clkena_lw='1' THEN
+					bus_datum_dirty <= '0';
 				END IF;
 			END IF;
 		END IF;
@@ -1867,7 +2135,6 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 				rte_mmu_fix_ssw <= (others => '0');
 				rte_mmu_fix_opcode <= (others => '0');
 				rte_mmu_fix_input_buffer <= (others => '0');
-				rte_mmu_fix_bitnr <= (others => '0');
 				rte_format_b_version_error <= '0';
 			ELSIF clkena_lw='1' THEN
 				IF trapmake='1' THEN
@@ -1897,26 +2164,35 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 						rte_mmu_fix_ssw <= (others => '0');
 						rte_mmu_fix_opcode <= (others => '0');
 						rte_mmu_fix_input_buffer <= (others => '0');
-						rte_mmu_fix_bitnr <= (others => '0');
 					ELSE
 						rte_mmu_fix_capture_active <= '0';
 						rte_mmu_fix_long_index <= 0;
 					END IF;
 				ELSIF micro_state = rte5 AND rte_mmu_fix_capture_active = '1' THEN
-					CASE rte_mmu_fix_long_index IS
-						WHEN 0 =>
-							rte_mmu_fix_ssw <= data_read(15 downto 0);      -- SP+$0A after unwind starts at $08 longword
-						WHEN 3 =>
-							rte_mmu_fix_opcode <= data_read(15 downto 0);   -- SP+$14 low word
-							rte_mmu_fix_bitnr  <= data_read(18 downto 16);  -- static-BTST bit number (CCR FIX)
-						WHEN 9 =>
-							rte_mmu_fix_input_buffer <= data_read;           -- SP+$2C data input buffer
-						WHEN OTHERS =>
-							NULL;
-					END CASE;
-					IF rte_mmu_fix_long_index = 11 AND
-					   data_read(15 downto 12) /= RTE_030_FORMAT_B_VERSION THEN
-						rte_format_b_version_error <= '1';
+					-- BUG #460 FIX: only a really-acked (or DIB-substituted) pop may
+					-- update the decision words (same hardening as rte_format_word).
+					-- A parasitic fault-released beat leaves the word at its reset
+					-- value (zeros), which fails SAFE: SSW=0 arms neither the commit
+					-- nor the DIB substitution, and the parasitic fault dispatches
+					-- its own exception. Index bookkeeping stays ungated so the
+					-- unwind depth remains aligned with rot_cnt.
+					IF (beat_valid='1' AND bus_datum_dirty='0') OR dib_sub_hit='1' THEN
+						CASE rte_mmu_fix_long_index IS
+							WHEN 0 =>
+								rte_mmu_fix_ssw <= data_read(15 downto 0);      -- SP+$0A after unwind starts at $08 longword
+							WHEN 2 =>
+								rte_mmu_fix_faddr <= data_read;                  -- SP+$10 fault address
+							WHEN 3 =>
+								rte_mmu_fix_opcode <= data_read(15 downto 0);   -- SP+$14 low word
+							WHEN 9 =>
+								rte_mmu_fix_input_buffer <= data_read;           -- SP+$2C data input buffer
+							WHEN OTHERS =>
+								NULL;
+						END CASE;
+						IF rte_mmu_fix_long_index = 11 AND
+						   data_read(15 downto 12) /= RTE_030_FORMAT_B_VERSION THEN
+							rte_format_b_version_error <= '1';
+						END IF;
 					END IF;
 					IF rot_cnt = "000001" THEN
 						rte_mmu_fix_capture_active <= '0';
@@ -1960,17 +2236,23 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 						rte_fmt_a_long_index <= 0;
 					END IF;
 				ELSIF micro_state = rte5 AND rte_fmt_a_capture_active = '1' THEN
-					CASE rte_fmt_a_long_index IS
-						WHEN 0 =>
-							rte_fmt_a_state1 <= data_read(31 downto 16);
-							rte_fmt_a_ssw <= data_read(15 downto 0);
-						WHEN 2 =>
-							rte_fmt_a_fault_addr <= data_read;
-						WHEN 4 =>
-							rte_fmt_a_data_out <= data_read;
-						WHEN OTHERS =>
-							NULL;
-					END CASE;
+					-- BUG #460 FIX: same beat_valid hardening as the Format $B
+					-- captures above. Zeros fail safe: rte_fmt_a_replay_needed
+					-- requires state1(8) & ssw(8), so a garbage-released pop can
+					-- no longer aim a replay write with a junk SSW/fault address.
+					IF (beat_valid='1' AND bus_datum_dirty='0') OR dib_sub_hit='1' THEN
+						CASE rte_fmt_a_long_index IS
+							WHEN 0 =>
+								rte_fmt_a_state1 <= data_read(31 downto 16);
+								rte_fmt_a_ssw <= data_read(15 downto 0);
+							WHEN 2 =>
+								rte_fmt_a_fault_addr <= data_read;
+							WHEN 4 =>
+								rte_fmt_a_data_out <= data_read;
+							WHEN OTHERS =>
+								NULL;
+						END CASE;
+					END IF;
 					IF rot_cnt = "000001" THEN
 						rte_fmt_a_capture_active <= '0';
 					ELSE
@@ -1983,7 +2265,7 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 
 	PROCESS (long_start, reg_QB, data_write_tmp, exec, data_read, data_write_mux, memmaskmux, bf_ext_out,
 			 data_write_muxin, memmask, oddout, addr,
-		 moves_bus_pending, moves_direction, moves_reg, addsub_q, opcode)
+			 moves_bus_pending, moves_direction, moves_reg, addsub_q, opcode)
 	BEGIN
 		-- MC68030 Bus Error Frame: data_write_muxin uses data_write_tmp (default path).
 		-- berr state data is loaded into data_write_tmp in the sequential process
@@ -2046,18 +2328,21 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 -----------------------------------------------------------------------------
 -- Registerfile
 -----------------------------------------------------------------------------
-PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, rte_mmu_fix_commit, rte_mmu_fix_dest, rte_mmu_fix_size, rte_mmu_fix_input_buffer, rte_mmu_fix_opcode)
+PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, rte_mmu_fix_commit, rte_mmu_fix_dest, rte_mmu_fix_size, rte_mmu_fix_input_buffer, rte_mmu_fix_opcode, mmu_restart_restore_now)
+	variable v_regfile : regfile_t;
+	variable v_hold_a7 : std_logic_vector(31 downto 0);
 	BEGIN
 		reg_QA <= regfile(RDindex_A);
 		reg_QB <= regfile(RDindex_B);
 		IF rising_edge(clk) THEN
 		    IF clkena_lw='1' THEN
+					v_regfile := regfile;
 					rf_source_addrd <= rf_source_addr;
 					WR_AReg <= rf_dest_addr(3);
 					RDindex_A <= conv_integer(rf_dest_addr(3 downto 0));
 					RDindex_B <= conv_integer(rf_source_addr(3 downto 0));
 					IF Wwrena='1' THEN
-						regfile(RDindex_A) <= regin;
+						v_regfile(RDindex_A) := regin;
 					END IF;
 				-- BUG #323 FIX: Direct MOVES mem->CPU register write.
 				-- Writes data_read directly to the destination register during the
@@ -2075,41 +2360,41 @@ PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, rte_mmu_fix_commit, rte_mmu_f
 					CASE exe_datatype IS
 						WHEN "00" =>  -- Byte
 							IF moves_reg(3) = '1' THEN  -- An: sign-extend byte to 32 bits
-								regfile(conv_integer(moves_reg)) <= (31 downto 8 => data_read(7)) & data_read(7 downto 0);
+								v_regfile(conv_integer(moves_reg)) := (31 downto 8 => data_read(7)) & data_read(7 downto 0);
 							ELSE  -- Dn: write only bits 7:0
-								regfile(conv_integer(moves_reg))(7 downto 0) <= data_read(7 downto 0);
+								v_regfile(conv_integer(moves_reg))(7 downto 0) := data_read(7 downto 0);
 							END IF;
 						WHEN "01" =>  -- Word
 							IF moves_reg(3) = '1' THEN  -- An: sign-extend word to 32 bits
-								regfile(conv_integer(moves_reg)) <= (31 downto 16 => data_read(15)) & data_read(15 downto 0);
+								v_regfile(conv_integer(moves_reg)) := (31 downto 16 => data_read(15)) & data_read(15 downto 0);
 							ELSE  -- Dn: write only bits 15:0
-								regfile(conv_integer(moves_reg))(15 downto 0) <= data_read(15 downto 0);
+								v_regfile(conv_integer(moves_reg))(15 downto 0) := data_read(15 downto 0);
 							END IF;
 						WHEN OTHERS =>  -- Long: write full 32 bits
-							regfile(conv_integer(moves_reg)) <= data_read;
+							v_regfile(conv_integer(moves_reg)) := data_read;
 					END CASE;
 				END IF;
-				-- CCR FIX 2026-07-02: register writeback is MOVE/MOVEA-only. TST/BTST
-				-- now also commit (for their CCR) but must NOT write a register —
-				-- their bits 11:9 are not a destination field (TST $4A10 would
-				-- smash D5, BTST $0810 would smash D4).
-				IF rte_mmu_fix_commit = '1' AND rte_mmu_fix_is_move = '1' THEN
+				-- BUG #448 FIX: TST has no register destination - its commit is the
+				-- CCR update (rte_mmu_fix_ccr_update) plus the PC skip only. Without
+				-- this guard TST's opcode bits decode as MOVE fields here: TST.B/L
+				-- clobbered D5, TST.W matched the MOVEA arm and clobbered A5.
+				IF rte_mmu_fix_commit = '1' AND rte_mmu_fix_is_tst = '0' THEN
 					IF rte_mmu_fix_opcode(8 downto 6) = "001" THEN
 						-- MOVEA to An: always 32-bit write, sign-extend for word
 						IF rte_mmu_fix_size = "01" THEN  -- MOVEA.W: sign-extend 16->32
-							regfile(conv_integer('1' & rte_mmu_fix_dest)) <= (31 downto 16 => rte_mmu_fix_input_buffer(15)) & rte_mmu_fix_input_buffer(15 downto 0);
+							v_regfile(conv_integer('1' & rte_mmu_fix_dest)) := (31 downto 16 => rte_mmu_fix_input_buffer(15)) & rte_mmu_fix_input_buffer(15 downto 0);
 						ELSE  -- MOVEA.L
-							regfile(conv_integer('1' & rte_mmu_fix_dest)) <= rte_mmu_fix_input_buffer;
+							v_regfile(conv_integer('1' & rte_mmu_fix_dest)) := rte_mmu_fix_input_buffer;
 						END IF;
 					ELSE
 						-- MOVE to Dn: size-dependent partial write
 						CASE rte_mmu_fix_size IS
 							WHEN "00" =>  -- Byte
-								regfile(conv_integer('0' & rte_mmu_fix_dest))(7 downto 0) <= rte_mmu_fix_input_buffer(7 downto 0);
+								v_regfile(conv_integer('0' & rte_mmu_fix_dest))(7 downto 0) := rte_mmu_fix_input_buffer(7 downto 0);
 							WHEN "01" =>  -- Word
-								regfile(conv_integer('0' & rte_mmu_fix_dest))(15 downto 0) <= rte_mmu_fix_input_buffer(15 downto 0);
+								v_regfile(conv_integer('0' & rte_mmu_fix_dest))(15 downto 0) := rte_mmu_fix_input_buffer(15 downto 0);
 							WHEN OTHERS =>  -- Long
-								regfile(conv_integer('0' & rte_mmu_fix_dest)) <= rte_mmu_fix_input_buffer;
+								v_regfile(conv_integer('0' & rte_mmu_fix_dest)) := rte_mmu_fix_input_buffer;
 						END CASE;
 					END IF;
 				END IF;
@@ -2123,9 +2408,19 @@ PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, rte_mmu_fix_commit, rte_mmu_f
 				-- deferred swap in rte4/rte5 via set(from_MSP)/set(from_ISP).
 				IF cpu(1)='1' AND preSVmode='1' AND exec(to_SR)='1' AND SRin(5)='1' AND SRin(4) /= FlagsSR(4) THEN
 					IF SRin(4) = '1' THEN
-						regfile(15) <= MSP;  -- M 0->1: load MSP into A7
+						v_regfile(15) := MSP;  -- M 0->1: load MSP into A7
 					ELSE
-						regfile(15) <= ISP;  -- M 1->0: load ISP into A7
+						v_regfile(15) := ISP;  -- M 1->0: load ISP into A7
+					END IF;
+				END IF;
+				-- STOP #imm companion A7 load (set_stop path): new M = data_read(12),
+				-- gated on staying supervisor (new S = data_read(13) = '1'). Companion
+				-- shadow-save in the movec/stack process and a7_is_msp update above.
+				IF cpu(1)='1' AND preSVmode='1' AND set_stop='1' AND data_read(13)='1' AND data_read(12) /= FlagsSR(4) THEN
+					IF data_read(12) = '1' THEN
+						v_regfile(15) := MSP;  -- M 0->1: load MSP into A7
+					ELSE
+						v_regfile(15) := ISP;  -- M 1->0: load ISP into A7
 					END IF;
 				END IF;
 				-- MC68020/030: MOVEC Dn,MSP/ISP must update A7 when writing the ACTIVE
@@ -2136,17 +2431,55 @@ PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, rte_mmu_fix_commit, rte_mmu_f
 				--   ISP active (a7_is_msp='0'): MOVEC Dn,$804 updates A7
 				IF exec(movec_wr)='1' AND FlagsSR(5)='1' THEN
 					IF movec_regsel=X"803" AND a7_is_msp='1' THEN
-						regfile(15) <= reg_QA;
+						v_regfile(15) := reg_QA;
 					ELSIF movec_regsel=X"804" AND a7_is_msp='0' THEN
-						regfile(15) <= reg_QA;
+						v_regfile(15) := reg_QA;
 					END IF;
 				END IF;
 				-- WinUAE leaves A7 unchanged when RTE finds an invalid frame
 				-- format. The candidate SR/PC/format words are probed, but the
 				-- frame is not consumed; vector 14 stacks below the original A7.
 				IF trap_format_error='1' THEN
-					regfile(15) <= rte_saved_a7;
+					v_regfile(15) := rte_saved_a7;
 				END IF;
+
+				IF mmu_restart_restore_now='1' THEN
+					-- Dispatch edge: full rollback (incl. A7 - undoes the faulted
+					-- instruction's own -(SP)/(SP)+ side effects; changeMode has not
+					-- swapped stacks yet).  HOLD edge (mmu_restart_restore='1', one
+					-- cycle later): A7 EXEMPT - the changeMode user->supervisor A7
+					-- swap and/or the first frame push land on this edge, and
+					-- re-applying the shadow A7 here made the kernel stack the fault
+					-- frame on the USER stack (hardware: supervisor dispatch with
+					-- A7=$1DFFF97C -> fault during stacking -> double-fault halt).
+					v_hold_a7 := v_regfile(15);
+					v_regfile := regfile_shadow;
+					IF mmu_restart_restore='1' THEN
+						-- A7-exempt hold edge - but NOT for a straggler (SP)+/-(SP)
+						-- writeback of the faulted instruction landing here: keeping
+						-- it advances A7 past the rolled-back transfer, and the
+						-- restarted MOVEM.L (SP)+ reloads from beyond the saved
+						-- block. On a demand-zero stack page that loads ZEROS into
+						-- the whole callee-saved set (hardware 2026-07-25: NetBSD
+						-- init wiped D2-D7/A2-A5 inside vsnprintf after preemption
+						-- PFLUSHA, then livelocked on the a2=0 dereference; sim
+						-- repro tb_mmu_movem_atc_restore T36). The changeMode
+						-- swap / frame pushes this exemption protects never carry
+						-- postadd/presub.
+						-- The MOVEM base writeback arrives via save_memaddr, the
+						-- plain (An)+/-(An) forms via postadd/presub; none of the
+						-- exempt changeMode/frame-push A7 updates carry any of
+						-- these flags.
+						IF exec(postadd)='0' AND exec(presub)='0' AND
+						   exec(save_memaddr)='0' THEN
+							v_regfile(15) := v_hold_a7;
+						END IF;
+					END IF;
+				END IF;
+				IF decodeOPC='1' THEN
+					regfile_shadow <= v_regfile;
+				END IF;
+				regfile <= v_regfile;
 			END IF;
 		END IF;
 	END PROCESS;
@@ -2561,15 +2894,20 @@ PROCESS (clk)
 				--   5. micro_state=trap0, useStackframe2=1 -> $2xxx fmt/vec   (role B)
 				--   6. micro_state=trap0 (else)            -> $0xxx fmt/vec   (role B)
 				--   7. micro_state=int3                    -> $1xxx fmt/vec   (role B, Fmt$1 throwaway)
-				-- (The 2026-07-02 "hold data_write_tmp during walks" arm that lived
-				-- here was DEAD CODE and was removed 2026-07-07: this block is inside
-				-- the ELSIF clkena_lw='1' arm, and clkena_lw is gated on
-				-- pmmu_busy='0' at its :~1575 derivation — the hold condition could
-				-- never be true. The REAL v7 F-line fix was the TG68_PC brw gate.)
 				IF writePC='1' THEN
 					-- Priority 1: explicit PC push (trap0/1 68000-style, int4 Fmt$1 PC,
 					-- JSR/BSR target, DIV0 return PC, etc.)
-					data_write_tmp <= TG68_PC;
+					-- Interrupt/trace frames: the LIVE TG68_PC is unreliable at
+					-- the push beat (boundary fault/squash interleave clears or
+					-- advances it - hardware stacked PC-lo=0 at $0BB15FA8,
+					-- frozen capture beacon 0008); push the boundary resume PC
+					-- LATCHED at setinterrupt from registered sources instead.
+					-- JSR/BSR/DIV0 keep the live value (their PC is stable).
+					IF trap_interrupt='1' OR trap_trace='1' THEN
+						data_write_tmp <= trap_pc_latched;
+					ELSE
+						data_write_tmp <= TG68_PC;
+					END IF;
 				ELSIF micro_state=trap00 THEN
 					-- Priority 2: Format $2 instruction address longword must come from
 					-- exe_pc. Keep this branch BEFORE exec(writePC_add), otherwise a stale
@@ -2598,7 +2936,22 @@ PROCESS (clk)
 						data_write_tmp <= opcode_pc;
 					ELSIF trap_vector(9 downto 0) = "00" & X"38" THEN
 						data_write_tmp <= exe_pc;
+					ELSIF trap_interrupt='1' OR trap_trace='1' THEN
+						-- Boundary dispatches (interrupt/trace): the resume PC
+						-- is the boundary value, LATCHED at the dispatch
+						-- decision. The live adder read at this push beat can
+						-- be ZERO on hardware (wait states shift the beat past
+						-- the boundary; PC_dataa/PC_datab move on) - the
+						-- interrupt frame then stacks PC=0 and its RTE resumes
+						-- at 0 (NetBSD exec-return death spiral; frozen
+						-- slot-watch capture, beacon 0006).
+						data_write_tmp <= trap_pc_latched;
 					ELSE
+						-- Group-2 (TRAP #n, CHK, DIV0...): the +2 resume
+						-- adjustment (writePCnext) only materializes in the
+						-- adder DURING the push sequence - keep the live value
+						-- (a dispatch-time latch here re-executes the TRAP
+						-- forever: T7 regression).
 						data_write_tmp <= TG68_PC_add;
 					END IF;
 				ELSIF micro_state = trap0 THEN
@@ -2645,11 +2998,9 @@ PROCESS (clk)
 				ELSIF micro_state = berr2 THEN
 					data_write_tmp <= berr_data_out_saved;  -- Data output buffer ($18)
 				ELSIF micro_state = berr3 THEN
-					-- $14: faulted-instruction opcode in the LOW word ($16); bits 18:16
-					-- of the long carry the static-BTST bit number for the RTE-side CCR
-					-- rebuild (CCR FIX 2026-07-02 — the high word was last_opc_read
-					-- cosmetics; nothing consumes it).
-					data_write_tmp <= "0000000000000" & berr_capture_bitnr & berr_opcode_saved;
+					-- $14: Current instruction opcode in high word (matches real 68030
+					-- "internal register, opcode of faulted bus cycle" field)
+					data_write_tmp <= last_opc_read(15 downto 0) & berr_opcode_saved;
 				ELSIF micro_state = berr4 THEN
 					data_write_tmp <= berr_fault_addr;  -- Data cycle fault address ($10)
 				ELSIF micro_state = berr5 THEN
@@ -2878,8 +3229,17 @@ PROCESS (brief, OP1out, OP1outbrief, cpu)
 					   (state = "00" OR (state(1) = '1' AND memmaskmux(3) = '1' AND setstate = "00")) THEN
 						memaddr_delta_rega <= TG68_PC_add;
 						use_base <= '0';
-					ELSIF (micro_state = rte5 AND rot_cnt = "000001" AND rte_fmt_a_replay_needed = '1') OR
-					      micro_state = rte_mmu_replay THEN
+					-- Do not replace the frame address after only the first word of the
+					-- final longword. rte5 remains active until clkena_lw, and changing
+					-- the address while memmaskmux(3)='0' makes the second frame word
+					-- translate the replay target using supervisor FC. Besides losing the
+					-- frame word, an invalid supervisor translation latches a false fault
+					-- before rte_mmu_replay can apply the stacked user FC. Load the replay
+					-- address only on the completed final-datum edge; state and micro_state
+					-- advance to the write/replay state on that same edge.
+					ELSIF (micro_state = rte5 AND rot_cnt = "000001" AND
+					       rte_fmt_a_replay_needed = '1' AND memmaskmux(3) = '1') OR
+					      (micro_state = rte_mmu_replay AND memmaskmux(3) = '1') THEN
 						memaddr_delta_rega <= rte_fmt_a_fault_addr;
 						use_base <= '0';
 					-- BUG #149 FIX: MOVES states AND bus access pending need use_base='1' for address register EA
@@ -3053,7 +3413,18 @@ PROCESS (brief, OP1out, OP1outbrief, cpu)
 				-- TG68_PC_add (PC+2). The wrong address is used for the first fetch cycle,
 				-- corrupting last_opc_read. Fix: exclude this case so we fall through to
 				-- the setstate="00" ELSIF at line 2033 which correctly uses TG68_PC_add.
-				ELSIF (memmaskmux(3)='0' OR exec(mem_addsub)='1') AND NOT
+					-- Keep the effective address paired with a directPC beat
+					-- that was released without a real ack. memmask/state are held by
+					-- the same qualifier; advancing only this register would retry the
+					-- high PC word at the low-word address.
+					ELSIF directpc_retry_hold='1' THEN
+						-- Override the per-cycle defaults above as well as holding the
+						-- primary delta. RTE stack reads use A7 as memaddr_reg; dropping
+						-- use_base here redirects the retry to address zero even though
+						-- A7 itself was correctly held by clkena_lw='0'.
+						use_base <= use_base;
+						memaddr_delta_regb <= memaddr_delta_regb;
+					ELSIF (memmaskmux(3)='0' OR exec(mem_addsub)='1') AND NOT
 				      -- BUG #392 FIX: Only block addsub_q for -(An) during setup (state /= "11").
 				      -- During the actual bus write (state="11"), addsub_q provides the +2 word
 				      -- increment needed for the second half of a longword transfer. Without this,
@@ -3125,39 +3496,7 @@ PROCESS (brief, OP1out, OP1outbrief, cpu)
 						use_base <= '1';
 					END IF;
 				END IF;
-
-				-- LC II post-MMU bsr.w FIX (PMMU-stall address hold):
-				-- The logical-address datapath (memaddr_reg/memaddr_delta -> addr /
-				-- pmmu_addr_log_int) is combinational off these registers, which are
-				-- clocked by clkena_in. clkena_in keeps firing while pmmu_busy='1' (the
-				-- table walker needs it), UNLIKE clkena_lw which freezes micro_state. So a
-				-- CPU read/write (state(1)='1') that stalls on an ATC-miss walk would have
-				-- its in-flight address recomputed mid-walk (e.g. a bsr.w push redirected to
-				-- the branch target via TG68_PC_brw -> TG68_PC_add), committing the access to
-				-- the wrong location. Real 68030 holds the bus address for the whole access;
-				-- mirror that by freezing the address-datapath registers while the PMMU is
-				-- translating a pending CPU access. The longword base->base+2 progression
-				-- resumes after the walk (the 2nd word hits the now-filled ATC, no stall).
-				-- 7.1 type-7/bad-F-line FIX v9 (2026-07-03): widen the hold to FETCH
-				-- walks (state="00"), mirroring the memmask hold below (:~3439) which
-				-- already covers "ANY access". PCRING capture (sim_ring.log F1768):
-				-- the prefetch of $378000 (first word of a cold 32K page) walks; 2
-				-- ticks in, the un-held datapath recomputes with use_base cleared and
-				-- the pending -(A7) delta -> addr = 0-4 = $FFFFFFFC; the walker
-				-- translates the CORRECT original address but the post-walk REPLAYED
-				-- fetch issues at the corrupted one, returning open-bus garbage as
-				-- "the word at $378000" -> decoded as an opcode -> $FFFF-class word =
-				-- F-line (sim) / privileged garbage = "type 7" (HW), with opcode_pc
-				-- mis-booked +4 ($378004) by the same slipped window. TG68_PC itself
-				-- stayed correct throughout (v7 gates) — the tear was ONLY the address
-				-- datapath. Third member of the walk-hold family (data-addr June,
-				-- memmask June pt2, TG68_PC brw v7).
-				IF pmmu_busy='1' AND (state="00" OR state(1)='1') THEN
-					use_base           <= use_base;
-					memaddr_delta_rega <= memaddr_delta_rega;
-					memaddr_delta_regb <= memaddr_delta_regb;
-				END IF;
-
+					
 		-- only used for movem address update
 --					IF (long_done='0' AND state(1)='1') OR movem_presub='0' THEN
 					if ((memread(0) = '1') and state(1) = '1') or movem_presub = '0' then -- fix for unaligned movem mikej
@@ -3186,7 +3525,8 @@ PROCESS (brief, OP1out, OP1outbrief, cpu)
 -- PC Calc + fetch opcode
 -----------------------------------------------------------------------------
 PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data, direct_data, next_micro_state, micro_state, stop, make_trace, make_trace_t0, make_berr, IPL_nr, FlagsSR, set_rot_cnt, opcode, writePCbig, set_exec, exec,
-        PC_dataa, PC_datab, setnextpass, last_data_read, TG68_PC_brw, TG68_PC_word, Z_error, trap_trap, trap_trapv, interrupt, tmp_TG68_PC, TG68_PC, use_VBR_Stackframe, writePCnext, pmove_dn_mode, cpu_halted, exe_condition, dbcc_t0_suppress, c_out)
+        PC_dataa, PC_datab, setnextpass, last_data_read, TG68_PC_brw, TG68_PC_word, Z_error, trap_trap, trap_trapv, interrupt, tmp_TG68_PC, TG68_PC, use_VBR_Stackframe, writePCnext, pmove_dn_mode, cpu_halted, exe_condition, dbcc_t0_suppress, c_out,
+        rte_b_resume_refetch, opc_buf_valid, beat_valid, dib_sub_hit)
 	variable v_is_cof : std_logic;  -- T0 trace: change-of-flow instruction
 	variable v_irq_pending : std_logic;
 	variable v_pmmu_datatype : std_logic_vector(1 downto 0);
@@ -3243,7 +3583,17 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 		setendOPC <= '0';
 		setinterrupt <= '0';
 
-		-- T0 trace: combinational change-of-flow detection from opcode
+		-- T0 trace: combinational change-of-flow detection from opcode.
+		-- Instruction set per MC68030 UM 8.1.7 (p.8-12): "all branches, jumps,
+		-- instruction traps, returns, and coprocessor instructions that modify
+		-- the program counter flow", plus "status register manipulations";
+		-- "Instructions that increment the program counter normally do not
+		-- take the trace exception." NOP is deliberately NOT classified as COF
+		-- here: M68000PRM 3.3.5 (p.3-21) calls NOP a change-of-flow for T0
+		-- trace, but that passage describes the on-chip-FPU (68040) pipeline
+		-- sync; the MC68030-specific UM list excludes it, and the opcode
+		-- register holds an injected X"4E71" bubble during exception dispatch,
+		-- which a NOP entry here would spuriously trace at handler entry.
 		v_is_cof := '0';
 		IF cpu(1) = '1' THEN
 			-- BRA (0110 0000): always COF
@@ -3315,6 +3665,17 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 			IF opcode = x"0A7C" THEN
 				v_is_cof := '1';
 			END IF;
+			-- STOP (4E72): loads SR, so it is a "status register manipulation"
+			-- per MC68030 UM 8.1.7 (p.8-12). M68000PRM STOP (p.6-85): "A trace
+			-- exception occurs if instruction tracing is enabled (T0 = 1,
+			-- T1 = 0) when the STOP instruction begins execution", and UM
+			-- p.8-13: a traced STOP "never enters the stopped condition".
+			-- The opcode register still holds 4E72 while stop='1', so this
+			-- term wakes the boundary logic exactly like make_trace does for
+			-- the T1 case (stop clears on setinterrupt).
+			IF opcode = x"4E72" THEN
+				v_is_cof := '1';
+			END IF;
 		END IF;
 		v_irq_pending := '0';
 		IF FlagsSR(2 downto 0)<IPL_nr OR IPL_nr="111" THEN
@@ -3333,32 +3694,7 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 		-- BUG #369 FIX: Also exclude ptest1/pflush1/pload1 - same stale opcode problem.
 		-- When these states retire with setstate="00", state is still "01" from the stall cycle,
 		-- causing opcode <= last_opc_read (stale extension word) instead of data_read (next instr).
-		-- POP death-flash FIX (2026-07-11, 6th walk-hold family member — THE ROOT of
-		-- the "ILLEGAL on a byte-clean instruction stream" derail face): these
-		-- boundary strobes (setendOPC/setinterrupt/setopcode) are combinational off
-		-- clkena_lw-frozen state, so once true they stay true through EVERY
-		-- clkena_in edge of a PMMU walk stall — and the raw-clkena_in latches they
-		-- drive re-fire each walk edge. The killer: `opcode <= data_read(15:0)`
-		-- (state="00" arm), where data_read's low word is combinationally LIVE
-		-- data_in = the WALKER'S PAGE-TABLE DESCRIPTOR WORDS. A fetch-stall walk
-		-- (e.g. the loop's own code page evicted from the ATC by a cross-page copy
-		-- streaming both pointers — exactly POP's screen transitions) streams
-		-- descriptor halves into `opcode`; at the walk-completion edge the
-		-- clkena_lw-domain decode consumes `opcode` BEFORE the same-edge re-latch
-		-- of the true word (VHDL signal semantics), decoding a descriptor word →
-		-- ILLEGAL/F-line/A-line trap while the fetched bytes in RAM are pristine
-		-- (HW fetch-ring capture 2026-07-11 18:25: four clean move.b/dbra
-		-- iterations at $9BD52, then the trap — no wild jump, no garbage fetch).
-		-- Gate the whole boundary block with the family hold: no instruction
-		-- boundary may commit on a walk-stall edge. The strobes' frozen inputs
-		-- persist, so the boundary fires once at the first non-busy edge, where
-		-- data_read carries the true replayed fetch. Delayed-not-blocked also for
-		-- setinterrupt (IRQ/berr/pmmu_fault dispatch: a mid-walk fault drops
-		-- pmmu_busy when the walker aborts, then dispatches one edge later).
-		-- state="01" walks (PTEST/PFLUSH/PLOAD deliberate translations) are
-		-- excluded by the condition, same as every prior family member.
-		IF (setstate="00" OR (setstate="01" AND fline_context_valid='1')) AND next_micro_state=idle AND setnextpass='0' AND (exec_write_back='0' OR state="11") AND set_rot_cnt="000001" AND set_exec(opcCHK)='0' AND (micro_state /= pmmu_dn_read_wait OR state="00") AND micro_state /= pmove_decode AND micro_state /= pmove_mem_to_mmu_hi AND micro_state /= pmove_mem_to_mmu_lo AND micro_state /= pmove_mmu_to_mem_hi AND micro_state /= pmove_mmu_to_mem_lo AND micro_state /= ptest1 AND micro_state /= pflush1 AND micro_state /= pload1 AND cpu_halted='0'
-		   AND NOT (pmmu_busy='1' AND (state="00" OR state(1)='1')) THEN
+		IF (setstate="00" OR (setstate="01" AND fline_context_valid='1')) AND next_micro_state=idle AND setnextpass='0' AND (exec_write_back='0' OR state="11") AND set_rot_cnt="000001" AND set_exec(opcCHK)='0' AND (micro_state /= pmmu_dn_read_wait OR state="00") AND micro_state /= pmove_decode AND micro_state /= pmove_mem_to_mmu_hi AND micro_state /= pmove_mem_to_mmu_lo AND micro_state /= pmove_mmu_to_mem_hi AND micro_state /= pmove_mmu_to_mem_lo AND micro_state /= ptest1 AND micro_state /= pflush1 AND micro_state /= pload1 AND cpu_halted='0' THEN
 			setendOPC <= '1';
 			-- BUG #400 FIX: Also check pmmu_fault directly (not just make_berr) for immediate
 			-- bus error dispatch. make_berr is registered and won't reflect pmmu_fault until
@@ -3371,12 +3707,22 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 			-- IRQ term across successful RTE retirement. Immediate fault/trace
 			-- cases still keep priority on the same edge.
 			IF ((v_irq_pending = '1') AND opcode /= x"4E73") OR make_trace='1' OR (make_trace_t0='1' AND v_is_cof='1') OR make_berr='1'
-			   OR (pmmu_tc_en='1' AND pmmu_fault='1' AND
+			   OR (pmmu_tc_en='1' AND pmmu_fault='1' AND dib_sub_hit='0' AND
 			       ((berr_exception_active='0' AND pmmu_fault_dispatched='0') OR pmmu_fault_was_cleared='1') AND
 			       trap_berr='0' AND trap_mmu_berr='0')
 			   OR TG68_PC(0)='1' THEN
 				setinterrupt <= '1';
-			ELSIF stop='0' THEN
+			ELSIF stop='0' AND NOT (rte_b_resume_refetch='1' AND state /= "00")
+			              AND NOT (state /= "00" AND opc_buf_valid='0')
+			              AND NOT (state = "00" AND beat_valid='0') THEN
+				-- Retire gates:
+				-- (1) Post-$B-RTE forced refetch: hold until a FRESH state="00"
+				--     beat supplies the opcode (rte_b_resume_refetch arm site).
+				-- (2) opc_buf_valid: the buffered word is only consumable if
+				--     its fetch beat was beat_valid-acked (a force-completed
+				--     fetch leaves the previous wrong-position word behind).
+				-- (3) A state="00" retire edge must itself be beat_valid -
+				--     data_read on a fault-released edge is bus garbage.
 				setopcode <= '1';
 			END IF;
 		END IF;	
@@ -3405,6 +3751,8 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 				addrvalue <= '0';
 				opcode <= X"2E79"; 					--move $0,a7
 				opcode_pc <= (others => '0');
+				opc_buf_valid <= '1';				-- reset presets are retire-valid
+				rte_b_resume_refetch <= '0';
 				trap_interrupt <= '0';
 				interrupt <= '0';
 				last_opc_read  <= X"4EF9";			--jmp nn.l
@@ -3430,27 +3778,34 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					cpu_halted <= '0';
 					pmmu_fault_dispatched <= '0';
 					pmmu_fault_was_cleared <= '0';
+					mmu_restart_pending <= '0';
+					mmu_restart_soft <= '0';
+					mmu_restart_restore <= '0';
+					berr_pmmu_fault_lastwrite <= '0';
 					berr_fault_addr <= (others => '0');
 					berr_frame_pc <= (others => '0');
 					berr_opcode_saved <= (others => '0');
-					berr_setup_opcode <= (others => '0');
-					berr_setup_exe_pc <= (others => '0');
-					berr_capture_opcode <= (others => '0');
-					berr_capture_pc <= (others => '0');
-					berr_capture_nextpc <= (others => '0');
-					berr_capture_bitnr <= (others => '0');
 					berr_ssw <= (others => '0');
 					berr_data_out_saved <= (others => '0');
 					berr_long_frame <= '0';
 					berr_external_rw <= '1';
 					berr_external_fc <= (others => '0');
 					berr_external_datatype <= "10";
+					berr_external_rmw <= '0';
 					berr_pmmu_datatype <= "10";
 					berr_pmmu_fault_addr <= (others => '0');
 					berr_pmmu_fault_fc <= (others => '0');
 					berr_pmmu_fault_rw <= '1';
+					berr_pmmu_fault_rmw <= '0';
 					berr_pmmu_fault_is_insn <= '0';
 					berr_pmmu_fault_valid <= '0';
+					berr_pmmu_fault_lastwrite <= '0';
+					berr_pmmu_fault_from_rte_replay <= '0';
+					berr_restart_pc <= (others => '0');
+					mmu_restart_pending <= '0';
+					mmu_restart_soft <= '0';
+					mmu_restart_restore <= '0';
+					flags_shadow <= (others => '0');
 					berr_external_addr <= (others => '0');
 					memmask <= "111111";
 					exec_write_back <= '0';
@@ -3471,78 +3826,87 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 			ELSE
 --				IPL_nr <= NOT IPL;
 				IF clkena_in='1' THEN
-					-- FORMAT-$B CONTINUE-PAST FIX: capture the end-of-instruction PC.
-					-- During operand setup (setstate="01") TG68_PC holds the PC just past
-					-- the faulting instruction's last word. Once the data access starts
-					-- (setstate="10") the prefetch advances TG68_PC up to the prefetch depth
-					-- (~3 words) ahead, so stacking the live TG68_PC in a data bus-fault frame
-					-- overshoots the true next-instruction PC for instructions shorter than the
-					-- prefetch (the Mac OS BERR-probe forms). A DF-cleared "continue-past" RTE
-					-- then resumes too far and derails. Latch the setup-phase PC; the external
-					-- data-fault frame build below stacks THIS instead of TG68_PC.
-					IF setstate = "01" THEN
-						instr_boundary_pc <= TG68_PC;
-						-- CONTINUE-PAST FIX v2: also latch the FAULTING instruction's opcode and
-						-- start PC here (pre-fault). These feed the external-data-fault frame:
-						-- resume PC = berr_setup_exe_pc + decoded length, opcode field = this
-						-- opcode (so rte_mmu_fix decodes the real move, not the clobbered 4E71).
-						berr_setup_opcode <= opcode;
-						berr_setup_exe_pc <= exe_pc;
-					END IF;
-					-- LC II post-MMU bsr.w FIX (part 2 — longword word-counter hold):
-					-- Freeze the longword word counter (memmask/memread) during a PMMU stall
-					-- of ANY access (fetch state="00" OR data read/write state(1)='1'), not
-					-- just fetches. Without this, a longword WRITE whose first word misses the
-					-- ATC keeps advancing the word position (high->low) while it waits for the
-					-- walk, so the data marches to the low word while the held address still
-					-- points at the high-word slot -> the longword collapses to a single
-					-- mis-valued word ($0130 at $1ff3c4, $1ff3c6 never written). Holding the
-					-- counter (with the address-datapath hold above) keeps word0 stable until
-					-- the walk commits it; word1 then advances normally (ATC hit, no stall).
-					IF NOT ((state = "00" OR state(1) = '1') AND pmmu_busy = '1') THEN
+					IF NOT (state = "00" AND pmmu_busy = '1') AND directpc_retry_hold='0' THEN
 						memmask <= memmask(3 downto 0)&"11";
 						memread <= memread(1 downto 0)&memmaskmux(5 downto 4);
 					END IF;
 --					IF wbmemmask(5 downto 4)="11" THEN
 --						wbmemmask <= memmask;
 --					END IF;
-					-- CONTINUE-PAST FIX: PC+2 only for the PMMU software-fix path
-					-- (bit9=1, which stacks the live TG68_PC). The OS continue-past
-					-- case (bit9=0) keeps the next-instruction PC already restored from
-					-- the stacked frame (instr_boundary_pc); only its register is written.
-					IF rte_mmu_fix_commit='1' AND rte_mmu_fix_ssw(9)='1' THEN
-						TG68_PC <= TG68_PC + 2;
-					-- 7.1 type-7 / bad-F-line FIX (2026-07-03): gate the RTS/RTE/JMP-abs
-					-- (directPC, PC<=data_read) and JSR/JMP-indirect (ea_to_pc, PC<=addr)
-					-- redirects on pmmu_busy='0', exactly like the brw arm below. jsr/jmp
-					-- (kernel ~5683-5716) do writePC (return-address push) AND the ea_to_pc
-					-- redirect; if the push's stack write / prefetch stalls on a PMMU walk,
-					-- clkena_lw freezes the push while the UNGATED redirect kept advancing
-					-- TG68_PC one prefetch word early -> the pushed return address was torn
-					-- (landed mid-instruction, e.g. $378004 = jsr return $378006 - 2 -> the
-					-- callee's rts hit the jsr displacement word $FD48 as an F-line -> bomb).
-					-- Holding the redirect until the walk clears makes it commit on the first
-					-- non-busy edge (data_read/addr valid, same edge the frozen push samples).
-					-- Non-walk path unaffected (pmmu_busy='0' always). Sibling of the v7
-					-- bsr/brw tear fix; that gated only the brw arm, missing jsr's ea_to_pc.
-					ELSIF exec(directPC)='1' AND pmmu_busy='0' THEN
-						TG68_PC <= data_read;
-					ELSIF exec(ea_to_pc)='1' AND pmmu_busy='0' THEN
-						TG68_PC <= addr;
-					-- 7.1 WILD-RTS FIX (2026-07-02): gate the TG68_PC_brw redirect on
-				-- pmmu_busy='0' UNIFORMLY, like the sequential-fetch arm. The PMMU
-				-- retrofit guarded only (state="00"); the branch redirect kept firing
-				-- on clkena_in edges while a walk stall froze clkena_lw (micro_state +
-				-- data_write_tmp). For a bsr.w whose displacement word ends a page,
-				-- the NEXT-page prefetch walk is already stalling at bsr2, so the
-				-- redirect moved TG68_PC away BEFORE the push-data capture -> the
-				-- pushed return address was torn/zero, and the callee's rts popped
-				-- garbage (System 7.1 "bad F-Line" bomb; berr_bench probe #13).
-				-- TG68_PC_brw is combinational from the frozen micro_state, so it
-				-- stays asserted through the stall and the redirect commits on the
-				-- first non-busy edge — same edge the push data samples, restoring
-				-- the designed atomic handoff.
-				ELSIF (((state ="00") OR TG68_PC_brw = '1') AND pmmu_busy='0') AND stop='0'
+					IF rte_mmu_fix_commit='1' THEN
+						-- Skip the COMPLETED instruction: opcode + its source EA
+						-- extension words (the fixed +2 only suited (An) forms;
+						-- a committed (d16,An) resumed INTO its own extension
+						-- word - MuForce loop shape on multi-word MOVEs).
+						TG68_PC <= TG68_PC + rte_mmu_fix_len;
+					ELSIF exec(directPC)='1' THEN
+						-- A read aborted by a PMMU fault must not supply the PC.
+						-- Register-bound faulted loads are undone by the restart
+						-- rollback, but directPC consumers (RTS/RTE/JMP-indirect)
+						-- redirect the instruction stream immediately: with the
+						-- translation faulted the bus data is garbage, and an ODD
+						-- garbage PC fires the Group-0 address-error check while
+						-- the fault's own dispatch is raising berr_exception_active
+						-- -> HALT_CTX_C double-fault halt (T16 RTS pop on an
+						-- invalidated page; hardware: NetBSD fork-return halt with
+						-- PC=$00000001 at exe_pc=$0E0122BA). Holding the old PC is
+						-- safe: the fault dispatches, the frame stacks the rollback
+						-- PC, and the instruction re-executes with valid data.
+						-- beat_valid (the wrapper's TRUE ready-ack) replaces the
+						-- earlier live-fault + first-fire-latch scoping, which
+						-- raced on hardware (PC=$1 recurred at the exec boundary).
+						-- Two-tier commit. Tier 1: a clean completed longword.
+						-- Tier 2 (beacon 0014/0015 NetBSD lockup): the sticky
+						-- bus_beat_poisoned flag outlives the datum that was
+						-- actually released (a parasitic prefetch beat squashed
+						-- without a dispatch, inside the RTE's microcode where
+						-- no setopcode can clear it - DPCW showed the pop beats
+						-- themselves CLEAN, bv=1). Refusing the commit then lets
+						-- the RTE/RTS complete micro-code-wise (A7 advanced)
+						-- while the PC keeps the OLD stream: execution sails on
+						-- past the return (hardware: kernel exe_pc=$3B4C after
+						-- the $B RTE at $276A, then a wild JMP to stream data
+						-- $2F3C1400 and a double-fault halt on the wrong stack).
+						-- Tier 2 commits when the stale flag is the ONLY veto:
+						-- THIS datum's beats were all acked (beat_valid at the
+						-- completion edge, bus_datum_dirty clear - a released
+						-- beat inside the datum leaves it misassembled, e.g.
+						-- {SR,PClo}, and must keep refusing) and nothing is
+						-- pending to rescue the instruction (no make_berr, no
+						-- trapmake, no live PMMU fault - a real fault-released
+						-- datum always has those set by its completion edge:
+						-- id12/T16 protection intact).
+						-- Tier-2 fault terms are INSN-EXEMPT: a directPC pop is a
+						-- DATA read, so a pending/live fault flagged as an
+						-- instruction fetch is by definition PARASITIC here (the
+						-- speculative fall-through prefetch at the RTE tail - T27).
+						-- It must not veto: the redirect is precisely what discards
+						-- the speculative word, after which the never-consumed
+						-- fault squashes. A fault on the pop itself is a data
+						-- fault (is_insn=0) and still refuses (id12/T16).
+						IF clkena_lw='1' AND
+						   ((beat_valid='1' AND bus_beat_poisoned='0' AND
+						    (pmmu_tc_en='0' OR pmmu_fault='0')) OR
+						    dib_sub_hit='1' OR
+						    (beat_valid='1' AND bus_datum_dirty='0' AND
+							     (make_berr='0' OR
+							      (berr_pmmu_fault_valid='1' AND
+							       berr_pmmu_fault_is_insn='1')) AND
+						     trapmake='0' AND
+						     (pmmu_tc_en='0' OR pmmu_fault='0' OR
+						      pmmu_fault_is_insn_out='1'))) THEN
+							TG68_PC <= data_read;
+						END IF;
+					ELSIF exec(ea_to_pc)='1' THEN
+						-- A faulted memory-indirect JMP/JSR must leave the old PC
+						-- intact until the bus-error restart dispatches. Committing
+						-- addr here turns the released pointer beat into a control
+						-- transfer (hardware: JMP ([PC+bd]) fault at $9174 committed
+						-- $2F3CFFFF, then address-error double-faulted).
+						IF ea_to_pc_datum_invalid='0' THEN
+							TG68_PC <= addr;
+						END IF;
+					ELSIF (((state ="00") AND pmmu_busy='0') OR TG68_PC_brw = '1') AND stop='0'
 					      AND NOT (micro_state = pmmu_ld_nn AND nextpass = '1') THEN
 						TG68_PC <= TG68_PC_add;
 					END IF;
@@ -3550,55 +3914,59 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					-- BUG #53 FIX: Move extension word capture to clkena_in block (1-stage pipeline)
 					-- Previously in clkena_lw block, which never executed for PMOVE memory EA modes!
 					-- PMOVE memory EA sets memmask="100111" → clkena_lw='0' → brief never captured
-					-- POP death-flash FIX (2026-07-11, walk-hold family, sibling of the
-					-- boundary-strobe gate above): getbrief is combinational off frozen
-					-- decode state, so a walk stall re-latches `brief` every clkena_in
-					-- edge — and the state(1)='0' arm samples data_read whose low word
-					-- is LIVE data_in = walker descriptor words. The clkena_lw-domain
-					-- decode then consumes `brief` at the walk-completion edge BEFORE
-					-- the same-edge re-latch of the true word → garbage extension word
-					-- → wild effective address (the amok-copy face of the derail).
-					-- Hold both brief latches during CPU-access walk stalls; they fire
-					-- once at the first non-busy edge with the true replayed data. The
-					-- :BUG #53 clkena_lw='0' PMOVE arm keeps its memmask-window intent
-					-- (pmmu_busy='0' there in the non-walk case it was built for).
-					IF NOT (pmmu_busy='1' AND (state="00" OR state(1)='1')) THEN
-						IF getbrief='1' THEN
-							IF next_micro_state = pmove_decode AND fline_context_valid='0' AND clkena_lw='0' THEN
-								-- After PMMU translation resumes an instruction fetch, the first
-								-- F-line extension word can already be on the bus while data_read
-								-- still holds the opcode word from the previous fetch. Capture the
-								-- live bus word so PMOVE/PFLUSH/PTEST/PLOAD decode sees the real
-								-- extension instead of reusing the opcode.
+					-- beat_valid/opc_buf_valid gating: an extension word from a
+					-- force-completed (faulted) fetch beat is bus garbage; the
+					-- consumer-gated restart dispatches for the fault, so
+					-- HOLDING brief here is safe - the instruction re-executes
+					-- with real data. A garbage extension otherwise computes a
+					-- garbage EA and the STORE lands at a wrong address (the
+					-- NetBSD pool-page corruption class).
+					IF getbrief='1' THEN
+						IF next_micro_state = pmove_decode AND fline_context_valid='0' AND clkena_lw='0' THEN
+							-- After PMMU translation resumes an instruction fetch, the first
+							-- F-line extension word can already be on the bus while data_read
+							-- still holds the opcode word from the previous fetch. Capture the
+							-- live bus word so PMOVE/PFLUSH/PTEST/PLOAD decode sees the real
+							-- extension instead of reusing the opcode.
+							IF beat_valid='1' THEN
 								brief <= data_in;
-							ELSIF state(1)='1' THEN
+							END IF;
+						ELSIF state(1)='1' THEN
+							IF opc_buf_valid='1' THEN
 								brief <= last_opc_read(15 downto 0);
-							ELSE
+							END IF;
+						ELSE
+							IF beat_valid='1' THEN
 								brief <= data_read(15 downto 0);
 							END IF;
-							-- MOVEC is especially sensitive to extension-word timing on real
-							-- hardware. Latch the control-register selector alongside the
-							-- extension word so movec1 never decodes a transient/stale brief.
-							IF next_micro_state = movec1 THEN
-								IF state(1)='1' THEN
+						END IF;
+						-- MOVEC is especially sensitive to extension-word timing on real
+						-- hardware. Latch the control-register selector alongside the
+						-- extension word so movec1 never decodes a transient/stale brief.
+						IF next_micro_state = movec1 THEN
+							IF state(1)='1' THEN
+								IF opc_buf_valid='1' THEN
 									movec_regsel <= last_opc_read(11 downto 0);
-								ELSE
+								END IF;
+							ELSE
+								IF beat_valid='1' THEN
 									movec_regsel <= data_read(11 downto 0);
 								END IF;
 							END IF;
 						END IF;
+					END IF;
 
-						-- pmmu_ld_AnXn1 brief latch: For PMOVE (d8,An,Xn) mode,
-						-- the EA brief extension word was fetched during the state="00"
-						-- bus cycle alongside pmove_decode.  During pmove_decode, state="00"
-						-- so data_read has the current bus data (the EA brief word).
-						-- last_opc_read still has the PREVIOUS cycle's value (the PMOVE
-						-- extension word) because it hasn't been updated yet at this point
-						-- in the process (clkena_lw block updates it at line 2542).
-						-- Use data_read, matching the getbrief mechanism for state(1)='0'.
-						IF micro_state = pmove_decode AND next_micro_state = pmmu_ld_AnXn1 THEN
-							brief <= data_read(15 downto 0);
-						END IF;
+					-- pmmu_ld_AnXn1 brief latch: For PMOVE (d8,An,Xn) mode,
+					-- the EA brief extension word was fetched during the state="00"
+					-- bus cycle alongside pmove_decode.  During pmove_decode, state="00"
+					-- so data_read has the current bus data (the EA brief word).
+					-- last_opc_read still has the PREVIOUS cycle's value (the PMOVE
+					-- extension word) because it hasn't been updated yet at this point
+					-- in the process (clkena_lw block updates it at line 2542).
+					-- Use data_read, matching the getbrief mechanism for state(1)='0'.
+					IF micro_state = pmove_decode AND next_micro_state = pmmu_ld_AnXn1 AND
+					   beat_valid='1' THEN
+						brief <= data_read(15 downto 0);
 					END IF;
 
 					-- BUG #318/322 FIX: MOVES indexed mode (d8,An,Xn) brief loading
@@ -3613,18 +3981,15 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					-- CRITICAL: Use next_micro_state, not micro_state! At this clock edge,
 					-- micro_state still has the OLD value. next_micro_state has the value
 					-- that micro_state will become, which is pmove_decode when getbrief fired.
-						-- LC II walk-exposure FIX B (2026-07-07): this capture is a
-						-- ONE-SHOT (it sets fline_context_valid and disarms itself).
-						-- If it fires mid-walk, the clkena_lw='0' arm below samples
-						-- data_in = walker page-table words and LOCKS the garbage in
-						-- (PMMU instruction misdecode). Suspend the one-shot while a
-						-- CPU access is walking: the trigger (frozen micro_state
-						-- family) persists, so the capture still fires on the
-						-- walk-completing edge with the real extension word.
-						IF next_micro_state = pmove_decode AND fline_context_valid = '0' AND getbrief = '1'
-						   AND NOT (pmmu_busy='1' AND (state="00" OR state(1)='1')) THEN
-						fline_opcode_latch <= opcode;
-						-- Capture from SAME source as brief to avoid timing issues
+						IF next_micro_state = pmove_decode AND fline_context_valid = '0' AND getbrief = '1' AND
+						   ((clkena_lw='0' AND beat_valid='1') OR
+						    (clkena_lw='1' AND state(1)='1' AND opc_buf_valid='1') OR
+						    (clkena_lw='1' AND state(1)='0' AND beat_valid='1')) THEN
+							fline_opcode_latch <= opcode;
+							-- Capture from the same valid source as brief. A PMMU fault can
+							-- force-complete an extension fetch with bus garbage; accepting
+							-- it here while brief rejects it leaves a stale selector/command
+							-- live across exception entry and into the next F-line instruction.
 						IF clkena_lw='0' THEN
 							fline_brief_latch <= data_in;
 						ELSIF state(1)='1' THEN
@@ -3670,12 +4035,7 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 							pmove_dn_mode <= '0';  -- Clear for non-Dn modes
 						END IF;
 					-- BUG #198 FIX: Increment pmove_dn_regnum for second half of 64-bit PMOVE
-					-- LC II walk-exposure HARDENING (2026-07-07): the increment was
-					-- LEVEL-triggered on micro_state alone in a clkena_in block —
-					-- any stall that keeps clkena_in firing while micro_state is
-					-- frozen (PMMU walk, longword first beat) would multi-increment.
-					-- Gate on clkena_lw: exactly one increment per state visit.
-					ELSIF micro_state = pmove_dn_hi AND clkena_lw='1' THEN
+					ELSIF micro_state = pmove_dn_hi THEN
 						-- Transition from pmove_dn_hi to pmove_dn_lo: increment for Dn+1
 						pmove_dn_regnum <= pmove_dn_regnum + "001";
 					END IF;
@@ -3726,11 +4086,15 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 				IF clkena_lw='1' THEN
 					-- MC68030 double bus fault: Reset stall-monitor flag each active cycle
 					pmmu_fault_was_cleared <= '0';
+					mmu_restart_restore <= '0';
 					v_pmmu_datatype := berr_pmmu_datatype;
 					interrupt <= setinterrupt;
 					decodeOPC <= setopcode;
 					endOPC <= setendOPC;
 					execOPC <= setexecOPC;
+					IF decodeOPC='1' THEN
+						flags_shadow <= Flags;
+					END IF;
 					-- BUG #400 FIX: Clear dispatched flag when PMMU fault_reg is cleared
 					-- (happens when a new translation request is issued, e.g., berr stack push)
 					if pmmu_fault = '0' then
@@ -3747,7 +4111,7 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 
 					if(trap_berr='0' and trap_mmu_berr='0') then
 						if pmmu_tc_en = '1' then
-							if pmmu_fault='1' and ((berr_exception_active='0' and pmmu_fault_dispatched='0') OR pmmu_fault_was_cleared='1') then
+							if pmmu_fault='1' and dib_sub_hit='0' and ((berr_exception_active='0' and pmmu_fault_dispatched='0') OR pmmu_fault_was_cleared='1') then
 								make_berr <= '1';
 								-- Mark the current PMMU fault as consumed as soon as it
 								-- requests bus-error dispatch.  The PMMU keeps fault_reg
@@ -3755,15 +4119,6 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 								-- early mark, the first bus-error frame stack write sees the
 								-- stale fault for one cycle and trips the double-fault guard.
 								pmmu_fault_dispatched <= '1';
-								-- CCR FIX: latch the static-BTST bit number for PMMU-fault
-								-- frames too (same in-flight instruction, sndOPC still live).
-								berr_capture_bitnr <= sndOPC(2 downto 0);
-								-- v6: latch the opcode/pc too — the PMMU-fault frame build
-								-- also stacks berr_capture_opcode at +$14; without this it
-								-- held the value from an OLDER external fault, so the RTE
-								-- writeback gate decoded a stale opcode for PMMU faults.
-								berr_capture_opcode <= opcode;
-								berr_capture_pc     <= opcode_pc;
 							else
 								make_berr <= (berr OR make_berr OR pmmu_walker_berr);
 							end if;
@@ -3771,7 +4126,7 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 							-- Track whether the fault originated in the PMMU path or the external
 							-- bus path. On MC68030 both dispatch to vector 2, but the PMMU path
 							-- still needs its own status/stack-frame handling.
-							if (pmmu_fault = '1' and pmmu_fault_stat(15) = '1' and
+							if (pmmu_fault = '1' and dib_sub_hit = '0' and pmmu_fault_stat(15) = '1' and
 							    ((berr_exception_active='0' and pmmu_fault_dispatched='0') OR pmmu_fault_was_cleared='1')) or
 							   pmmu_walker_berr = '1' then
 								make_mmu_berr <= '1';
@@ -3791,16 +4146,8 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 							berr_external_rw <= pmmu_rw;
 							berr_external_fc <= fc_internal;
 							berr_external_datatype <= datatype;  -- BUG #433b FIX: latch at BERR first-fire
+							berr_external_rmw <= pmmu_rmw;
 							berr_external_addr <= addr;          -- BUG #434 FIX: latch fault addr at BERR first-fire (state="11")
-							-- CONTINUE-PAST FIX v3: capture the EXECUTING instruction here.
-							-- opcode/opcode_pc still hold the faulting instruction at first-fire
-							-- (the trap dispatch's 4E71 clobber comes later); the v2 setstate="01"
-							-- latches go stale when the preceding instructions are register-only.
-							berr_capture_opcode <= opcode;
-							berr_capture_pc     <= opcode_pc;
-							berr_capture_nextpc <= TG68_PC;   -- v4: prefetch ptr = next-instr + 2
-							-- CCR FIX: static-BTST bit number (sndOPC still holds the imm word)
-							berr_capture_bitnr  <= sndOPC(2 downto 0);
 						end if;
 					else
 						-- MC68030 Double bus fault detection: bus error/fault during bus error processing
@@ -3831,19 +4178,81 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					end if;
 					-- Latch PMMU access size at first-fire so later micro-state activity
 					-- cannot corrupt SSW.SIZE for the eventual bus/MMU frame.
-					if pmmu_fault='0' and make_berr='0' and trap_berr='0' and trap_mmu_berr='0' and berr_exception_active='0' then
+					if (pmmu_tc_en='0' or pmmu_fault='0') and make_berr='0' and trap_berr='0' and trap_mmu_berr='0' and berr_exception_active='0' then
 						berr_pmmu_datatype <= "10";
 						berr_pmmu_fault_valid <= '0';
-					elsif pmmu_fault='1' and make_berr='0' and trap_berr='0' and trap_mmu_berr='0' then
-						berr_pmmu_datatype <= datatype;
-						berr_pmmu_fault_addr <= pmmu_fault_addr_out;
-						berr_pmmu_fault_fc <= pmmu_fault_fc_out;
-						berr_pmmu_fault_rw <= pmmu_fault_rw_out;
-						berr_pmmu_fault_is_insn <= pmmu_fault_is_insn_out;
-						berr_pmmu_fault_valid <= '1';
-						v_pmmu_datatype := datatype;
+						berr_pmmu_fault_from_rte_replay <= '0';
+						-- Self-clearing squash window: a restart fault that evaporates
+						-- WITHOUT dispatching (transient walker fault, retried/cleared
+						-- translation) must not leave mmu_restart_pending armed - the
+						-- stuck window silently drops every subsequent write (nWr/UDS/
+						-- LDS gated) and blocks translations (pmmu_req gated), which on
+						-- NetBSD lost the fork call's return-address push and wedged
+						-- fault_reg/berr_exception_active into a later double-fault.
+						mmu_restart_pending <= '0';
+						mmu_restart_soft <= '0';
+					elsif pmmu_tc_en='1' and pmmu_fault='1' and dib_sub_hit='0' and make_berr='0' and trap_berr='0' and trap_mmu_berr='0' then
+						-- Preserve the first fault until its exception frame is built. A
+						-- released replay fault can be followed immediately by a fetch at
+						-- the restored PC; that request must not replace the write metadata.
+						IF berr_pmmu_fault_valid = '0' THEN
+							berr_pmmu_datatype <= datatype;
+							-- Continuation PC for a LASTWRITE Format $A frame, decided at
+							-- first-fire while the faulted store is still the executing
+							-- instruction. A store's write beat can only run after every
+							-- stream word of the instruction was consumed (EA + data), so
+							-- a valid buffered word beyond insn_next_pc is the NEXT
+							-- instruction's opcode and its address is the continuation.
+							-- insn_next_pc is the counted fallback (immediate-operand
+							-- consumption is not fully counted; the buffer check
+							-- self-corrects the undercount).
+							IF opc_buf_valid='1' AND last_opc_pc > insn_next_pc THEN
+								berr_pmmu_fault_next_pc <= last_opc_pc;
+							ELSE
+								berr_pmmu_fault_next_pc <= insn_next_pc;
+							END IF;
+							berr_pmmu_fault_addr <= pmmu_fault_addr_out;
+							berr_pmmu_fault_fc <= pmmu_fault_fc_out;
+							berr_pmmu_fault_rw <= pmmu_fault_rw_out;
+							berr_pmmu_fault_rmw <= pmmu_rmw;
+							berr_pmmu_fault_is_insn <= pmmu_fault_is_insn_out;
+							berr_pmmu_fault_lastwrite <= pmmu_fault_lastwrite_ok;
+							IF micro_state = rte_mmu_replay THEN
+								berr_pmmu_fault_from_rte_replay <= '1';
+							ELSE
+								berr_pmmu_fault_from_rte_replay <= '0';
+							END IF;
+							berr_pmmu_fault_valid <= '1';
+							IF (pmmu_fault_is_insn_out = '0' OR insn_fetch_consumer = '1') AND
+							   pmmu_fault_lastwrite_ok = '0' THEN
+								mmu_restart_pending <= '1';
+								mmu_restart_soft <= pmmu_fault_is_insn_out;
+								berr_restart_pc <= exe_pc;
+							END IF;
+							v_pmmu_datatype := datatype;
+							-- data_write_muxin includes register-forwarded MOVES writes.
+							berr_pmmu_write_data <= data_write_muxin;
+						END IF;
 					end if;
 
+					-- T27 squash: a completing directPC load (RTE/RTS redirect)
+					-- discards the speculative instruction stream, so a PENDING
+					-- bus error whose first-fire flavor was an INSTRUCTION
+					-- FETCH (the parasitic fall-through prefetch at the RTE
+					-- tail) dies with it - otherwise it dispatches against the
+					-- redirect TARGET's stream (stacked PC = the new location,
+					-- +1 phantom fault). A live DATA-flavored fault blocks the
+					-- squash (the pop's own fault must still dispatch).
+					IF exec(directPC)='1' AND clkena_lw='1' AND
+						   make_berr='1' AND berr_pmmu_fault_valid='1' AND
+						   berr_pmmu_fault_is_insn='1' AND
+					   trap_berr='0' AND trap_mmu_berr='0' AND
+					   (pmmu_tc_en='0' OR pmmu_fault='0' OR
+					    pmmu_fault_is_insn_out='1') THEN
+							make_berr <= '0';
+							make_mmu_berr <= '0';
+							berr_pmmu_fault_valid <= '0';
+					END IF;
 					stop <= set_stop OR (stop AND NOT setinterrupt);
 					IF setinterrupt='1' THEN
 						trap_interrupt <= '0';
@@ -3855,6 +4264,11 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 						trap_mmu_berr <= '0';  -- BUG #159: Clear MMU BERR trap
 						trap_addr_error <= '0';  -- Clear by default
 						berr_long_frame <= '0';
+						IF pmmu_fault_restart_dispatch = '1' THEN
+							mmu_restart_pending <= '0';
+							mmu_restart_soft <= '0';
+							mmu_restart_restore <= '1';
+						END IF;
 						-- BUG #393 FIX: MC68030 UM 8.1 exception priority:
 						-- Group 0 (highest): Reset, Address Error, Bus Error
 						-- Group 1: Trace, Interrupt, Illegal, Privilege
@@ -3924,14 +4338,39 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 									   (pmmu_fault='1' AND pmmu_fault_stat(15)='1' AND
 									    ((berr_exception_active='0' AND pmmu_fault_dispatched='0') OR pmmu_fault_was_cleared='1')) THEN
 										trap_mmu_berr <= '1';
-											-- Diagnostic/spec candidate: use the long recoverable bus-fault
-											-- frame for PMMU faults instead of guessing instruction-boundary
-											-- timing from R/W polarity.
-											berr_long_frame <= '1';
+											-- WinUAE parity (Exception_mmu030): Format $A (short,
+											-- single-write-replayable) exactly when this write is
+											-- LASTWRITE-eligible; Format $B (long) otherwise - covers
+											-- every read (Table 8-6), CAS's locked write, a
+											-- non-final MOVEM register, and instruction fetches.
+										IF berr_pmmu_fault_valid = '1' THEN
+											berr_long_frame <= NOT berr_pmmu_fault_lastwrite;
+										ELSIF pmmu_fault = '1' THEN
+											berr_long_frame <= NOT pmmu_fault_lastwrite_ok;
+											ELSE
+												berr_long_frame <= NOT berr_pmmu_fault_lastwrite;
+											END IF;
 									ELSE
 										trap_berr <= '1';  -- Use vector 2 for normal bus error
-											-- Same diagnostic candidate for external bus faults.
-											berr_long_frame <= '1';
+											-- A PMMU-originated fault lands here too whenever it isn't
+											-- classified as the "B" (bus-error) subtype - e.g. a WP or
+											-- supervisor-violation ATC hit. It still carries genuine
+											-- LASTWRITE provenance (pmmu_fault_lastwrite_ok), so give it
+											-- the same WinUAE-parity Format $A/B treatment. Only a TRUE
+											-- external (non-PMMU) bus error, where no LASTWRITE
+											-- provenance exists at all, keeps the unconditional long
+											-- frame.
+											IF pmmu_fault = '1' OR berr_pmmu_fault_valid = '1' THEN
+											IF berr_pmmu_fault_valid = '1' THEN
+												berr_long_frame <= NOT berr_pmmu_fault_lastwrite;
+											ELSIF pmmu_fault = '1' THEN
+												berr_long_frame <= NOT pmmu_fault_lastwrite_ok;
+												ELSE
+													berr_long_frame <= NOT berr_pmmu_fault_lastwrite;
+												END IF;
+											ELSE
+												berr_long_frame <= '1';
+											END IF;
 									END IF;
 								-- BUG #400 FIX: Mark pmmu_fault as dispatched to prevent false
 								-- double bus fault from stale fault_reg before new translation clears it
@@ -3939,41 +4378,71 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 									pmmu_fault_dispatched <= '1';
 								end if;
 								berr_exception_active <= '1';
-								-- MC68030/WinUAE stack the current PC in Format $A/$B
-								-- bus-fault frames.  For a Format $A LASTWRITE fault this
-								-- is the post-instruction PC; RTE replays only the saved
-								-- write and must not restart the instruction from exe_pc.
-								-- FORMAT-$B CONTINUE-PAST FIX v2 (2026-06-21): for an EXTERNAL data
-								-- bus fault (the Mac OS BERR-protected handle-validation probe), stack
-								-- the TRUE next-instruction PC = faulting-instr start + its decoded
-								-- length, and save the faulting opcode. HW ground truth (JTAG capture):
-								-- instr_boundary_pc is the PREFETCH pointer (= exe_pc + 6, a constant
-								-- 3 words ahead) so it overshoots the short probe forms; and exe_opcode
-								-- is clobbered to $4E71 by fault time. Use the pre-fault setstate="01"
-								-- latches (berr_setup_*) instead. Length from the faulting source EA:
-								--   (An)     [mode 010] = 1 word  -> +2  (movea.l (a1),a0 = $2051)
-								--   (d16,An) [mode 101] = 2 words -> +4  (move.l $38(a6),d0 = $202E)
-								-- PMMU faults keep the live TG68_PC (their rte_mmu_fix replay advances
-								-- the PC itself). Other EA modes (e.g. the absolute-EA boot RAM probe,
-								-- which recovers via jmp(A6) and never RTEs this frame) fall back to the
-								-- old instr_boundary_pc — harmless, since their stacked PC is unused.
-								IF pmmu_fault = '1' OR berr_pmmu_fault_valid = '1' OR make_mmu_berr = '1' THEN
+								-- Format $A/LASTWRITE frames keep the continuation PC for
+								-- saved-write replay; restartable data faults (reads,
+								-- non-final MOVEM writes) stack the instruction-start PC so
+								-- a plain RTE re-executes after the register rollback.
+								-- TG68_PC is the PREFETCH pointer: when the buffer holds
+								-- an unconsumed readahead word, the next unexecuted
+								-- instruction is at last_opc_pc = TG68_PC-2, and stacking
+								-- TG68_PC makes the post-replay resume skip one word.
+								IF berr_pmmu_fault_valid = '1' AND berr_pmmu_fault_from_rte_replay = '1' THEN
+									-- RTE restores SR/PC before retrying the saved write. A fault
+									-- during that retry belongs to the restored instruction stream.
 									berr_frame_pc <= TG68_PC;
+								ELSIF micro_state = rte_mmu_replay AND pmmu_fault = '1' THEN
+									berr_frame_pc <= TG68_PC;
+								ELSIF pmmu_fault_restart_live = '1' THEN
+									berr_frame_pc <= exe_pc;
+								ELSIF mmu_restart_pending = '1' THEN
+									berr_frame_pc <= berr_restart_pc;
+								ELSIF pmmu_fault_lastwrite_ok='1' AND berr_pmmu_fault_valid='1' THEN
+									-- LASTWRITE Format $A continuation PC: the instruction-end
+									-- PC latched at the fault's first-fire, when the faulted
+									-- store was still the executing instruction. Fetch-side
+									-- reconstructions (TG68_PC, last_opc_pc vs
+									-- stream_consumed_pc) skew with prefetch depth: the
+									-- 2026-07-24 hardware capture (init's jemalloc MOVE.L
+									-- D2,$38(A3) WP/COW fault) stacked PC+2, the misaligned
+									-- RTE-replay resume executed a displacement word as an
+									-- opcode and fabricated a byte write to a chimera address,
+									-- and NetBSD livelocked forever because pid 1 discards
+									-- SIGSEGV (T33/T34 in tb_mmu_wp_lastwrite_frame).
+									berr_frame_pc <= berr_pmmu_fault_next_pc;
+								ELSIF pmmu_fault_lastwrite_ok='1' THEN
+									IF opc_buf_valid='1' AND last_opc_pc > insn_next_pc THEN
+										berr_frame_pc <= last_opc_pc;
+									ELSE
+										berr_frame_pc <= insn_next_pc;
+									END IF;
 								ELSE
-									-- CONTINUE-PAST FIX v4 (2026-07-02): resume = the TRUE next-
-									-- instruction PC = the prefetch pointer captured at first-fire
-									-- minus one prefetched word. berr_bench proved the v3 EA-mode
-									-- length reconstruction is wrong for two-word opcodes (btst
-									-- #imm,(An) = 4 bytes but EA mode 010 -> v3 stacked +2 ->
-									-- resumed on the immediate word -> derail into the vector table
-									-- -> the $100 F-line bomb). TG68_PC at first-fire is next+2 for
-									-- every OS-validator read form (move.l(d16,An), movea.l(An),
-									-- tst.b(An), btst #imm,(An), abs) -> no length decode needed.
-									berr_frame_pc <= berr_capture_nextpc - 2;
+									berr_frame_pc <= TG68_PC;
 								END IF;
-								berr_opcode_saved <= berr_capture_opcode;
-								-- Save data output buffer for berr2 (data being written at fault time)
-								berr_data_out_saved <= data_write_tmp;
+								-- synthesis translate_off
+								report "BERR_FRAMEPC: restart_live=" & std_logic'image(pmmu_fault_restart_live) &
+								       " pending=" & std_logic'image(mmu_restart_pending) &
+								       " lastwrite=" & std_logic'image(pmmu_fault_lastwrite_ok) &
+								       " scp=" & integer'image(conv_integer(stream_consumed_pc(15 downto 0))) &
+								       " exe_pc=" & integer'image(conv_integer(exe_pc(15 downto 0))) &
+								       " last_opc_pc=" & integer'image(conv_integer(last_opc_pc(15 downto 0))) &
+								       " tg68_pc=" & integer'image(conv_integer(TG68_PC(15 downto 0))) &
+								       " faddr=" & integer'image(conv_integer(pmmu_fault_addr_out(15 downto 0))) &
+								       " faddr_hi=" & integer'image(conv_integer(pmmu_fault_addr_out(31 downto 16))) severity note;
+								-- synthesis translate_on
+								berr_opcode_saved <= exe_opcode;
+								-- Save data output buffer for berr2 (data being written at fault time).
+								-- For PMMU write faults use the presented bus data - register-sourced
+								-- writes (exec(write_reg)/MOVES forwarding) bypass data_write_tmp
+								-- entirely. Live dispatch samples data_write_muxin directly (the
+								-- faulted instruction's decode outputs are still held this cycle);
+								-- deferred dispatch uses the first-fire shadow.
+								IF berr_pmmu_fault_valid = '1' and berr_pmmu_fault_rw = '0' THEN
+									berr_data_out_saved <= berr_pmmu_write_data;
+								ELSIF pmmu_fault = '1' and pmmu_fault_rw_out = '0' THEN
+									berr_data_out_saved <= data_write_muxin;
+								ELSE
+									berr_data_out_saved <= data_write_tmp;
+								END IF;
 								berr_ssw <= (others => '0');
 								-- BUG #414/#415: Latch fault address and construct SSW
 								-- SSW layout: FC(15) FB(14) RC(13) RB(12) [11:9] DF(8) RM(7) RW(6) SIZE(5:4) [3] FC(2:0)
@@ -3982,18 +4451,24 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 									-- dispatch, or first-fire latched metadata when the
 									-- registered make_mmu_berr path fires after fault_reg
 									-- has already dropped.
-									if pmmu_fault = '1' then
+									if berr_pmmu_fault_valid = '1' then
+										berr_fault_addr <= berr_pmmu_fault_addr;
+										berr_ssw(2 downto 0) <= berr_pmmu_fault_fc;
+										berr_ssw(6) <= berr_pmmu_fault_rw;
+									elsif pmmu_fault = '1' then
 										berr_fault_addr <= pmmu_fault_addr_out;
 										berr_ssw(2 downto 0) <= pmmu_fault_fc_out;
 										berr_ssw(6) <= pmmu_fault_rw_out;
-									elsif berr_pmmu_fault_valid = '1' or make_mmu_berr = '1' then
+									elsif make_mmu_berr = '1' then
 										berr_fault_addr <= berr_pmmu_fault_addr;
 										berr_ssw(2 downto 0) <= berr_pmmu_fault_fc;
 										berr_ssw(6) <= berr_pmmu_fault_rw;
 									end if;
 									-- Pipeline bits based on instruction vs data fault
-									if (pmmu_fault = '1' and pmmu_fault_is_insn_out = '1') or
-									   (pmmu_fault = '0' and (berr_pmmu_fault_valid = '1' or make_mmu_berr = '1') and berr_pmmu_fault_is_insn = '1') then
+									if (berr_pmmu_fault_valid = '1' and berr_pmmu_fault_is_insn = '1') or
+									   (berr_pmmu_fault_valid = '0' and pmmu_fault = '1' and pmmu_fault_is_insn_out = '1') or
+									   (berr_pmmu_fault_valid = '0' and pmmu_fault = '0' and make_mmu_berr = '1' and
+									    berr_pmmu_fault_is_insn = '1') then
 										-- Instruction fetch fault: stage B (prefetch)
 										berr_ssw(15) <= '0';  -- FC=0: not stage C
 										berr_ssw(14) <= '1';  -- FB=1: stage B (prefetch) fault
@@ -4018,9 +4493,17 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 										end case;
 									end if;
 										berr_ssw(11 downto 10) <= "00";  -- Reserved
-									berr_ssw(7) <= exec_tas OR exec_cas;  -- RM: read-modify-write (TAS/CAS/CAS2)
+									-- Dispatch can occur after exec_cas/exec_tas has cleared, so
+									-- use the first-fire shadow whenever deferred metadata exists.
+									if berr_pmmu_fault_valid = '1' or
+									   (pmmu_fault = '0' and make_mmu_berr = '1') then
+										berr_ssw(7) <= berr_pmmu_fault_rmw;
+									else
+										berr_ssw(7) <= pmmu_rmw;
+									end if;
 									berr_ssw(3) <= '0';   -- Reserved
 									berr_pmmu_fault_valid <= '0';
+									berr_pmmu_fault_from_rte_replay <= '0';
 								else
 									-- External BERR: use fault-time latched state
 									berr_fault_addr <= berr_external_addr;  -- BUG #434 FIX: use addr latched at first-fire, not PC-based addr at state="00"
@@ -4052,7 +4535,7 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 										when others => berr_ssw(5 downto 4) <= "00";
 									end case;
 									berr_ssw(11 downto 10) <= "00"; -- Reserved (bit 9 preserved for software-fix)
-									berr_ssw(7) <= exec_tas OR exec_cas;  -- RM: read-modify-write (TAS/CAS/CAS2)
+									berr_ssw(7) <= berr_external_rmw;
 									berr_ssw(3) <= '0';
 								end if;
 							END IF;
@@ -4070,21 +4553,141 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 						IPL_vec <= last_data_read(7 downto 0);    --	TH
 					END IF;	
 
-					IF state="00" THEN
+					-- Same force-completed-beat quarantine as the last_data_read
+					-- latch, now via the wrapper's true ready-ack qualifier.
+					-- opc_buf_valid tracks whether last_opc_read holds a real
+					-- word: a force-completed fetch beat leaves the PREVIOUS
+					-- (wrong-position) word in the buffer, and the boundary
+					-- retire must not consume it either.
+					IF state="00" AND beat_valid='0' THEN
+						opc_buf_valid <= '0';
+					END IF;
+					IF state="00" AND beat_valid='1' THEN
+						opc_buf_valid <= '1';
 						last_opc_read <= data_read(15 downto 0);
 						last_opc_pc <= tg68_pc;--TH
-					END IF;	
+						-- Track the address of the newest instruction-stream word the
+						-- decode has CONSUMED (as opcode, brief/extension, or immediate).
+						-- At a LASTWRITE data-fault dispatch, the prefetch buffer word at
+						-- last_opc_pc is unconsumed readahead iff its address differs from
+						-- stream_consumed_pc - in that case the continuation PC for the
+						-- Format $A frame is last_opc_pc, not the prefetch pointer TG68_PC
+						-- (stacking TG68_PC skips the buffered word after replay: NetBSD
+						-- copyout/copyinstr derail as panic: trap T_FMTERR).  Address
+						-- comparison is immune to strobe/fetch cycle coincidences that
+						-- broke the previous boolean classifier.
+					END IF;
+					IF setopcode='1' THEN
+						IF state="00" THEN
+							stream_consumed_pc <= tg68_pc;
+							insn_next_pc <= tg68_pc + 2;
+						ELSE
+							stream_consumed_pc <= last_opc_pc;
+							insn_next_pc <= last_opc_pc + 2;
+						END IF;
+					ELSIF getbrief='1' THEN
+						IF state(1)='1' THEN
+							stream_consumed_pc <= last_opc_pc;
+						ELSE
+							stream_consumed_pc <= tg68_pc;
+						END IF;
+						insn_next_pc <= insn_next_pc + 2;
+					ELSIF state="00" AND
+					      (exec(update_ld)='1' OR
+					       micro_state = ld_nn  OR micro_state = st_nn  OR
+					       micro_state = ld_dAn1 OR micro_state = st_dAn1 OR
+					       micro_state = ld_AnXn1 OR micro_state = ld_AnXn2 OR
+					       micro_state = st_AnXn1 OR micro_state = st_AnXn2 OR
+					       micro_state = ld_AnXnbd1 OR micro_state = ld_AnXnbd2 OR micro_state = ld_AnXnbd3 OR
+					       micro_state = ld_229_1 OR micro_state = ld_229_2 OR
+					       micro_state = ld_229_3 OR micro_state = ld_229_4 OR
+					       micro_state = st_229_1 OR micro_state = st_229_2 OR
+					       micro_state = st_229_3 OR micro_state = st_229_4) THEN
+						stream_consumed_pc <= tg68_pc;
+						insn_next_pc <= insn_next_pc + 2;
+					ELSIF state="00" AND
+					      (micro_state = pmmu_ld_nn OR micro_state = pmmu_ld_dAn1 OR
+					       micro_state = pmmu_ld_AnXn1 OR micro_state = pmmu_ld_AnXn2 OR
+					       micro_state = pmmu_ld_229_1 OR micro_state = pmmu_ld_229_2 OR
+					       micro_state = pmmu_ld_229_3 OR micro_state = pmmu_ld_229_4) THEN
+						-- PMOVE EA builders consume stream words too; keep the
+						-- continuation PC honest for a PMOVE-to-memory write fault.
+						insn_next_pc <= insn_next_pc + 2;
+					END IF;
+					-- Arm the forced-refetch window at the completion of every
+					-- Format $B frame RTE: the buffered prefetch word at the
+					-- resume PC may be GARBAGE from the faulted fetch itself
+					-- (hardware acks the beat with open-bus echo data BEFORE
+					-- the walk resolves the fault; sim faults first, so the
+					-- contract with poisoned unmapped reads still passes).
+					-- The FBRD hardware capture proved the frame and unwind
+					-- were clean while the resume executed $1B00 echo data:
+					-- the stale word's address EQUALS the resume PC, so the
+					-- boundary consumed it without refetching.
+					-- Arm at the SECOND-TO-LAST pop (rot_cnt=2), not the last:
+					-- the boundary can retire the stale buffered word on the
+					-- very edge the final pop completes (same one-cycle-late
+					-- lesson as the ghost-fix commit at rot_cnt=2), and a
+					-- flag registered on that edge misses it. rot_cnt=1 kept
+					-- as belt-and-braces.
+					IF clkena_lw='1' AND micro_state = rte5 AND
+					   (rot_cnt = "000010" OR rot_cnt = "000001") AND
+					   rte_format_word(15 downto 12) = "1011" THEN
+						rte_b_resume_refetch <= '1';
+					END IF;
+					-- DIB SUBSTITUTION arm: a DF-cleared pure-data read frame
+					-- (the MC68030 UM 8.2.2 software-completion protocol) whose
+					-- opcode the register-commit whitelist CANNOT handle
+					-- (memory destinations, arithmetic-from-memory - MuForce
+					-- completes ANY shape, e.g. MOVE.L (A1),(A4) copying
+					-- ExecBase). The restart re-executes the instruction; the
+					-- armed one-shot injects the DIB when its read refaults.
+					IF clkena_lw='1' AND micro_state = rte5 AND rot_cnt = "000010" AND
+					   rte_format_word(15 downto 12) = "1011" AND
+					   rte_mmu_fix_armed = '1' AND
+					   rte_mmu_fix_write = '0' AND
+					   rte_mmu_fix_ssw(15) = '0' AND rte_mmu_fix_ssw(14) = '0' AND
+					   rte_mmu_fix_ssw(13) = '0' AND rte_mmu_fix_ssw(12) = '0' AND
+					   rte_mmu_fix_ssw(8) = '0' AND
+					   rte_mmu_fix_ssw(7) = '0' AND
+					   rte_mmu_fix_ssw(6) = '1' THEN
+						dib_sub_valid <= '1';
+						dib_sub_fresh <= '1';
+						dib_sub_addr  <= rte_mmu_fix_faddr;
+						dib_sub_data  <= rte_mmu_fix_input_buffer;
+					END IF;
+					-- Lifetime: the FIRST setopcode after arming is the
+					-- re-executed instruction itself entering decode (its
+					-- data read has not happened yet) - consume "fresh" and
+					-- keep the one-shot alive. The SECOND setopcode means
+					-- that instruction completed (with or without needing
+					-- the injection) - the window is over. Any dispatched
+					-- exception also ends it. NOT cleared at the hit edge:
+					-- a longword read is two word beats, both must inject.
+					IF trapmake='1' AND clkena_lw='1' THEN
+						dib_sub_valid <= '0';
+						dib_sub_fresh <= '0';
+					ELSIF setopcode='1' AND clkena_lw='1' THEN
+						IF dib_sub_fresh='1' THEN
+							dib_sub_fresh <= '0';
+						ELSE
+							dib_sub_valid <= '0';
+						END IF;
+					END IF;
 					IF setopcode='1' THEN
 						trap_interrupt <= '0';
 						trap_trace <= '0';
 						TG68_PC_word <= '0';
 						trap_berr <= '0';
+						trap_mmu_berr <= '0';
 						trap_addr_error <= '0';
-						-- MC68030: Clear berr exception window when normal instruction fetches
-						-- Don't clear if trap_berr was still active (it reads the OLD value here)
-						-- or if make_berr is pending - handler fetch may have faulted
-						IF trap_berr='0' AND make_berr='0' THEN
+						rte_b_resume_refetch <= '0';
+						-- MC68030: a successful opcode fetch means bus-error exception
+						-- dispatch/stacking has completed.  Do not let the active window
+						-- leak into the handler's ordinary stack/data accesses.
+						IF make_berr='0' AND (pmmu_tc_en='0' OR pmmu_fault='0') THEN
 							berr_exception_active <= '0';
+							pmmu_fault_was_cleared <= '0';
 						END IF;
 						-- BUG #65 FIX: Do NOT clear pmove_dn_mode here!
 						-- pmove_dn_mode is now cleared ONLY when queue becomes empty (lines 1765-1766)
@@ -4130,7 +4733,11 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 				-- operations (shifts, mul, div). But RTE rte5 needs state="10" (memory
 				-- read) while counting down. Without the exemption, rte5 never reads
 				-- the extra frame data for Format $9/$A/$B, leaving SP wrong on return.
-				IF (state="10" AND addrvalue='0' AND write_back='1' AND setstate/="10") OR (set_rot_cnt/="000001" AND next_micro_state /= rte5 AND next_micro_state /= berr_fill) OR (stop='1' AND interrupt='0') OR set_exec(opcCHK)='1' THEN
+				IF directpc_retry_hold='1' THEN
+						-- clkena_in was released without a data ack; preserve the
+						-- current stack read until it is accepted.
+					NULL;
+				ELSIF (state="10" AND addrvalue='0' AND write_back='1' AND setstate/="10") OR (set_rot_cnt/="000001" AND next_micro_state /= rte5 AND next_micro_state /= berr_fill) OR (stop='1' AND interrupt='0') OR set_exec(opcCHK)='1' THEN
 						state <= "01";
 						memmask <= "111111";
 						addrvalue <= '0';
@@ -4253,10 +4860,17 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 						trace_group2_sr(5) <= '1';
 					END IF;
 					-- Configure stacked trace frame after Group 2 handler vector loaded.
-					-- The saved trace frame PC/IA is the pending handler entry. RTE from
-					-- the trace handler must resume in the original Group 2 handler.
+					-- MC68030 UM Table 8-6 (p.8-33), Format $2: the stacked PC is the next
+					-- instruction to execute - here the pending Group 2 handler entry, just
+					-- read from the vector table by trap3 (data_read). The INSTRUCTION
+					-- ADDRESS field is "the address of the instruction that caused the
+					-- exception" - for the trace exception that is the traced (trapping)
+					-- instruction, so exe_pc must KEEP its value from that instruction's
+					-- setopcode. (BUG #439's exe_pc <= data_read overwrote it when the PC
+					-- field was still sourced from exe_pc; the PC field now comes from
+					-- trap_pc_latched, so the overwrite only corrupted the IA field.)
 					IF micro_state = trace_stk_grp2 THEN
-						exe_pc <= data_read;
+						trap_pc_latched <= data_read;
 						trap_trace <= '1';
 						trap_SR <= trace_group2_sr;
 						trace_pending_group2 <= '0';
@@ -4264,6 +4878,65 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 
 					IF decodeOPC='1' OR interrupt='1' THEN
 						trap_SR <= FlagsSR;
+					END IF;
+					-- Latch the would-be frame PC while the PC adder still
+					-- holds the boundary/decode value: at every instruction
+					-- decode, at interrupt dispatch, and at group-2 trap
+					-- commit. The short-frame push mux uses this instead of
+					-- the live adder (see trap_pc_latched declaration).
+					-- Latch the boundary RESUME PC at the setinterrupt cycle:
+					-- the OLDEST UNCONSUMED stream word. Address-based
+					-- (stream_consumed_pc classifier, same rule as the $A
+					-- replay resume-skew fix): if the buffered word at
+					-- last_opc_pc has not been consumed, the resume is THERE;
+					-- otherwise the next unexecuted instruction is at the
+					-- fetch pointer. The state-based v4 mux ("state=00 ->
+					-- tg68_pc") SKIPS the buffered word when a prefetch beat
+					-- completes exactly at the interrupt boundary - on
+					-- hardware wait-states make that common, and the skipped
+					-- instruction class (a store burst missing its last
+					-- store: the never-filled trapframe PC, the pool-page
+					-- corruption, the wide-watch capture at pc=$226FE0)
+					-- follows. Sim storms validate; the adder and plain
+					-- TG68_PC variants are storm/hardware-rejected (id7/v5).
+					-- (v6 note: an address-based variant - last_opc_pc when
+					-- /= stream_consumed_pc - stacks one instruction EARLY in
+					-- pipeline-overlap cases and FAILS the IRQ storms; the
+					-- state-based rule below is the storm-validated one.)
+					IF setinterrupt='1' THEN
+						-- Trace/IRQ can dispatch on the same edge as a control
+						-- transfer retires.  For RTE/RTS/RTR/RTD the continuation
+						-- PC is the longword being popped now; for EA-to-PC flows
+						-- it is the computed target address.  last_opc_pc is the
+						-- instruction that caused the transfer, not the resume PC.
+						-- Same two-tier rule as the TG68_PC commit: a stale-poison
+						-- veto with nothing pending must not push the boundary
+						-- latch onto the state-based fallbacks (they would stack
+						-- the OLD stream PC for a dispatch landing on the pop).
+						IF exec(directPC)='1' AND clkena_lw='1' AND
+						   (((beat_valid='1' AND bus_beat_poisoned='0') AND
+						     (pmmu_tc_en='0' OR pmmu_fault='0')) OR dib_sub_hit='1' OR
+						    (beat_valid='1' AND bus_datum_dirty='0' AND
+							     (make_berr='0' OR
+							      (berr_pmmu_fault_valid='1' AND
+							       berr_pmmu_fault_is_insn='1')) AND
+						     trapmake='0' AND
+						     (pmmu_tc_en='0' OR pmmu_fault='0' OR
+						      pmmu_fault_is_insn_out='1'))) THEN
+							trap_pc_latched <= data_read;
+						ELSIF exec(ea_to_pc)='1' THEN
+							IF ea_to_pc_datum_invalid='0' THEN
+								trap_pc_latched <= addr;
+							ELSE
+								-- If dispatch coincides with the rejected redirect, stack
+								-- the faulting instruction rather than the garbage target.
+								trap_pc_latched <= exe_pc;
+							END IF;
+						ELSIF state="00" THEN
+							trap_pc_latched <= tg68_pc;
+						ELSE
+							trap_pc_latched <= last_opc_pc;
+						END IF;
 					END IF;
 					-- Once the bus-error handler reaches RTE/RTR, bus-error exception
 					-- stacking is no longer active. Leaving this sticky until a later
@@ -4347,6 +5020,22 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 						END IF;
 					END IF;	
 				exec(get_2ndOPC) <= set(get_2ndOPC) OR setopcode;
+
+				-- Dispatch-vs-deferred-swap collision (see the preSVmode
+				-- toggle suppression): the swap's A7<->shadow transfers land
+				-- one cycle later through THIS exec latch, so squash them at
+				-- the latch on the collision cycle. A7 stays on the kernel
+				-- stack for the dispatch; the swap re-fires after the
+				-- handler's RTE with the shadows untouched.
+				IF setexecOPC='1' AND setinterrupt='1' AND set(changeMode)='1' THEN
+					exec(changeMode) <= '0';
+					exec(to_USP) <= '0';
+					exec(from_USP) <= '0';
+					exec(to_ISP) <= '0';
+					exec(from_ISP) <= '0';
+					exec(to_MSP) <= '0';
+					exec(from_MSP) <= '0';
+				END IF;
 
 				END IF;
 			END IF;
@@ -4483,10 +5172,35 @@ PROCESS (clk, Reset, FlagsSR, last_data_read, OP2out, exec)
 					FlagsSR(7) <= '0';
 					FlagsSR(6) <= '0';
 				END IF;
-				IF set(changeMode)='1' THEN
+				-- Dispatch-vs-deferred-swap collision: a fault/trace/IRQ whose
+				-- dispatch decision (setinterrupt, combinational) lands on the
+				-- same boundary cycle as the RTE's deferred S->U swap
+				-- (setexecOPC requester) must keep supervisor mode - the
+				-- exception stacks with the USER SR from FlagsSR on the
+				-- kernel stack, and the swap re-fires cleanly at the first
+				-- boundary after the handler's RTE. Without this the swap
+				-- toggles S->U mid-dispatch and the frame is pushed on the
+				-- user stack -> fault-in-stacking double-fault halt (NetBSD
+				-- fork child's first user instruction on a hot fault-ATC
+				-- entry; STKD capture: correct USP/ISP shadows, halt A7=USP).
+				-- Suppression is at this CLOCKED consumption site because
+				-- gating the combinational set(changeMode) request on
+				-- setinterrupt closes a combinational loop (Quartus 332125
+				-- Selector120/process_26: setinterrupt's boundary condition
+				-- reads setstate/next_micro_state/set_exec from the decode
+				-- process). Trap-path changeMode requesters never run on
+				-- setinterrupt cycles (their decode forces setstate/="00"),
+				-- so the collision signature is exact.
+				IF set(changeMode)='1' AND NOT (setexecOPC='1' AND setinterrupt='1') THEN
 					preSVmode <= NOT preSVmode;
 					FlagsSR(5) <= NOT preSVmode;
 					fc_internal(2) <= NOT preSVmode;
+				END IF;
+				-- STOP loads SR and then suppresses the next opcode boundary. A
+				-- supervisor-to-user STOP therefore must commit SVmode here; its
+				-- existing changeMode request still performs the A7/USP exchange.
+				IF set_stop='1' THEN
+					SVmode <= data_read(13);
 				END IF;
 				IF micro_state=trap3 THEN
 					-- MC68030 UM 8.1: Clear T1 and T0 on exception entry
@@ -4495,6 +5209,21 @@ PROCESS (clk, Reset, FlagsSR, last_data_read, OP2out, exec)
 					-- and a full assignment would clobber that S-bit update.
 					FlagsSR(7) <= '0';
 					FlagsSR(6) <= '0';
+					-- Deferred-swap orphan: an exception dispatching while the
+					-- RTE's (or MOVE-to-SR's) S->U swap is still pending sees
+					-- preSVmode=S so the dispatch skips changeMode - correct
+					-- for A7 (the kernel stack was never swapped away) and for
+					-- the stacked SR (the user SR was pushed), but FlagsSR(5)
+					-- is still 0 from the SR restore, so the handler would run
+					-- with a user-mode SR: its first privileged instruction
+					-- takes a privilege violation INSIDE the handler (NetBSD
+					-- fork-child boundary fetch fault -> recursive dispatch ->
+					-- ATC fault-entry cascade -> double-fault halt; T15).
+					-- Exception entry must always leave S=1.
+					IF preSVmode='1' AND FlagsSR(5)='0' THEN
+						FlagsSR(5) <= '1';
+						fc_internal(2) <= '1';
+					END IF;
 				END IF;
 				IF trap_trace='1' AND state="10" THEN
 					make_trace <= '0';
@@ -4547,6 +5276,26 @@ PROCESS (clk, Reset, FlagsSR, last_data_read, OP2out, exec)
 				END IF;
 				IF interrupt='1' THEN
 					fc_internal(2) <= '1';
+					-- Orphan-SR at DISPATCH (not just trap3): fc_internal(2)
+					-- re-tracks FlagsSR(5) every cycle (ELSE arm above), so the
+					-- one-cycle '1' here evaporates and the berr_fill frame
+					-- pushes go out with the USER FC when the dispatch found
+					-- the deferred S->U swap still pending (preSVmode=S,
+					-- FlagsSR(5)=user). User-FC pushes walk the per-process
+					-- CRP where kernel VAs are unmapped: the push itself
+					-- faults -> genuine double-fault halt (hardware HALT
+					-- capture: saved_addr=push addr $0BAFFFFC, desc_addr=
+					-- CRP+$2C, desc=0, fc=ud1). Raising FlagsSR(5) here makes
+					-- the supervisor FC stick for the stacking and handler;
+					-- the frame still stacks the pre-exception user SR because
+					-- trap_SR latched FlagsSR at this same edge (berr8 pushes
+					-- trap_SR & Flags). Real 68030: exception processing sets
+					-- S first, THEN stacks (UM 8.1). Normal user faults are
+					-- unaffected (changeMode already raises FlagsSR(5) at
+					-- dispatch when preSVmode=0).
+					IF preSVmode='1' AND FlagsSR(5)='0' THEN
+						FlagsSR(5) <= '1';
+					END IF;
 				END IF;
 				-- BUG FIX: Revert SR high byte on RTE format error.
 				-- MC68030 UM 6.4.2: The status register value in the format error
@@ -4584,7 +5333,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		 datatype, interrupt, c_out, trapmake, rot_cnt, brief, addr, trap_trapv, last_data_in, use_VBR_Stackframe,
 		 long_start, set_datatype, sndOPC, set_exec, exec, ea_build_now, reg_QA, reg_QB, make_berr, trap_berr, last_opc_read,
 			 moves_writeback_pending, moves_active, pmmu_opcode, pmmu_brief, rte_format_word, rte_format_b_version_error,
-			 rte_fmt_a_replay_needed, rte_fmt_a_replay_size)
+			 rte_fmt_a_replay_needed, rte_fmt_a_replay_size, mmu_restart_active)
 	variable v_rte_format_valid : std_logic;
 	BEGIN
 		TG68_PC_brw <= '0';
@@ -4785,7 +5534,25 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 
 		-- Suppress changeMode during invalid RTE format detection (would corrupt stacks
 		-- before Format Error fires). Valid formats proceed with normal mode switching.
-		IF setexecOPC='1' AND trapmake='0' AND FlagsSR(5)/=preSVmode AND
+		-- ALSO suppress on interrupt/bus-error dispatch cycles: the RTE's deferred
+		-- S->U swap fires at the first post-RTE instruction boundary, and a fault
+		-- dispatching on that same cycle (fork child's first user instruction
+		-- hitting a fault-ATC entry - a one-cycle fault) MERGED with it: the two
+		-- set(changeMode) requests became one toggle, the S->U swap loaded
+		-- A7:=USP while the dispatch's own swap was skipped (preSVmode still read
+		-- supervisor), and the exception frame was stacked on the USER stack ->
+		-- fault-in-stacking double-fault halt (hardware: NetBSD fork return,
+		-- STKD capture: correct USP/ISP shadows, halt a7 = USP value).
+		-- Suppressing the deferred swap here keeps A7 on the kernel stack (no
+		-- swap had happened yet), stacks the frame with the USER SR from FlagsSR,
+		-- and the deferred swap re-fires after the handler's RTE.
+		-- NOTE: the same-cycle dispatch collision (fault dispatching on the
+		-- deferred-swap boundary) is suppressed at the CLOCKED consumption
+		-- site (preSVmode toggle), not here: setinterrupt's boundary condition
+		-- reads setstate/next_micro_state/set_exec from THIS process, so
+		-- gating set(changeMode) on setinterrupt closes a combinational loop
+		-- (Quartus 332125, Selector120/process_26 - see [[sta-loop-artifact]]).
+		IF setexecOPC='1' AND trapmake='0' AND interrupt='0' AND FlagsSR(5)/=preSVmode AND
 		   NOT (micro_state = rte4 AND cpu(1)='1' AND v_rte_format_valid='0') THEN
 			set(changeMode) <= '1';
 		END IF;
@@ -4831,7 +5598,12 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 						-- In this core interrupt_mode means the active supervisor A7 is on
 						-- the ISP path even if the saved M bit is stale or was changed by
 						-- handler code. Save that active A7 back to ISP before loading USP.
-						IF interrupt_mode='1' OR rte_saved_mbit='0' THEN
+						-- STOP can clear S while MSP is active. It is not an RTE
+						-- path, so use the live A7-shadow selector rather than the
+						-- stale RTE-only M-bit latch.
+						IF interrupt_mode='1' OR
+						   ((stop='1') AND a7_is_msp='0') OR
+						   ((stop='0') AND rte_saved_mbit='0') THEN
 							set(to_ISP) <= '1';   -- Active stack is ISP
 						ELSE
 							set(to_MSP) <= '1';   -- Active stack is MSP
@@ -5896,8 +6668,11 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 										
 									WHEN "1110001" =>					--nop
 									
-									WHEN "1110010" =>					--stop
-										IF SVmode='0' THEN
+										WHEN "1110010" =>					--stop
+											-- A legal supervisor STOP may load S=0 and retains
+											-- its opcode while stopped. Only a newly decoded user
+											-- STOP takes privilege violation.
+											IF SVmode='0' AND stop='0' THEN
 											trap_priv <= '1';
 											trapmake <= '1';
 										ELSE
@@ -5929,16 +6704,21 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 											trapmake <= '1';
 										END IF;
 										
-									WHEN "1110100" =>  									--rtd
-										datatype <= "10";
-										IF decodeOPC='1' THEN
-											setstate <= "10";
-											set(postadd) <= '1';
-											setstackaddr <= '1';
-											set(direct_delta) <= '1';
-											set(directPC) <= '1';
-											set_direct_data <= '1';
-											next_micro_state <= rtd1;
+									WHEN "1110100" =>  									--rtd (68010+)
+										IF cpu="00" THEN
+											trap_illegal <= '1';
+											trapmake <= '1';
+										ELSE
+											datatype <= "10";
+											IF decodeOPC='1' THEN
+												setstate <= "10";
+												set(postadd) <= '1';
+												setstackaddr <= '1';
+												set(direct_delta) <= '1';
+												set(directPC) <= '1';
+												set_direct_data <= '1';
+												next_micro_state <= rtd1;
+											END IF;
 										END IF;
 										
 										
@@ -6086,22 +6866,14 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 				
 				IF micro_state=idle THEN
 					IF opcode(11 downto 8)="0001" THEN		--bsr
-						-- BUG FIX (LC II post-MMU bsr.w/bsr.l): set(presub) must fire in the
-						-- SAME cycle as the return-PC push write (setstate="11"). bsr.s pushes
-						-- here in idle, so presub stays in that branch. bsr.w/bsr.l defer the
-						-- push to the bsr2 state (after the displacement is fetched), so presub
-						-- moves to bsr2 too. Previously presub fired here (idle) but the bsr2
-						-- write ran without it, so the push used the branch-target EA
-						-- (TG68_PC_add) instead of -(A7): the return went to the jump target and
-						-- the real stack slot stayed unwritten, so rts later popped $0 -> derail.
+						set(presub) <= '1';
 						setstackaddr <='1';
 						IF opcode(7 downto 0)="11111111" THEN
 							next_micro_state <= bsr2;
 							set(longaktion) <= '1';
 						ELSIF opcode(7 downto 0)="00000000" THEN
 							next_micro_state <= bsr2;
-						ELSE
-							set(presub) <= '1';
+						ELSE	
 							next_micro_state <= bsr1;
 							setstate <= "11";
 							writePC <= '1';
@@ -6539,49 +7311,43 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 						trapmake <= '1';
 					END IF;
 				--ELSIF cpu="11" AND opcode(8 downto 6)="100" THEN --cpSAVE
-				ELSIF cpu(1)='1' AND opcode(8 downto 6)="100" THEN --cpSAVE
-					-- cpSAVE valid EA modes: control alterable or predecrement
-					-- Valid: (An), -(An), (d16,An), (d8,An,Xn), (xxx).W, (xxx).L
-					-- Invalid: Dn, An, (An)+, #imm, (d16,PC), (d8,PC,Xn)
-					IF opcode(5 downto 4)/="00" AND opcode(5 downto 3)/="011" AND
-					   (opcode(5 downto 3)/="111" OR opcode(2 downto 1)="00") THEN
-						-- Valid EA mode for cpSAVE - this is a PRIVILEGED instruction
-						IF SVmode='1' THEN
-							-- Supervisor mode without FPU: F-line exception
+					ELSIF cpu(1)='1' AND opcode(8 downto 6)="100" THEN --cpSAVE
+						-- cpSAVE valid EA modes: control alterable or predecrement
+						-- Valid: (An), -(An), (d16,An), (d8,An,Xn), (xxx).W, (xxx).L
+						-- Invalid: Dn, An, (An)+, #imm, (d16,PC), (d8,PC,Xn)
+						-- MC68030 UM 6.6: privilege checking precedes EA validation.
+						IF SVmode='0' THEN
+							trap_priv <= '1';
+							trapmake <= '1';
+						ELSIF opcode(5 downto 4)/="00" AND opcode(5 downto 3)/="011" AND
+						      (opcode(5 downto 3)/="111" OR opcode(2 downto 1)="00") THEN
+							-- No external coprocessor: supervisor cpSAVE is F-line.
 							trap_1111 <= '1';
 							trapmake <= '1';
 						ELSE
-							-- User mode: privilege violation (cpSAVE is privileged)
-							trap_priv <= '1';
+							-- Invalid supervisor EA is also F-line.
+							trap_1111 <= '1';
 							trapmake <= '1';
-						END IF;
-					ELSE
-						-- Invalid EA mode: F-line exception regardless of mode
-						trap_1111 <= '1';
-						trapmake <= '1';
 					END IF;
 				--ELSIF cpu="11" AND opcode(8 downto 6)="101" THEN --cpRESTORE
 				ELSIF cpu(1)='1' AND opcode(8 downto 6)="101" THEN --cpRESTORE
-					-- cpRESTORE valid EA modes: control or postincrement
-					-- Valid: (An), (An)+, (d16,An), (d8,An,Xn), (xxx).W, (xxx).L, (d16,PC), (d8,PC,Xn)
-					-- Invalid: Dn, An, -(An), #imm
-					-- Mode 111 valid: reg 0-3 only (absolute and PC-relative, NOT #imm which is reg 4)
-					IF opcode(5 downto 4)/="00" AND opcode(5 downto 3)/="100" AND
-					   (opcode(5 downto 3)/="111" OR opcode(2)='0') THEN
-						-- Valid EA mode for cpRESTORE - this is a PRIVILEGED instruction
-						IF SVmode='1' THEN
-							-- Supervisor mode without FPU: F-line exception
+						-- cpRESTORE valid EA modes: control or postincrement
+						-- Valid: (An), (An)+, (d16,An), (d8,An,Xn), (xxx).W, (xxx).L, (d16,PC), (d8,PC,Xn)
+						-- Invalid: Dn, An, -(An), #imm
+						-- Mode 111 valid: reg 0-3 only (absolute and PC-relative, NOT #imm which is reg 4)
+						-- MC68030 UM 6.5: privilege checking precedes EA validation.
+						IF SVmode='0' THEN
+							trap_priv <= '1';
+							trapmake <= '1';
+						ELSIF opcode(5 downto 4)/="00" AND opcode(5 downto 3)/="100" AND
+						      (opcode(5 downto 3)/="111" OR opcode(2)='0') THEN
+							-- No external coprocessor: supervisor cpRESTORE is F-line.
 							trap_1111 <= '1';
 							trapmake <= '1';
 						ELSE
-							-- User mode: privilege violation (cpRESTORE is privileged)
-							trap_priv <= '1';
+							-- Invalid supervisor EA is also F-line.
+							trap_1111 <= '1';
 							trapmake <= '1';
-						END IF;
-					ELSE
-						-- Invalid EA mode: F-line exception regardless of mode
-						trap_1111 <= '1';
-						trapmake <= '1';
 					END IF;
 				ELSE
 					-- Generic missing-coprocessor F-line forms use vector 11.
@@ -6649,7 +7415,25 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 				writePC <= '1';
 			END IF;			
 		END IF;	
-		
+
+		IF mmu_restart_active='1' THEN
+			-- MMU RESTART squash: results computed from the aborted access's
+			-- garbage data must not raise competing Group-2 traps or redirect
+			-- the PC; the whole instruction re-executes after rollback.
+			trap_trapv <= '0';
+			set_Z_error <= '0';
+			set(trap_chk) <= '0';
+			set_exec(opcCHK) <= '0';
+			-- The bus-error dispatch itself must stay live: instruction-space
+			-- (extension-word) restart faults dispatch through trapmake, and
+			-- clearing it unconditionally deadlocks the fault (no dispatch,
+			-- pending window frozen).
+			IF make_berr='0' AND trap_berr='0' AND trap_mmu_berr='0' THEN
+				trapmake <= '0';
+				writePC <= '0';
+			END IF;
+		END IF;
+
 -----------------------------------------------------------------------------
 -- execute microcode
 -----------------------------------------------------------------------------
@@ -7244,15 +8028,11 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					TG68_PC_brw <= '1';	
 					next_micro_state <= nop;
 					
-				WHEN bsr2 =>		--bsr.w / bsr.l: push return PC, then branch
-					IF long_start='0' THEN
-						TG68_PC_brw <= '1';
+				WHEN bsr2 =>		--bsr
+					IF long_start='0' THEN	
+						TG68_PC_brw <= '1';	
 						skipFetch <= '1';	-- AMR - can't skip fetch for bsr.l
 					END IF;
-					-- set(presub) must fire HERE (atomic with the setstate="11" push write)
-					-- so the write EA is -(A7); see the bsr-decode comment above. Without it
-					-- the push landed on the branch target and the stack slot stayed $0.
-					set(presub) <= '1';
 					set(longaktion) <= '1';
 					writePC <= '1';
 					setstate <= "11";
@@ -7595,7 +8375,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					next_micro_state <= int4;
 				WHEN int4 =>
 					-- Push Format $1 PC (32-bit) on ISP
-					writePC <= '1';          -- data_write_tmp <= TG68_PC
+					writePC <= '1';          -- data_write_tmp <= trap_pc_latched (interrupt frame)
 					set(presub) <= '1';
 					setstackaddr <= '1';
 					setstate <= "11";        -- Write
@@ -7637,6 +8417,13 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
                         setstate <= "01";
                         setstackaddr <= '1';
                         next_micro_state <= berr_fill;
+                        -- User-mode fault: this A7-swap wait cycle pushes nothing, but
+                        -- the decode prologue decrements rot_cnt every cycle - without
+                        -- holding it here the fill loop pushes one long less (88 bytes)
+                        -- than the Format $B RTE pops (92), leaking SSP +4 per user
+                        -- fault and drifting the kernel-stack frames upward (NetBSD
+                        -- init dies with a format error within a few user faults).
+                        set_rot_cnt <= rot_cnt;
                     ELSE
                         setstate <= "11";
                         set(presub) <= '1';
@@ -7878,7 +8665,9 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 							next_micro_state <= rte5;
 						WHEN OTHERS =>
 							-- Invalid format for MC68030 - generate Format Error exception (vector 14)
-							-- Formats $4-$8, $C-$F are not valid on MC68030
+							-- Formats $3-$8, $C-$F are not valid on MC68030
+							-- ($3/$4/$7 are MC68040 frames, $8 is MC68010, $C is CPU32
+							-- per M68000PRM Appendix B Figures B-6..B-9, B-13..B-15)
 							-- Hold fetch/retire while trap dispatch logic takes over on next cycle.
 							-- Without this, a transient fetch can occur from the frame PC after
 							-- directSR, leading to illegal/double-fault paths before vector 14.
@@ -7945,13 +8734,17 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					WHEN rte_mmu_replay =>
 						-- The replay write cycle was scheduled by the final rte5 frame
 						-- read.  Keep the saved data size visible until the bus cycle
-						-- completes, then resume at the already-restored stacked PC.
+						-- completes, then take one fetch-sync cycle at the restored PC.
 						datatype <= rte_fmt_a_replay_size;
 						set_datatype <= rte_fmt_a_replay_size;
-						IF rte_fmt_a_replay_size = "10" THEN
-							set(longaktion) <= '1';
-						END IF;
-						next_micro_state <= nop;
+						next_micro_state <= rte_mmu_replay_sync;
+
+					WHEN rte_mmu_replay_sync =>
+						-- The first post-replay fetch is now on the bus.  Retire it as
+						-- the next opcode immediately; generic nop/nopnop either retires
+						-- too early on replay data (long replays shift by a beat) or too
+						-- late on an extension word.
+						next_micro_state <= idle;
 
 					-- MC68030: RTE Format $1 chain - read SR from second stack frame
 					WHEN rte6 =>
@@ -8180,7 +8973,12 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
                     set(update_FC) <= '1';  -- Ensure FC reflects supervisor mode
                     
                     -- F-Line Context: Use pmmu_brief for stable values
-                    IF (pmmu_brief(15 downto 13) = "000" AND (pmmu_brief(14 downto 10) = "00010" OR pmmu_brief(14 downto 10) = "00011")) OR  -- TT0/TT1
+                    -- A force-completed extension fetch deliberately leaves the
+                    -- context invalid. Do not decode the previous brief while the
+                    -- PMMU fault is moving into exception dispatch.
+                    IF fline_context_valid = '0' THEN
+                        next_micro_state <= pmove_decode;
+                    ELSIF (pmmu_brief(15 downto 13) = "000" AND (pmmu_brief(14 downto 10) = "00010" OR pmmu_brief(14 downto 10) = "00011")) OR  -- TT0/TT1
                         (pmmu_brief(15 downto 13) = "010" AND (pmmu_brief(14 downto 10) = "10000" OR pmmu_brief(14 downto 10) = "10010" OR pmmu_brief(14 downto 10) = "10011")) OR  -- TC/SRP/CRP
                         (pmmu_brief(15 downto 13) = "011" AND pmmu_brief(14 downto 10) = "11000" ) THEN  --MMUSR
                         
@@ -8197,12 +8995,13 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
                         -- BUG #377 FIX: Use pmmu_opcode (latched F-line opcode) instead of opcode!
                         -- By pmove_decode time, opcode may have been overwritten by prefetch.
                         -- fline_opcode_latch preserves the original F-line opcode EA mode bits.
-		                        -- PDF candidate: PMOVE allows Dn for 32/16-bit MMU registers.
-		                        -- An, auto inc/dec, PC-relative, immediate, and CRP/SRP via Dn
-		                        -- are invalid F-line instructions.
-		                        ELSIF (pmmu_opcode(5 downto 3)="001") OR
-		                              (pmmu_opcode(5 downto 3)="000" AND
-		                               (pmmu_brief(14 downto 10)="10010" OR pmmu_brief(14 downto 10)="10011")) OR
+		                        -- WinUAE mmu_op30_invea(): Dn, An, (An)+, -(An), immediate, and
+		                        -- PC-relative are ALL invalid F-line PMOVE forms, uniformly for
+		                        -- every MMU register (TC/TT0/TT1/MMUSR included, not just CRP/SRP).
+		                        -- The EA mode check alone determines legality; the register
+		                        -- selector (pmmu_brief) is irrelevant to this check.
+		                        ELSIF (pmmu_opcode(5 downto 3)="000") OR
+		                              (pmmu_opcode(5 downto 3)="001") OR
 		                              (pmmu_opcode(5 downto 3)="011") OR
 		                              (pmmu_opcode(5 downto 3)="100") OR
 		                              (pmmu_opcode(5 downto 3)="111" and pmmu_opcode(2)='1') OR
@@ -8212,7 +9011,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		                             trapmake <= '1';
 		                        ELSE
 	                             -- Valid EA modes:
-	                             -- Dn for 32/16-bit regs, (An), (d16,An), (d8,An,Xn), (xxx).W, (xxx).L
+	                             -- (An), (d16,An), (d8,An,Xn), (xxx).W, (xxx).L
 	                             set(ea_build) <= '1';
                              IF pmmu_brief(14 downto 10) = "11000" THEN
                                  datatype <= "01"; -- Word for MMUSR
@@ -9132,13 +9931,32 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
         MSP <= regfile(15);  -- M 1->0: save old A7 (was MSP) to MSP shadow
       end if;
     end if;
+    -- STOP #imm companion shadow save (set_stop path). Mirrors the A7 load
+    -- in the regfile process: save the outgoing A7 to the shadow it was
+    -- aliasing before STOP's new M selects the other stack.
+    if cpu(1)='1' and preSVmode='1' and set_stop='1' and data_read(13)='1' and data_read(12) /= FlagsSR(4) then
+      if data_read(12) = '1' then
+        ISP <= regfile(15);  -- M 0->1: save old A7 (was ISP) to ISP shadow
+      else
+        MSP <= regfile(15);  -- M 1->0: save old A7 (was MSP) to MSP shadow
+      end if;
+    end if;
     -- Auto-clear self-clearing command bits after they've been set
     -- MC68030 spec: bits 2 (CEI), 3 (CI), 10 (CED), 11 (CD) are self-clearing
-    if CACR(2) = '1' or CACR(3) = '1' or CACR(10) = '1' or CACR(11) = '1' then
-      CACR(2) <= '0';   -- Clear CEI (Clear Entry in Instruction Cache)
+    -- BUG #453 FIX: clear ONLY the bit whose operation the priority encoder
+    -- (cache_op_scope/cache_op_cache process) emitted this cycle - same
+    -- priority order CI > CD > CEI > CED. Previously one write of CACR $0808
+    -- (CI+CD, exactly what AmigaOS CacheClearU issues on 030) wiped all four
+    -- bits at once and the D-cache invalidate was silently dropped. Pending
+    -- bits now emit on the following cycles until all are consumed.
+    if CACR(3) = '1' then
       CACR(3) <= '0';   -- Clear CI (Clear Instruction Cache)
-      CACR(10) <= '0';  -- Clear CED (Clear Entry in Data Cache)
+    elsif CACR(11) = '1' then
       CACR(11) <= '0';  -- Clear CD (Clear Data Cache)
+    elsif CACR(2) = '1' then
+      CACR(2) <= '0';   -- Clear CEI (Clear Entry in Instruction Cache)
+    elsif CACR(10) = '1' then
+      CACR(10) <= '0';  -- Clear CED (Clear Entry in Data Cache)
     end if;
 	  end if;
 	end if;
@@ -9147,7 +9965,12 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	case movec_regsel is
 		when X"000" => movec_data <= "00000000000000000000000000000" & SFC;
 		when X"001" => movec_data <= "00000000000000000000000000000" & DFC;
-	  when X"002" => movec_data <= CACR; -- CACR full 32-bit read
+		  -- MC68030 MOVEC reads expose only the persistent CACR state.  Cache
+		  -- clear commands (CEI/CI/CED/CD) are write-only/self-clearing and must
+		  -- not leak if a MOVEC read follows their write before the next enabled
+		  -- clock.  WinUAE uses the same architectural read mask ($3313), while
+		  -- writes accept the wider command mask ($3F1F).
+		  when X"002" => movec_data <= CACR and x"00003313";
 	  when X"800" => movec_data <= USP;  -- BUG #18: USP -- 68010+
 	  when X"801" => movec_data <= VBR;  -- 68010+
 	  when X"802" => movec_data <= CAAR; -- 68020+
@@ -9462,10 +10285,7 @@ PROCESS (sndOPC, movem_mux)
 	END PROCESS;
 
 -- MC68030 address routing: direct when MMU disabled, translated when enabled
--- Identity address when the MMU is off OR during the instruction-prefetch grace
--- window (a still-prefetched opcode fetch that must not be re-translated).
-addr_out <= pmmu_addr_log_int when (pmmu_tc_en = '0' or mmu_grace_suppress = '1')
-            else pmmu_addr_phys_int;
+addr_out <= pmmu_addr_log_int when pmmu_tc_en = '0' else pmmu_addr_phys_int;
 
 -- Format Error debug latch: captures key state when trap_format_error fires
 -- Once latched, holds until reset so hardware debug can read it
@@ -9521,13 +10341,6 @@ debug_setnextpass <= '1' when setnextpass='1' else '0';
 
 -- DEBUG: BUG #213 - Address generation and opcode capture
 debug_TG68_PC <= TG68_PC;
--- DIAG (2026-06-21): carry the STABLE instr_boundary_pc (latched at setstate="01"
--- before the fault, holds through dispatch — no clkena clear/settle ambiguity).
--- For an external data fault this IS the stacked PC (berr_frame_pc <= instr_boundary_pc
--- at the data-fault frame build), so PFR0 = the resume PC the OS probe RTE would use.
-debug_berr_frame_pc <= instr_boundary_pc;
-debug_exe_opcode <= exe_opcode;
-debug_berr_opcode <= opcode;
 debug_memaddr_reg <= memaddr_reg;
 debug_memaddr_delta <= memaddr_delta;
 debug_oddout <= oddout;
@@ -9569,6 +10382,7 @@ debug_fline_opcode_latch <= fline_opcode_latch;
 debug_pmmu_ea_mode_latched <= pmmu_ea_mode_latched;
 debug_exec_direct_delta <= '1' when exec(direct_delta)='1' else '0';
 debug_exec_directPC <= '1' when exec(directPC)='1' else '0';
+debug_bus_beat_poisoned <= '1' when bus_beat_poisoned='1' else '0';
 debug_exec_mem_addsub <= '1' when exec(mem_addsub)='1' else '0';
 debug_set_addrlong <= '1' when set(addrlong)='1' else '0';
 debug_mdelta_src <= x"00";
@@ -9645,6 +10459,51 @@ debug_rte_format_word    <= rte_format_word;
 debug_rte_mmu_fix_ssw    <= rte_mmu_fix_ssw;
 debug_rte_mmu_fix_opcode <= rte_mmu_fix_opcode;
 debug_rte_mmu_fix_write  <= rte_mmu_fix_commit;
+debug_rte_fmt_a_state1 <= rte_fmt_a_state1;
+debug_rte_fmt_a_ssw <= rte_fmt_a_ssw;
+debug_rte_fmt_a_fault_addr <= rte_fmt_a_fault_addr;
+debug_rte_fmt_a_data_out <= rte_fmt_a_data_out;
+debug_rte_fmt_a_replay_needed <= rte_fmt_a_replay_needed;
 debug_rte_format_b_version_error <= rte_format_b_version_error;
+
+-- synthesis translate_off
+diag_rte_events : PROCESS (clk)
+BEGIN
+	IF rising_edge(clk) THEN
+			IF clkena_lw = '1' THEN
+				IF rte_mmu_fix_commit = '1' THEN
+				report "FIX_COMMIT: tg68_pc=" & integer'image(conv_integer(TG68_PC(15 downto 0))) &
+				       " fix_opcode=" & integer'image(conv_integer(rte_mmu_fix_opcode)) severity note;
+			END IF;
+			IF exec(directPC) = '1' AND clkena_lw = '1' THEN
+				report "RTE_RESUME: target=" & integer'image(conv_integer(data_read(15 downto 0))) &
+				       " bv=" & std_logic'image(beat_valid) &
+				       " poison=" & std_logic'image(bus_beat_poisoned) &
+				       " dirty=" & std_logic'image(bus_datum_dirty) &
+				       " retry=" & std_logic'image(directpc_retry_hold) &
+				       " make=" & std_logic'image(make_berr) &
+				       " meta=" & std_logic'image(berr_pmmu_fault_valid) &
+				       " insn=" & std_logic'image(berr_pmmu_fault_is_insn) &
+				       " trapmake=" & bit'image(trapmake) &
+				       " pf=" & std_logic'image(pmmu_fault) &
+				       " pf_insn=" & std_logic'image(pmmu_fault_is_insn_out) &
+				       " state=" & integer'image(conv_integer(state))
+				       severity note;
+			END IF;
+		END IF;
+		IF clkena_in = '1' AND (micro_state = berr_fill OR micro_state = berr1 OR micro_state = berr2 OR
+		                        micro_state = berr3 OR micro_state = berr4 OR micro_state = berr5 OR
+		                        micro_state = berr6 OR micro_state = berr7 OR micro_state = berr8) THEN
+			report "BERRPUSH: addr=" & integer'image(conv_integer(memaddr(15 downto 0))) &
+			       " state=" & integer'image(conv_integer(state)) &
+			       " pf=" & std_logic'image(pmmu_fault) &
+			       " pb=" & std_logic'image(pmmu_busy) &
+			       " mm5=" & std_logic'image(memmaskmux(5)) &
+			       " pend=" & std_logic'image(mmu_restart_pending) &
+			       " soft=" & std_logic'image(mmu_restart_soft) severity note;
+		END IF;
+	END IF;
+END PROCESS;
+-- synthesis translate_on
 
 END;

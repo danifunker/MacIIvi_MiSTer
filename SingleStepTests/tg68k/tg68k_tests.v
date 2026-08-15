@@ -49,6 +49,10 @@ module tg68k_tests
       .clk             (clk),
       .nReset          (~reset),
       .clkena_in       (clkena_in),
+      // Every harness beat is a REAL ack (the C++ RAM answers every enabled
+      // cycle), so the new kernel's ready-ack qualifier is constant-true. The
+      // VHDL default ('1') is lost in the ghdl-generated Verilog — tie it.
+      .beat_valid      (1'b1),
       .data_in         (data_in),
       .IPL             (3'b111),
       .IPL_autovector  (1'b0),

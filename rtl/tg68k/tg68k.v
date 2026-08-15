@@ -69,6 +69,12 @@ module tg68k (
 
 	assign dbg_walk_cycle_o = walk_cycle;
 
+	// The latest 030_mmu kernel removed these two forensic taps (replaced by the
+	// debug_rte_fmt_a_* family); keep the wrapper ports for the probe deck.
+	assign dbg_berr_frame_pc = 32'h0;
+	assign dbg_berr_opcode   = 16'h0;
+	assign dbg_exe_opcode    = k_opcode;   // live opcode register (debug_opcode)
+
 wire  [1:0] tg68_busstate;
 
 // ---------------------------------------------------------------------------
@@ -83,12 +89,33 @@ localparam USE_68030_CACHE = 1'b0;
 wire        cache_read_hit;     // current CPU access is a cacheable read that HIT the cache
 wire [15:0] cache_kernel_data;  // 16-bit word fed to the kernel on a cache hit (skips the bus)
 
-// Suppress clkena while the walker is borrowing the bus so the (stalled) CPU
-// pipeline does not advance during a page-table walk. On a cache read-hit the
-// access completes with no bus cycle, so clkena pulses immediately (like a
-// busstate=01 no-access cycle) instead of waiting for s_state 7.
-wire        tg68_clkena = phi1 && (s_state == 7 || tg68_busstate == 2'b01 || cache_read_hit)
-                          && !walk_cycle && !fill_active;
+// clkena discipline for the 030_mmu LATEST kernel (Minimig lineage, imported
+// 2026-08-15). The old LCII kernel carried in-kernel "walk-hold" latch gates so
+// clkena edges during a page-table walk were harmless; the new kernel dropped
+// those in favor of a WRAPPER-side contract (mirrors Minimig cpu_wrapper.v):
+//  - hold clkena while the walker has an outstanding request (pmmu_walker_req),
+//    not just while the borrowed transfer runs (walk_cycle): between descriptor
+//    levels the kernel must NOT advance, or stream latches re-fire on walk
+//    edges and consume descriptor words as opcodes/extension words.
+//  - hold clkena while the PMMU is busy translating (covers the 1-cycle ATC-miss
+//    gap before the walker request rises, their BUG #407) UNLESS it faulted:
+//    on pmmu_fault the CPU must advance to dispatch the bus-error exception.
+//  - a pmmu_fault force-released beat carries NO real data; beat_valid=0 marks
+//    it (see below) so the kernel consumes nothing from the bus.
+wire        kernel_pmmu_busy;                        // kernel debug_pmmu_busy
+wire        kernel_pmmu_fault = dbg_pmmu_fault_o;    // kernel debug_pmmu_fault
+wire        tg68_clkena = phi1 && (s_state == 7 || tg68_busstate == 2'b01 || cache_read_hit
+                                   || kernel_pmmu_fault)
+                          && !walk_cycle && !fill_active
+                          && !pmmu_walker_req
+                          && (!kernel_pmmu_busy || kernel_pmmu_fault);
+// TRUE ready-ack qualifier (new-kernel beat_valid contract): high only when the
+// beat completed via a REAL ack — a bus cycle that reached s_state 7 (DTACK- or
+// BERR-terminated), an internal no-memaccess cycle, or a cache read-hit. The
+// pmmu_fault force-release arm of clkena above is NOT a real ack: beat_valid=0
+// there, so stream latches, extension capture, directPC and opcode retire all
+// skip the garbage beat (their hardware capture: $1B00/$FFFF junk as opcodes).
+wire        tg68_beat_valid = (s_state == 7) || (tg68_busstate == 2'b01) || cache_read_hit;
 wire [31:0] tg68_addr;
 wire [15:0] tg68_din;
 reg  [15:0] tg68_din_r;
@@ -141,7 +168,7 @@ wire  [3:0] dbg_rf_waddr;
 wire  [7:0] dbg_ustate;
 wire        dbg_use_base;
 wire  [1:0] dbg_setstate, dbg_state;
-wire        dbg_pmmu_busy;        // kernel pmmu_busy (the bsr.w-hold gate)
+wire        dbg_pmmu_busy = kernel_pmmu_busy;  // kernel pmmu_busy (now tapped unconditionally)
 wire [31:0] dbg_memaddr_drega;    // memaddr_delta_rega (held by the bsr.w fix)
 // move.b decode-sequence probes: find where the absolute-EA (ld_nn / set_addrlong)
 // transition is lost when the instruction fetch stalls on a PMMU walk.
@@ -279,6 +306,14 @@ always @(posedge clk) begin
 			if ((busreq_ack || bus_granted) && !busrel_ack) s_state <= s_state;
 			if (eff_busstate == 2'b01) s_state <= 0;
 			if (cache_read_hit) s_state <= 0;   // cache read-hit: no bus cycle (see phi1 branch)
+			// PMMU busy/fault: park the bus FSM at s_state 0 so no cycle launches
+			// with an untranslated/stale physical address, and a FAULTED access
+			// runs no bus cycle at all (the new kernel dispatches the exception
+			// off the force-released clkena; mirrors Minimig pmmu_suppress_bus).
+			// Only ever parks — the s_state==0 guard means a cycle already in
+			// flight always completes. walk_cycle/fill_active own the FSM for
+			// borrowed walker/line-fill transfers and are exempt.
+			if (pmmu_bus_park) s_state <= 0;
 
 			case (s_state)
 
@@ -402,6 +437,10 @@ end
 	// (USE_68030_CACHE=0), so this stays cache-free and matches LCII's
 	// expression verbatim for future syncs.
 	wire berr_kernel_cycle = berr & ~walk_cycle & ~fill_active;
+	// Bus-FSM park term for the clkena contract above (declared here, next to
+	// its sibling berr gate; used in the phi2 branch of the s_state FSM).
+	wire pmmu_bus_park = (kernel_pmmu_busy | kernel_pmmu_fault)
+	                     & ~walk_cycle & ~fill_active & (s_state == 3'd0);
 	reg berr_hold;
 	always @(posedge clk) begin
 		if (reset)
@@ -437,6 +476,7 @@ end
 		.clk            ( clk           ),
 		.nReset         ( ~reset        ),
 		.clkena_in      ( tg68_clkena   ),
+		.beat_valid     ( tg68_beat_valid ),
 		// On a cache read-hit the kernel takes data straight from the cache
 		// (no bus cycle ran, so tg68_din_r is stale); otherwise the latched
 		// bus word. cache_read_hit is constant 0 when USE_68030_CACHE=0.
@@ -471,6 +511,10 @@ end
 		.debug_make_berr ( kernel_make_berr ),
 		.debug_trap_berr ( kernel_trap_berr ),
 
+		// PMMU busy: clkena hold while a translation is pending (new-kernel
+		// contract, their BUG #407 — see the tg68_clkena block above).
+		.debug_pmmu_busy ( kernel_pmmu_busy ),
+
 		// 68030 cache control + PMMU address taps (consumed by the cache below).
 		.pmmu_addr_log      ( cache_addr_log     ),
 		.pmmu_addr_phys     ( cache_addr_phys    ),
@@ -484,11 +528,12 @@ end
 		.cache_op_scope     ( cache_op_scope     ),
 		.cache_op_cache     ( cache_op_cache     ),
 		.cache_op_addr      ( cache_op_addr      ),
-		// continue-past diagnostic taps (always connected)
-		.debug_berr_frame_pc ( dbg_berr_frame_pc ),
+		// continue-past diagnostic taps (always connected). The latest kernel
+		// dropped debug_berr_frame_pc/debug_exe_opcode/debug_berr_opcode (the
+		// richer debug_rte_fmt_a_* family replaced them); the wrapper-level
+		// taps are kept for the MacIIvi.sv/dbg_probes deck — frame-PC and
+		// berr-opcode tie off, exe_opcode maps to the live opcode register.
 		.debug_exe_PC        ( dbg_exe_pc         ),
-		.debug_exe_opcode    ( dbg_exe_opcode     ),
-		.debug_berr_opcode   ( dbg_berr_opcode    ),
 
 		// F-line trap capture taps (always connected; latch block below)
 		.debug_trap_1111           ( k_trap_1111     ),
@@ -518,7 +563,6 @@ end
 		.debug_use_base      ( dbg_use_base  ),
 		.debug_setstate      ( dbg_setstate  ),
 		.debug_state         ( dbg_state     ),
-		.debug_pmmu_busy     ( dbg_pmmu_busy ),
 		.debug_memaddr_delta_rega ( dbg_memaddr_drega ),
 		.debug_next_micro_state ( dbg_next_ustate ),
 		.debug_last_opc_read ( dbg_last_opc    ),

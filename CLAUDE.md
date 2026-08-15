@@ -36,9 +36,17 @@ Key references:
 
 ## Hard rules
 
-- **CPU sync rule**: `rtl/tg68k/` must stay byte-identical to
-  `../MacLCII_MiSTer` at the pinned commit (currently `a254a02`). CPU fixes
-  land in MacLCII first, then get re-copied. Never fork the kernel here.
+- **CPU sync rule** (re-pinned 2026-08-15 by owner request): the CPU upstream
+  is now `../Minimig-AGA_MiSTer` (the 030_mmu lineage, BUG #447–#470 era +
+  LASTWRITE frame fix) — the VHDL in `rtl/tg68k/` is a wholesale LF-normalized
+  copy of their `rtl/tg68k/` (kernel/ALU/PMMU/Cache/Pack + CacheCtrl kept as
+  reference). Kernel fixes land in Minimig-AGA first, then get re-copied —
+  never fork the kernel here. `tg68k.v` (the Mac bus wrapper) is OURS and
+  carries the integration contract: clkena held across the walker-request
+  window and PMMU-busy, force-released on pmmu_fault with beat_valid=0, bus
+  FSM parked during busy/fault, berr-hold with walk_cycle gating, E-clock/VMA,
+  BR/BG/BGACK, autovectoring. The pre-2026-08 MacLCII pin (`a254a02` era, the
+  in-kernel walk-hold gates) is history — see git log of rtl/tg68k/.
 - **Line endings**: repo policy is LF (`core.autocrlf=false`, enforced for
   *.sh via .gitattributes). The sim toolchain runs under **WSL** — CRLF in a
   shell script or Makefile breaks it.
