@@ -781,6 +781,7 @@ end
 		reg  [31:0]  fill_base;      // line-aligned (16-byte) physical base (cache's i/d_fill_addr)
 		reg  [127:0] fill_buf;       // accumulates the 8 read words (word k -> [16k +: 16])
 		reg          fill_dirty;     // a word was captured without fill_data_valid -> drop the line
+		reg          fill_dv_d;      // fill_data_valid delayed 1 clk (2-cycle-stable qualifier)
 		reg          i_fill_valid_r, d_fill_valid_r;
 
 		assign       fill_active   = (fill_st == FILL_READ);             // bus-owning read phase
@@ -888,11 +889,13 @@ end
 				fill_base      <= 32'd0;
 				fill_buf       <= 128'd0;
 				fill_dirty     <= 1'b0;
+				fill_dv_d      <= 1'b0;
 				i_fill_valid_r <= 1'b0;
 				d_fill_valid_r <= 1'b0;
 			end else begin
 				i_fill_valid_r <= 1'b0;   // single-cycle valid pulses
 				d_fill_valid_r <= 1'b0;
+				fill_dv_d      <= fill_data_valid;
 				case (fill_st)
 					FILL_IDLE:
 						// fc != 7: if the kernel's FC output lingers in CPU space on
@@ -914,7 +917,13 @@ end
 							// the fill acked at slot start like any CPU read; if the
 							// SDRAM had not actually served THIS word's address by
 							// the capture edge, the word is stale -> poison-drop.
-							if (!fill_data_valid) fill_dirty <= 1'b1;
+							// STABLE for 2 clk (fill_dv_d): a ready that rose at the
+							// capture edge itself is the razor case — the 65 MHz
+							// controller may have completed between our samples with
+							// din's latch still carrying the older word. One extra
+							// cycle of demonstrated stability costs only an occasional
+							// spurious drop (retry), never a poisoned line.
+							if (!(fill_data_valid && fill_dv_d)) fill_dirty <= 1'b1;
 						end
 						if (phi1 && s_state == 3'd7) begin
 							if (fill_word != 3'd7)
