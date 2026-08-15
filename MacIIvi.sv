@@ -989,16 +989,20 @@ module emu
 	wire sdram_ram_ready;       // SDRAM read-data-valid (from sdram.v)
 	wire cpu_walk_cycle;        // PMMU walker borrowing the bus (from tg68k dbg_walk_cycle_o)
 	wire cpu_fill_cycle;        // cache line-fill borrowing the bus (tg68k dbg_fill_cycle_o)
-	// SURGICAL gate: ONLY the borrowed bus-master reads — the PMMU-walk
-	// descriptor read and (2026-08-15) the cache line-fill read — wait for real
-	// SDRAM data-valid. Both are phase-misaligned with the SDRAM command slot
-	// and would otherwise latch stale `dout` (the walker's 10MB-boot Sad Mac;
-	// for fills it would silently POISON a cache line). Every normal access
-	// keeps the fast slot-start ack, so the known-good cpu-cycle timing (that
-	// booted reliably) is left unperturbed.
+	// SURGICAL gate: ONLY the borrowed PMMU-walk descriptor read waits for real
+	// SDRAM data-valid. Every normal access keeps the fast slot-start ack, so
+	// the known-good cpu-cycle timing (that booted reliably) is left
+	// unperturbed. Cache line-fill reads deliberately do NOT take this gate:
+	// the first cut did (fill_read & sdram_ram_ready) and the build WEDGED in
+	// the boot gray phase on HW, both boots, while sim (no such gate) and STA
+	// were clean — a fill stalled on ram_ready freezes the CPU outright, since
+	// clkena is held for the whole fill. Fills instead ack at slot start like
+	// every normal CPU read and tg68k.v checks sdram_ram_ready RETROSPECTIVELY
+	// at each word capture (fill_data_valid below): a word captured while the
+	// SDRAM hadn't served that address marks the line dirty and the fill is
+	// dropped, never installed — the stale-dout class costs a retry, not
+	// corruption, and can never stall.
 	wire walk_read = cpu_walk_cycle & (selectRAM | selectVRAM) & _cpuRW;
-	// Fills read RAM and ROM only (the cacheable regions; both SDRAM-backed).
-	wire fill_read = cpu_fill_cycle & (selectRAM | selectROM) & _cpuRW;
 	always @(posedge clk_sys) begin
 		if (!_cpuReset) begin
 			dtack_en <= 0;
@@ -1027,8 +1031,8 @@ module emu
 			// slot-start ack — the timing the core already booted reliably with — so
 			// this cannot perturb normal cpu-cycle timing. Peripherals keep the
 			// immediate ack.
-			if (!_cpuAS & ( (cpuBusControl & mem_latch_d & ~walk_read & ~fill_read)
-			              | (cpuBusControl & (walk_read | fill_read) & sdram_ram_ready)
+			if (!_cpuAS & ( (cpuBusControl & mem_latch_d & ~walk_read)
+			              | (cpuBusControl & walk_read & sdram_ram_ready)
 			              | (!selectROM & !selectRAM & !selectVRAM) )) dtack_en <= 1;
 		end
 	end
@@ -1357,6 +1361,7 @@ module emu
 		.cpu        ( 2'b10 ),  // 68030 (Mac LC II); old selectable form: {status_cpu[1], |status_cpu}
 		.cpu_turbo  ( status_machine ),   // P600: 2x off-bus beats (reset-latched)
 		.ram_size_bytes ( ram_size_bytes ),  // bounds the cacheable-RAM decode
+		.fill_data_valid ( sdram_ram_ready ),  // per-word fill capture qualifier (dirty-drop)
 
 		.dtack_n    ( _cpuDTACK  ),
 		.rw_n       ( tg68_rw    ),

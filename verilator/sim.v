@@ -493,6 +493,9 @@ module emu
 		.cpu        ( 2'b10 ),  // 68030 (Mac LC II); old selectable form: {status_cpu[1], |status_cpu}
 		.cpu_turbo  ( sim_p600 ),           // P600: 2x off-bus beats
 		.ram_size_bytes ( ram_size_bytes ), // bounds the cacheable-RAM decode
+		// sim_ram serves every read in-slot; the stale-dout class the dirty-drop
+		// protects against is SDRAM-controller-specific (see MacIIvi.sv).
+		.fill_data_valid ( 1'b1 ),
 
 		.dtack_n    ( _cpuDTACK  ),
 		.rw_n       ( tg68_rw    ),

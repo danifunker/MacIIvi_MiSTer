@@ -19,6 +19,15 @@ module tg68k (
 	// cacheable-region decode so the open-bus tail of the $0xxxxxxx RAM window
 	// ($FFFF pattern-probe space) can never be cached.
 	input [26:0] ram_size_bytes,
+	// Read-data-valid qualifier for cache line-fill captures (MacIIvi.sv wires
+	// sdram_ram_ready; the sim ties 1). Fill bus cycles use the NORMAL
+	// slot-start DTACK — a fill must never be able to stall the CPU — and this
+	// signal is checked retrospectively at each word capture instead: a word
+	// captured while the SDRAM had not actually served that address (the
+	// walker's stale-dout class) marks the whole line DIRTY and the fill is
+	// dropped at completion, never installed. A dropped fill is only a future
+	// miss; a poisoned line would be silent corruption.
+	input fill_data_valid,
 
 	input  dtack_n,
 	output rw_n,
@@ -110,6 +119,18 @@ localparam USE_68030_CACHE = 1'b1;
 wire        cache_read_hit;     // current CPU access is a cacheable read that HIT the cache
 wire [15:0] cache_kernel_data;  // 16-bit word fed to the kernel on a cache hit (skips the bus)
 wire        cache_fill_pending; // a line-fill request is latched awaiting service (gates turbo)
+// A hit may bypass the bus ONLY while no cycle has launched (s_state 0). The
+// unqualified form wedged real hardware (2026-08-15, both boots, sim+STA
+// clean): a fill's install pulse lands on a phi2 edge; if that same edge
+// advances s_state 0->1 for the still-pending missed access (pre-install
+// i_hit=0), the next phi1 asserts AS at s_state 1 while the now-visible hit
+// forces s_state back to 0 — AS is stranded asserted with the FSM parked,
+// nothing reaches the s_state 6 deassert, and dtack_en latches early off the
+// stale AS-low window, so the NEXT real cycle passes s_state 4 instantly and
+// captures data the SDRAM hasn't served (sim_ram serves combinationally, so
+// simulation cannot see it). With the s_state==0 qualifier a just-launched
+// cycle simply completes on the bus — same fresh data, one redundant read.
+wire        cache_hit_beat = cache_read_hit & (s_state == 3'd0);
 
 // clkena discipline for the 030_mmu LATEST kernel (Minimig lineage, imported
 // 2026-08-15). The old LCII kernel carried in-kernel "walk-hold" latch gates so
@@ -138,10 +159,10 @@ wire        kernel_pmmu_fault = dbg_pmmu_fault_o;    // kernel debug_pmmu_fault
 // cache never populates (measured: 14 fills/18 hits vs 200 fills/2M hits over
 // the same boot window). With a fill pending, internal beats fall back to phi1
 // pace until the line is filled; fills are rare once the working set is warm.
-wire        tg68_clkena = (   (phi1 && (s_state == 7 || tg68_busstate == 2'b01 || cache_read_hit
+wire        tg68_clkena = (   (phi1 && (s_state == 7 || tg68_busstate == 2'b01 || cache_hit_beat
                                         || kernel_pmmu_fault))
                            || (cpu_turbo && phi2 && s_state == 3'd0
-                               && (tg68_busstate == 2'b01 || cache_read_hit)
+                               && (tg68_busstate == 2'b01 || cache_hit_beat)
                                && !cache_fill_pending) )
                           && !walk_cycle && !fill_active
                           && !pmmu_walker_req
@@ -152,7 +173,7 @@ wire        tg68_clkena = (   (phi1 && (s_state == 7 || tg68_busstate == 2'b01 |
 // pmmu_fault force-release arm of clkena above is NOT a real ack: beat_valid=0
 // there, so stream latches, extension capture, directPC and opcode retire all
 // skip the garbage beat (their hardware capture: $1B00/$FFFF junk as opcodes).
-wire        tg68_beat_valid = (s_state == 7) || (tg68_busstate == 2'b01) || cache_read_hit;
+wire        tg68_beat_valid = (s_state == 7) || (tg68_busstate == 2'b01) || cache_hit_beat;
 wire [31:0] tg68_addr;
 wire [15:0] tg68_din;
 reg  [15:0] tg68_din_r;
@@ -312,10 +333,13 @@ always @(posedge clk) begin
 			if (s_state != 4 && s_state != 3'd0) s_state <= s_state + 1'd1;
 			if (busreq_ack || bus_granted) s_state <= s_state;
 			if (eff_busstate == 2'b01) s_state <= 0;
-			// Cache read-hit: no external bus cycle — hold s_state at 0 (exactly
-			// like a busstate=01 no-access cycle); clkena pulses this phi1 and the
-			// cache supplies the data via the kernel data_in mux below.
-			if (cache_read_hit) s_state <= 0;
+			// Cache read-hit BEAT (hit qualified with s_state==0 — see the
+			// cache_hit_beat note): no external bus cycle — hold s_state at 0
+			// exactly like a busstate=01 no-access cycle; clkena pulses this
+			// phi1 and the cache supplies the data via the kernel data_in mux.
+			// A hit that appears after a cycle launched does NOT park the FSM
+			// (that stranded AS asserted and wedged HW); the cycle completes.
+			if (cache_hit_beat) s_state <= 0;
 
 			case (s_state)
 				1: if (eff_busstate != 2'b01) begin
@@ -342,7 +366,7 @@ always @(posedge clk) begin
 				s_state <= s_state + 1'd1;
 			if ((busreq_ack || bus_granted) && !busrel_ack) s_state <= s_state;
 			if (eff_busstate == 2'b01) s_state <= 0;
-			if (cache_read_hit) s_state <= 0;   // cache read-hit: no bus cycle (see phi1 branch)
+			if (cache_hit_beat) s_state <= 0;   // qualified hit only (see phi1 branch)
 			// PMMU busy/fault: park the bus FSM at s_state 0 so no cycle launches
 			// with an untranslated/stale physical address, and a FAULTED access
 			// runs no bus cycle at all (the new kernel dispatches the exception
@@ -514,10 +538,10 @@ end
 		.nReset         ( ~reset        ),
 		.clkena_in      ( tg68_clkena   ),
 		.beat_valid     ( tg68_beat_valid ),
-		// On a cache read-hit the kernel takes data straight from the cache
-		// (no bus cycle ran, so tg68_din_r is stale); otherwise the latched
-		// bus word. cache_read_hit is constant 0 when USE_68030_CACHE=0.
-		.data_in        ( cache_read_hit ? cache_kernel_data : tg68_din_r ),
+		// On a cache read-hit BEAT the kernel takes data straight from the
+		// cache (no bus cycle ran, so tg68_din_r is stale); otherwise the
+		// latched bus word. cache_hit_beat is constant 0 when USE_68030_CACHE=0.
+		.data_in        ( cache_hit_beat ? cache_kernel_data : tg68_din_r ),
 		.IPL            ( ipl           ),
 		.IPL_autovector ( 1'b0          ),
 		.berr           ( berr_held     ),
@@ -756,6 +780,7 @@ end
 		reg          fill_is_i;      // 1 = fill the I-cache, 0 = the D-cache
 		reg  [31:0]  fill_base;      // line-aligned (16-byte) physical base (cache's i/d_fill_addr)
 		reg  [127:0] fill_buf;       // accumulates the 8 read words (word k -> [16k +: 16])
+		reg          fill_dirty;     // a word was captured without fill_data_valid -> drop the line
 		reg          i_fill_valid_r, d_fill_valid_r;
 
 		assign       fill_active   = (fill_st == FILL_READ);             // bus-owning read phase
@@ -862,6 +887,7 @@ end
 				fill_is_i      <= 1'b0;
 				fill_base      <= 32'd0;
 				fill_buf       <= 128'd0;
+				fill_dirty     <= 1'b0;
 				i_fill_valid_r <= 1'b0;
 				d_fill_valid_r <= 1'b0;
 			end else begin
@@ -875,21 +901,39 @@ end
 						if (phi1 && s_state == 3'd0 && tg68_busstate == 2'b01 &&
 						    fc != 3'b111 &&
 						    !walk_cycle && !pmmu_walker_req && (i_fill_req | d_fill_req)) begin
-							fill_st   <= FILL_READ;
-							fill_word <= 3'd0;
-							fill_is_i <= i_fill_req;                        // I-cache has priority
-							fill_base <= i_fill_req ? i_fill_addr : d_fill_addr;
+							fill_st    <= FILL_READ;
+							fill_word  <= 3'd0;
+							fill_dirty <= 1'b0;
+							fill_is_i  <= i_fill_req;                        // I-cache has priority
+							fill_base  <= i_fill_req ? i_fill_addr : d_fill_addr;
 						end
 					FILL_READ: begin
-						if (phi2 && s_state == 3'd6)
+						if (phi2 && s_state == 3'd6) begin
 							fill_buf[fill_word*16 +: 16] <= din;     // capture line word k
+							// Retrospective data-valid check (see the port note):
+							// the fill acked at slot start like any CPU read; if the
+							// SDRAM had not actually served THIS word's address by
+							// the capture edge, the word is stale -> poison-drop.
+							if (!fill_data_valid) fill_dirty <= 1'b1;
+						end
 						if (phi1 && s_state == 3'd7) begin
 							if (fill_word != 3'd7)
 								fill_word <= fill_word + 1'b1;       // next word
 							else begin
-								fill_st <= FILL_IDLE;                 // 16 bytes read -> populate + done
-								if (fill_is_i) i_fill_valid_r <= 1'b1;
-								else           d_fill_valid_r <= 1'b1;
+								fill_st <= FILL_IDLE;                 // 16 bytes read -> done
+								// Install only a fully-clean line: no fill_valid pulse
+								// on a dirty one. The cache holds i/d_fill_req asserted
+								// until a valid pulse arrives (BUG #132 keeps the same
+								// latched line/addr), so a dropped line simply RETRIES
+								// on a later idle window. Worst case is a line that
+								// never installs — future misses, never corruption.
+								// (While any fill is pending, cache_fill_pending also
+								// keeps the turbo phi2 arm off — persistent retries
+								// would degrade P600 toward 16 MHz, not wedge.)
+								if (!fill_dirty) begin
+									if (fill_is_i) i_fill_valid_r <= 1'b1;
+									else           d_fill_valid_r <= 1'b1;
+								end
 							end
 						end
 					end
@@ -913,7 +957,7 @@ end
 				cs_cyc <= cs_cyc + 1'b1;
 				if (tg68_clkena) begin
 					cs_beats <= cs_beats + 1'b1;
-					if (cache_read_hit) begin
+					if (cache_hit_beat) begin
 						if (tg68_busstate == 2'b00) begin cs_ihit <= cs_ihit+1'b1; ct_ihit <= ct_ihit+1'b1; end
 						else                        begin cs_dhit <= cs_dhit+1'b1; ct_dhit <= ct_dhit+1'b1; end
 					end
@@ -1039,6 +1083,25 @@ end
 			$display("TG68: FETCH PC=%h opcode=%h @%0t", tg68_addr, tg68_din_r, $time);
 	end
 	`endif
+
+`ifdef SIMULATION
+	// Orphaned-AS tripwire (permanent guard; found 2026-08-15): AS asserted
+	// while the bus FSM is parked at s_state 0 with no borrowed master means a
+	// launched cycle was abandoned — the exact hit-vs-launch race that wedged
+	// hardware while simulation stayed green (sim_ram's combinational serve
+	// masks the resulting early-DTACK data hazard, so only this invariant
+	// makes the bug visible in sim). Capped, loud, non-fatal.
+	reg [7:0] orphan_as_cnt = 8'd0;
+	always @(posedge clk) begin
+		if (reset) orphan_as_cnt <= 8'd0;
+		else if (!as_n_r && s_state == 3'd0 && !walk_cycle && !fill_active &&
+		         orphan_as_cnt != 8'hFF) begin
+			orphan_as_cnt <= orphan_as_cnt + 8'd1;
+			$display("TG68K *** ORPHANED AS *** s_state=0 as_n=0 busstate=%b addr=%h hit=%b @%0t",
+			         tg68_busstate, tg68_addr, cache_read_hit, $time);
+		end
+	end
+`endif
 
 	`ifdef PMMU_TRACE
 	// Focused PMMU table-walk + stall probe (does NOT spam per-fetch).
