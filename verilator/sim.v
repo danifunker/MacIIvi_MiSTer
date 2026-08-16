@@ -1066,7 +1066,7 @@ module emu
 		.selectPseudoVIA(selectPseudoVIA),
 		.pseudovia_data_in(pseudovia_dout),
 		.selectBoxID(selectBoxID),
-		// +p600: Performa 600 identity ($A55A2017) + cpu_turbo 32MHz mode —
+		// +p600: Performa 600 identity ($A55A2015, IIvx family) + cpu_turbo 32MHz mode —
 		// the sim twin of MacIIvi.sv's reset-latched OSD Machine (O1) select.
 		.machine_p600(sim_p600),
 		// was left unconnected in the LC II sim (floated 0) — the IIvi RAM

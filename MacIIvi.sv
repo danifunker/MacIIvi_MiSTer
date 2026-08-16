@@ -100,7 +100,7 @@ module emu
 		// machine runs the kernel's off-bus beats on both phi edges ("32 MHz"
 		// core on the 16 MHz bus, the real IIvx/P600 shape; tg68k.v
 		// cpu_turbo). Takes effect at the next reset only (R0 below).
-		"O1,Machine,Mac IIvi (16MHz),IIvx-P600 (32MHz);",
+		"O1,Machine,Mac IIvi (16MHz),Performa 600 (32MHz);",
 		// Memory: one line per SDRAM-module tier (O234 = status[4:2]), so only
 		// sizes the fitted module can back are offered. menumask bit 0 = module
 		// >=64MB (from hps_io sdram_sz; H hides when the bit is SET, h when CLEAR).
@@ -180,7 +180,7 @@ module emu
 	// Machine select (O1, re-added 2026-08-15 for the P600 32MHz mode): latched
 	// at reset exactly like Memory — a live OSD change does nothing until the
 	// next reset ("takes effect between reboots"). Drives BOTH the box-ID
-	// ($A55A2016 IIvi / $A55A2017 P600) and tg68k's cpu_turbo (32 MHz core on
+	// ($A55A2016 IIvi / $A55A2015 IIvx-family P600) and tg68k's cpu_turbo (32 MHz core on
 	// the 16 MHz bus — phi grid, E/VIA pacing and every peripheral rate are
 	// untouched, matching the real P600's 32 MHz 68030 on the IIvi bus).
 	// History: the ORIGINAL O1 machine option was removed 2026-07-13 when P600
@@ -2154,7 +2154,7 @@ module emu
 		.selectPseudoVIA(selectPseudoVIA),
 		.pseudovia_data_in(pseudovia_dout),
 		.selectBoxID(selectBoxID),
-		.machine_p600(status_machine),   // OSD Machine (O1), reset-latched: box-ID $A55A2017 when P600
+		.machine_p600(status_machine),   // OSD Machine (O1), reset-latched: box-ID $A55A2015 (IIvx) when P600
 		.selectUnmapped(selectUnmapped),
 		
 		// peripherals

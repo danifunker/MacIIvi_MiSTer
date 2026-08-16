@@ -64,7 +64,7 @@ module dataController_top(
 	input selectPseudoVIA,
 	input [7:0] pseudovia_data_in,
 	input selectBoxID,            // $5FFFFFFC machine-ID longword
-	input machine_p600,           // 0 = Mac IIvi ($A55A2016), 1 = Performa 600 ($A55A2017)
+	input machine_p600,           // 0 = Mac IIvi ($A55A2016), 1 = Performa 600 ($A55A2015, the IIvx family ID)
 	input selectUnmapped,
 
 	// RAM/ROM:
