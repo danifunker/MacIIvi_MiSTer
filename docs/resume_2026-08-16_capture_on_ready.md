@@ -197,3 +197,42 @@ tables) + _cpudone_ variant (CPU table with the covered ratios visible).
 - Core Command key = PS/2 **ALT** (rtl/ps2_kbd.sv) → KEY_LEFTALT in evdev
   injection; scripts/mac_kbd.py (new this session) sends cmd:x combos and
   type:/key: tokens with paired press/release.
+
+## Posted-write build: HW-FALSIFIED on the SEED 7 netlist (session close, ~12:55)
+
+`1ecedb71` (posted-write mdc824 + cache, SEED 7, STA all-met) **sad-Macs
+POST 2/2 on HW** — $0F/$0003 (address error) then $0F/$000A (F-line) on
+consecutive boots. DIFFERENT minor codes across boots = the intermittent
+corrupted-fetch **marginality class** (the 2026-08-15 93%-ALM script
+replayed: STA-met fits corrupting CPU fetches), NOT a deterministic
+posted-write protocol failure — a real ack hole would die at the same
+probe identically. The RTL (122a2b1) stays committed; the NETLIST is the
+suspect. Do not redeploy 1ecedb71 (archived
+scratch/MacIIvi_1ecedb71_postedwrite_SADMAC.rbf).
+
+Recovery: 6061d52d (validated cache build) redeployed, settled canonical
+~63s, machine parked at the carousel in P600 mode.
+
+## Handoff for the next session (owner: "later this week")
+
+1. **SEED 5 fit of the posted-write netlist was cooking at session end**
+   (auto_compile log in output_files/) — check STA; if met, gate on
+   2 boots + icons + Speedometer BEFORE trusting it (STA alone proved
+   insufficient twice now). Seed history in the qsf.
+2. If seed-lottery keeps failing: consider the marginality-anchor
+   approach (the always-on SCSI anchors precedent) for the fetch path,
+   or shed ALMs (PMMU ATC 22→8 is the known ~free knob, evaluated
+   2026-08-15) to get off the 93% edge.
+3. The posted-write A/B measurement (Speedometer Color vs 0.711) is
+   still PENDING — it needs a healthy netlist first.
+4. Remaining ladder: D-cache via M10K rework (fill engine now proven),
+   word-granular fill yield (suggestedtasks #3, recovers the FP-row
+   dip), slot/DTACK audit, 32-bit bus.
+5. scsi_bench gate is TRUSTWORTHY again (0 fails) — run it after any
+   family sync (all-S matrix = the --id clobber signature).
+
+Session totals (owner's morning table → now, P600 mode, same volume):
+**CPU 1.805 → 3.435 (+90%), video 0.523 → 0.711 (+36%)**, gap to the
+physical Performa 600 halved on both axes. 25+ deploy/boot cycles, two
+release-quality regressions caught and fixed (bench rot, ESC landmine),
+one owner rule learned and encoded (verified shutdown).
