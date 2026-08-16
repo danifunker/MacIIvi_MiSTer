@@ -781,9 +781,7 @@ end
 		reg  [31:0]  fill_base;      // line-aligned (16-byte) physical base (cache's i/d_fill_addr)
 		reg  [127:0] fill_buf;       // accumulates the 8 read words (word k -> [16k +: 16])
 		reg          fill_dirty;     // a word FAILED past its retry budget -> drop the line
-		reg          fill_wdirty;    // THIS slot's word captured without a 2-cycle-stable ready
-		reg   [2:0]  fill_retry;     // per-line retry budget spent (a dirty word re-reads its slot)
-		reg          fill_dv_d;      // fill_data_valid delayed 1 clk (2-cycle-stable qualifier)
+		reg   [2:0]  fill_retry;     // per-line retry budget spent (a late word re-reads its slot)
 		reg          i_fill_valid_r, d_fill_valid_r;
 
 		assign       fill_active   = (fill_st == FILL_READ);             // bus-owning read phase
@@ -891,15 +889,12 @@ end
 				fill_base      <= 32'd0;
 				fill_buf       <= 128'd0;
 				fill_dirty     <= 1'b0;
-				fill_wdirty    <= 1'b0;
 				fill_retry     <= 3'd0;
-				fill_dv_d      <= 1'b0;
 				i_fill_valid_r <= 1'b0;
 				d_fill_valid_r <= 1'b0;
 			end else begin
 				i_fill_valid_r <= 1'b0;   // single-cycle valid pulses
 				d_fill_valid_r <= 1'b0;
-				fill_dv_d      <= fill_data_valid;
 				case (fill_st)
 					FILL_IDLE:
 						// fc != 7: if the kernel's FC output lingers in CPU space on
@@ -911,59 +906,50 @@ end
 							fill_st     <= FILL_READ;
 							fill_word   <= 3'd0;
 							fill_dirty  <= 1'b0;
-							fill_wdirty <= 1'b0;
 							fill_retry  <= 3'd0;
 							fill_is_i   <= i_fill_req;                       // I-cache has priority
 							fill_base   <= i_fill_req ? i_fill_addr : d_fill_addr;
 						end
 					FILL_READ: begin
-						if (phi2 && s_state == 3'd6) begin
-							fill_buf[fill_word*16 +: 16] <= din;     // capture line word k
-							// Retrospective data-valid check (see the port note):
-							// the fill acked at slot start like any CPU read; if the
-							// SDRAM had not demonstrably served THIS word's address
-							// by the capture edge — fill_data_valid STABLE for 2 clk
-							// (fill_dv_d; a ready that rose at the capture edge is the
-							// razor case where din's latch may still carry the older
-							// word — the 65 MHz controller can complete between our
-							// samples) — the word is SUSPECT, not yet fatal.
-							fill_wdirty <= !(fill_data_valid && fill_dv_d);
-						end
+						// Capture + verdict at phi1 && s_state 7 — the KERNEL'S OWN
+						// read-completion sample point (every normal CPU read
+						// latches din here; the timing this core has booted with
+						// all along). fill_data_valid = sdram.v ram_ready, the
+						// walker-class freshness LEVEL (dout_valid && dout_addr ==
+						// addr): for word k it can only be high while dout holds
+						// word k itself (the address changed at slot start, so a
+						// leftover high can never alias to a stale word), and it
+						// rises when the slot's read completes mid-to-late slot.
+						// History (2026-08-15, all HW-measured): the original
+						// phi2/s6 capture sampled HALF A PHI EARLIER than the
+						// kernel's point — right where normal completions land.
+						// Single-sample there mostly worked (91s boots) but left
+						// the razor window; the 2-clk-stable variant (e4253e7)
+						// then failed HEALTHY words as slot geometry (cache never
+						// installed: 173s boots), and per-word retries on top
+						// (b38c9ac) only added borrow slots (223s). Sampling AT
+						// the kernel's point carries the same stability guarantee
+						// every normal read already relies on — no extra cycle of
+						// paranoia needed.
 						if (phi1 && s_state == 3'd7) begin
-							// A suspect word RE-READS its own slot: fill_bus_addr is
-							// combinational off the un-advanced fill_word, and the
-							// bus slot grid free-runs during the borrow, so holding
-							// the count replays the same address next pass — where a
-							// ready that was merely late/razor at s6 is comfortably
-							// stable. This is what keeps the 2-cycle sentinel from
-							// bleeding performance: the poison-per-LINE first cut
-							// (e4253e7) dropped whole lines on ONE suspect word, and
-							// under normal refresh/video SDRAM contention that
-							// starved the cache on HW (290s vs 91s boots, both
-							// machine modes) — sim_ram's combinational serve is
-							// constitutionally blind to it. The per-line budget
-							// bounds the borrow (worst 8+7 slots); a word still
-							// dirty past it poisons the line exactly like the first
-							// cut. Installs stay clean-only: future misses, never
-							// corruption.
-							if (fill_wdirty && fill_retry != 3'd7)
-								fill_retry <= fill_retry + 1'b1;     // re-run this word's slot
+							fill_buf[fill_word*16 +: 16] <= din;     // capture line word k
+							if (!fill_data_valid && fill_retry != 3'd7)
+								fill_retry <= fill_retry + 1'b1;     // late word: re-run its slot
 							else begin
-								if (fill_wdirty) fill_dirty <= 1'b1; // budget spent -> poison line
+								if (!fill_data_valid) fill_dirty <= 1'b1; // budget spent -> poison
 								if (fill_word != 3'd7)
 									fill_word <= fill_word + 1'b1;   // next word
 								else begin
 									fill_st <= FILL_IDLE;             // 16 bytes read -> done
-									// Install only a fully-clean line (fill_dirty for
-									// earlier words, fill_wdirty for THIS edge's
-									// verdict — nonblocking set above isn't visible
-									// yet). The cache holds i/d_fill_req asserted
-									// until a valid pulse arrives (BUG #132 keeps the
-									// same latched line/addr), so a dropped line
-									// simply RETRIES on a later idle window. (While
-									// any fill is pending, cache_fill_pending also
-									// keeps the turbo phi2 arm off.)
-									if (!fill_dirty && !fill_wdirty) begin
+									// Install only a fully-clean line (fill_dirty =
+									// earlier words, fill_data_valid = THIS word).
+									// The cache holds i/d_fill_req asserted until a
+									// valid pulse arrives (BUG #132 keeps the same
+									// latched line/addr), so a dropped line simply
+									// RETRIES on a later idle window — future
+									// misses, never corruption. (cache_fill_pending
+									// keeps the turbo phi2 arm off meanwhile.)
+									if (!fill_dirty && fill_data_valid) begin
 										if (fill_is_i) i_fill_valid_r <= 1'b1;
 										else           d_fill_valid_r <= 1'b1;
 									end
