@@ -19,14 +19,22 @@ module tg68k (
 	// cacheable-region decode so the open-bus tail of the $0xxxxxxx RAM window
 	// ($FFFF pattern-probe space) can never be cached.
 	input [26:0] ram_size_bytes,
-	// Read-data-valid qualifier for cache line-fill captures (MacIIvi.sv wires
-	// sdram_ram_ready; the sim ties 1). Fill bus cycles use the NORMAL
-	// slot-start DTACK — a fill must never be able to stall the CPU — and this
-	// signal is checked retrospectively at each word capture instead: a word
-	// captured while the SDRAM had not actually served that address (the
-	// walker's stale-dout class) marks the whole line DIRTY and the fill is
-	// dropped at completion, never installed. A dropped fill is only a future
-	// miss; a poisoned line would be silent corruption.
+	// Line-fill capture STROBE (level, may be true on several edges per word
+	// cycle): "the SDRAM dout currently holds THIS cycle's word AND din is the
+	// live passthrough of it". MacIIvi.sv wires sdram_ram_ready & cpuBusControl
+	// & memoryLatch & ~download_cycle & ~card_ext_slot & (selectRAM|selectROM);
+	// the sim twin drops ram_ready (sim_ram serves combinationally). Every
+	// term is load-bearing: ram_ready's compare is against the LIVE sdram addr
+	// input, which follows the floppy staging address through every extra slot
+	// and collapses when AS deasserts, and din is a LATCH except during the
+	// memoryLatch passthrough edge — an unqualified ram_ready can be true for
+	// ANOTHER master's word. Fill bus cycles keep the NORMAL slot-start DTACK
+	// (a fill must never be able to stall the CPU); the FILL FSM latches the
+	// word + a sticky served flag on any strobe-true edge and the end-of-cycle
+	// verdict reads the flag. Unserved word -> per-line-budget retry; budget
+	// spent -> line poisoned and dropped at completion, never installed (a
+	// dropped fill is only a future miss; a poisoned line would be silent
+	// corruption).
 	input fill_data_valid,
 
 	input  dtack_n,
@@ -115,19 +123,34 @@ wire  [1:0] tg68_busstate;
 // cache subsystem is in the generate `else` arm (cache_read_hit tied 0), so
 // the bus FSM is provably identical to the uncached design.
 // ---------------------------------------------------------------------------
-// PARKED 2026-08-16 (owner-sleep session): the fill engine is a measured NET
-// LOSS on HW — same-night, same-volume, same-UI-state, same-CD A/B: no-cache
-// dea200c6 settles ~100s where every 2026-08-15 cache build (poison/retry/
-// kernel-point-v2 captures alike) runs 213-225s, ~2x. All three capture
-// variants land within seconds of each other, so the drag is NOT the capture
-// policy — the open question is when sdram ram_ready actually rises for a
-// fill-BORROWED read on HW (sim's combinational serve cannot answer it; a
-// JTAG counter probe build can: count ready-at-capture hits vs retries vs
-// installs). Friday's 91s-vs-154s same-day win stands as evidence the engine
-// CAN pay — do not delete it; re-enable = flip this + the probe hunt.
-// Stability is NOT the issue: 17 consecutive clean 48MB boots across the
-// three cache builds (capture-v2's clean-only install invariant held).
-localparam USE_68030_CACHE = 1'b0;
+// RE-ENABLED 2026-08-16 (capture-on-ready): the 2026-08-15 "fills never
+// install on HW" mystery is CLOSED, analytically. ram_ready (sdram.v:173,
+// dout_valid && dout_addr == addr) is address-compare-qualified against the
+// LIVE addr input, and three top-level mechanisms make it structurally ZERO
+// at the old fixed sample points:
+//   1. the addrDecoder is AS-gated, so the moment the fill cycle deasserts
+//      AS (s_state 6 phi2) every select drops and memoryAddr collapses —
+//      capture-v2's s7-phi1 sample point read a CONSTANT 0 on HW;
+//   2. dskReadAckInt/Ext assert UNCONDITIONALLY during every extra slot
+//      (idle floppy included), which both muxes memoryAddr away AND issues a
+//      real SDRAM read that OVERWRITES dout with the staging word — dout
+//      persistence dies every 4th slot;
+//   3. the CPU din path is LATCHED in dataController (cpu_data): din equals
+//      live sdram dout ONLY during the cpuBusControl && memoryLatch
+//      passthrough edge (once per CPU slot — exactly the old s6-phi2 edge),
+//      so sampling "later where it's safe" was never an option.
+// Friday's s6-phi2 single-sample (91s boots) worked because it hit the one
+// edge where compare + live data coincide — a razor. The fix removes the
+// point-sample entirely: fill_data_valid is now the QUALIFIED strobe
+// (ram_ready & cpuBusControl & memoryLatch & ~download & ~card_ext &
+// RAM|ROM selects, wired in MacIIvi.sv/sim.v) and the FILL FSM captures
+// on ANY strobe-true edge with a sticky per-word served flag; the s7
+// verdict reads the flag. A word served late persists in dout (writes are
+// the only invalidator) so the retry cycle's first passthrough edge
+// recaptures it without re-racing the SDRAM — self-healing. Stability
+// invariants unchanged: slot-start DTACK (fills can never stall), per-line
+// retry budget, clean-only install (25/25 sad-Mac-free boots night-of).
+localparam USE_68030_CACHE = 1'b1;
 wire        cache_read_hit;     // current CPU access is a cacheable read that HIT the cache
 wire [15:0] cache_kernel_data;  // 16-bit word fed to the kernel on a cache hit (skips the bus)
 wire        cache_fill_pending; // a line-fill request is latched awaiting service (gates turbo)
@@ -794,6 +817,7 @@ end
 		reg  [127:0] fill_buf;       // accumulates the 8 read words (word k -> [16k +: 16])
 		reg          fill_dirty;     // a word FAILED past its retry budget -> drop the line
 		reg   [2:0]  fill_retry;     // per-line retry budget spent (a late word re-reads its slot)
+		reg          fill_served;    // sticky: THIS word was captured off a strobe-true edge
 		reg          i_fill_valid_r, d_fill_valid_r;
 
 		assign       fill_active   = (fill_st == FILL_READ);             // bus-owning read phase
@@ -902,6 +926,7 @@ end
 				fill_buf       <= 128'd0;
 				fill_dirty     <= 1'b0;
 				fill_retry     <= 3'd0;
+				fill_served    <= 1'b0;
 				i_fill_valid_r <= 1'b0;
 				d_fill_valid_r <= 1'b0;
 			end else begin
@@ -919,49 +944,56 @@ end
 							fill_word   <= 3'd0;
 							fill_dirty  <= 1'b0;
 							fill_retry  <= 3'd0;
+							fill_served <= 1'b0;
 							fill_is_i   <= i_fill_req;                       // I-cache has priority
 							fill_base   <= i_fill_req ? i_fill_addr : d_fill_addr;
 						end
 					FILL_READ: begin
-						// Capture + verdict at phi1 && s_state 7 — the KERNEL'S OWN
-						// read-completion sample point (every normal CPU read
-						// latches din here; the timing this core has booted with
-						// all along). fill_data_valid = sdram.v ram_ready, the
-						// walker-class freshness LEVEL (dout_valid && dout_addr ==
-						// addr): for word k it can only be high while dout holds
-						// word k itself (the address changed at slot start, so a
-						// leftover high can never alias to a stale word), and it
-						// rises when the slot's read completes mid-to-late slot.
-						// History (2026-08-15, all HW-measured): the original
-						// phi2/s6 capture sampled HALF A PHI EARLIER than the
-						// kernel's point — right where normal completions land.
-						// Single-sample there mostly worked (91s boots) but left
-						// the razor window; the 2-clk-stable variant (e4253e7)
-						// then failed HEALTHY words as slot geometry (cache never
-						// installed: 173s boots), and per-word retries on top
-						// (b38c9ac) only added borrow slots (223s). Sampling AT
-						// the kernel's point carries the same stability guarantee
-						// every normal read already relies on — no extra cycle of
-						// paranoia needed.
+						// CAPTURE-ON-STROBE (2026-08-16, the fix for the parked-era
+						// 2x drag): fill_data_valid is the qualified "din is the
+						// live passthrough of THIS word's just-served data" strobe
+						// (see the port comment). Latch the word and the sticky
+						// served flag on ANY strobe-true edge of the word's cycle —
+						// there is exactly one passthrough edge per CPU slot
+						// (memoryLatch), and a word served late persists in sdram
+						// dout (writes are the only invalidator), so the RETRY
+						// cycle recaptures it on its first passthrough edge without
+						// re-racing the SDRAM: self-healing. The parked-era designs
+						// point-sampled ram_ready at one fixed edge instead:
+						// s7-phi1 is structurally AFTER the AS-gated decode
+						// collapses memoryAddr (a constant-0 sample — the cache
+						// never installed, 213-225s boots), and s6-phi2 was the
+						// single coinciding edge (a razor — 91s boots, mostly).
+						// Capture and verdict are now different edges, so neither
+						// races the SDRAM completion.
+						if (fill_data_valid) begin
+							fill_buf[fill_word*16 +: 16] <= din;   // live line word k
+							fill_served <= 1'b1;
+						end
+						// End-of-cycle verdict at phi1 && s_state 7 (the fill
+						// cycle's fixed completion point — slot-start DTACK pacing,
+						// a fill can never stall). Reads the sticky flag, never the
+						// live level (0 here by construction: AS dropped at s6-phi2
+						// and the decode collapsed with it).
 						if (phi1 && s_state == 3'd7) begin
-							fill_buf[fill_word*16 +: 16] <= din;     // capture line word k
-							if (!fill_data_valid && fill_retry != 3'd7)
-								fill_retry <= fill_retry + 1'b1;     // late word: re-run its slot
+							if (!fill_served && fill_retry != 3'd7)
+								fill_retry <= fill_retry + 1'b1;     // unserved: re-run this word's slot
 							else begin
-								if (!fill_data_valid) fill_dirty <= 1'b1; // budget spent -> poison
+								if (!fill_served) fill_dirty <= 1'b1; // budget spent -> poison
+								fill_served <= 1'b0;                  // consume for the next word
 								if (fill_word != 3'd7)
 									fill_word <= fill_word + 1'b1;   // next word
 								else begin
 									fill_st <= FILL_IDLE;             // 16 bytes read -> done
 									// Install only a fully-clean line (fill_dirty =
-									// earlier words, fill_data_valid = THIS word).
-									// The cache holds i/d_fill_req asserted until a
+									// earlier words, fill_served = THIS word). The
+									// cache holds i/d_fill_req asserted until a
 									// valid pulse arrives (BUG #132 keeps the same
 									// latched line/addr), so a dropped line simply
 									// RETRIES on a later idle window — future
 									// misses, never corruption. (cache_fill_pending
 									// keeps the turbo phi2 arm off meanwhile.)
-									if (!fill_dirty && fill_data_valid) begin
+									if (!fill_dirty && fill_served) begin
 										if (fill_is_i) i_fill_valid_r <= 1'b1;
 										else           d_fill_valid_r <= 1'b1;
 									end

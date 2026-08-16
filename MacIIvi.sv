@@ -999,11 +999,14 @@ module emu
 	// the boot gray phase on HW, both boots, while sim (no such gate) and STA
 	// were clean — a fill stalled on ram_ready freezes the CPU outright, since
 	// clkena is held for the whole fill. Fills instead ack at slot start like
-	// every normal CPU read and tg68k.v checks sdram_ram_ready RETROSPECTIVELY
-	// at each word capture (fill_data_valid below): a word captured while the
-	// SDRAM hadn't served that address marks the line dirty and the fill is
-	// dropped, never installed — the stale-dout class costs a retry, not
-	// corruption, and can never stall.
+	// every normal CPU read and tg68k.v CAPTURES each word on the qualified
+	// strobe edges (fill_data_valid at the tg68k instance below: ram_ready
+	// + cpu-slot + memoryLatch passthrough + RAM/ROM decode, no download/
+	// card-ext override) with a sticky per-word served flag; the end-of-cycle
+	// verdict reads the flag. An unserved word re-runs its slot on a per-line
+	// budget, a spent budget poisons the line and the fill is dropped, never
+	// installed — the stale-dout class costs a retry, not corruption, and can
+	// never stall.
 	wire walk_read = cpu_walk_cycle & (selectRAM | selectVRAM) & _cpuRW;
 	always @(posedge clk_sys) begin
 		if (!_cpuReset) begin
@@ -1363,7 +1366,26 @@ module emu
 		.cpu        ( 2'b10 ),  // 68030 (Mac LC II); old selectable form: {status_cpu[1], |status_cpu}
 		.cpu_turbo  ( status_machine ),   // P600: 2x off-bus beats (reset-latched)
 		.ram_size_bytes ( ram_size_bytes ),  // bounds the cacheable-RAM decode
-		.fill_data_valid ( sdram_ram_ready ),  // per-word fill capture qualifier (dirty-drop)
+		// Line-fill capture strobe: TRUE only on edges where din is the LIVE
+		// passthrough of the fill word's just-served SDRAM data. Every term is
+		// load-bearing (2026-08-16 root cause of the parked-era 2x drag):
+		//   sdram_ram_ready       — dout holds the word addr currently presented;
+		//   cpuBusControl         — extra slots mux memoryAddr to the floppy
+		//                           staging address UNCONDITIONALLY (idle too) and
+		//                           their read clobbers dout: ready there refers
+		//                           to the FLOPPY word, not ours;
+		//   memoryLatch           — dataController's cpu_data latch passes
+		//                           memoryDataIn through combinationally ONLY on
+		//                           this edge (once per CPU slot); off it, din is
+		//                           a stale latch even while ready is true;
+		//   ~download_cycle,
+		//   ~card_ext_slot        — both override the sdram addr mux entirely;
+		//   selectRAM|selectROM   — the AS-gated decode must be presenting OUR
+		//                           (cacheable) address for the compare to refer
+		//                           to it. Keep in sync with verilator/sim.v.
+		.fill_data_valid ( sdram_ram_ready & cpuBusControl & memoryLatch
+		                   & ~download_cycle & ~card_ext_slot
+		                   & (selectRAM | selectROM) ),
 
 		.dtack_n    ( _cpuDTACK  ),
 		.rw_n       ( tg68_rw    ),

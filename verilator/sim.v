@@ -493,9 +493,18 @@ module emu
 		.cpu        ( 2'b10 ),  // 68030 (Mac LC II); old selectable form: {status_cpu[1], |status_cpu}
 		.cpu_turbo  ( sim_p600 ),           // P600: 2x off-bus beats
 		.ram_size_bytes ( ram_size_bytes ), // bounds the cacheable-RAM decode
-		// sim_ram serves every read in-slot; the stale-dout class the dirty-drop
-		// protects against is SDRAM-controller-specific (see MacIIvi.sv).
-		.fill_data_valid ( 1'b1 ),
+		// Line-fill capture strobe, sim twin of the MacIIvi.sv expression minus
+		// sdram_ram_ready (sim_ram serves every read in-slot, combinationally —
+		// there is no serve race to detect). The OTHER terms are NOT optional in
+		// sim: din goes through the same dataController cpu_data latch, so it is
+		// the live word only on cpuBusControl && memoryLatch passthrough edges,
+		// and only while the AS-gated decode presents the fill's RAM/ROM address.
+		// An unconditional 1'b1 here would capture stale-latch/open-bus data at
+		// off-window edges (including s7-phi1, after AS drop) and poison every
+		// line in sim. Keep in sync with MacIIvi.sv.
+		.fill_data_valid ( cpuBusControl & memoryLatch
+		                   & ~download_cycle & ~card_ext_slot
+		                   & (selectRAM | selectROM) ),
 
 		.dtack_n    ( _cpuDTACK  ),
 		.rw_n       ( tg68_rw    ),
