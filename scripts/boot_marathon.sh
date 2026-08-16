@@ -65,7 +65,7 @@ for i in $(seq 1 "$N"); do
   done
   log "BOOT $i verdict: $verdict"
   case "$verdict" in
-    SETTLED*) clean_shutdown ;;
+    SETTLED*) [ "${SKIP_SHUTDOWN:-0}" = 1 ] || clean_shutdown ;;
     *) fails=1; log "MARATHON STOPPED: boot $i failed — evidence in $OUT"; break ;;
   esac
 done
