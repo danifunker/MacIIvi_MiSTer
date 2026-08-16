@@ -30,41 +30,59 @@ Color Benchmarks (vs Mac II = 1.0), average **0.523**:
 Mono 68.783s / 0.474, TwoBit 76.317 / 0.510, FourBit 83.767 / 0.548,
 EightBit 100.533 / 0.563.
 
-Reference class for a REAL P600 (32MHz 030 + caches + 32-bit bus): CPU
-average ≈ 3.6-4.0; video multiples of ours. **We are ~0.5x the CPU and
-~0.2-0.25x the video of the real machine.** FIRST ACTION next session:
-get the owner's saved physical-P600 Speedometer numbers (they have them;
-desktop folder "MiSTer Performa 600 260816" holds OUR saved run) and
-replace this estimate with exact per-test deltas.
+**AUTHORITATIVE comparison: `docs/Speedometer_3-23_Benchmarks.md`** (the
+owner's measured table — physical Mac LC, LC II, Mac II, Performa 600,
+and This Core, all Speedometer 3.23). Exact deltas:
+
+| | Physical P600 | This Core | Gap |
+|---|---:|---:|---:|
+| CPU average | 7.136 | 1.805 | **3.95x** |
+| Video average | 1.622 | 0.523 | **3.10x** |
+
+Per-test gap ranking (P600/core): Sieve 6.7x, Puzzle 6.05x, Queens 4.91x,
+Bubble 4.90x, QuickSort 4.20x, Permutations 4.04x, IntMatrix 4.03x,
+Dhrystones 2.96x, FPMatrix 2.93x, KWhet 2.80x, Towers 2.73x, FFT 2.70x.
+
+And the owner's opening observation confirmed: the 68020 **Mac LC beats
+this core 2x** (3.702 vs 1.805); the LC II 2.5x (4.471).
 
 ## Why — the differential, ranked by contribution
 
-The per-test SHAPE is the diagnosis: compute-bound tests (Whet 3.32,
-FFT/Matrix ~2.2) sit ~2.4x above memory-bound ones (Dhrystone 1.38,
-Permutations 1.27, Queens 1.28). The 32MHz turbo (internal beats) works;
-everything memory dies on the bus. Contributors:
+**The Mac LC II row is the master key.** The real LC II = 16MHz 68030 on
+the SAME 16-bit bus and same V8-family chipset this core inherited, no L2
+— and it scores 4.471 vs our 1.805 (2.48x). So the 16-bit bus does NOT
+explain the bulk of the gap: the real LC II pays the same bus toll and
+wins 2.5x with HALF our (turbo) clock. What it has that we lack: the
+030's on-chip I+D caches ENABLED, and a bus that doesn't burn slot-grid
+wait states. The per-test gap ranking says the same — our worst rows
+(Sieve 6.7x, Puzzle 6.1x, Queens/Bubble 4.9x) are tight small-working-set
+loops that fit entirely inside the real 030's 256B+256B caches; our
+least-bad rows (FFT/Whet/FP ~2.7-2.9x) are SANE software-FP compute where
+turbo's internal beats help. Contributors, re-ranked by this evidence:
 
-1. **No working I-cache** (parked 2026-08-16, `USE_68030_CACHE=0`): a real
-   030 loses ~30-40% without its I-cache; ours is parked because the fill
-   engine measured a 2x NET LOSS as integrated (docs/
-   resume_2026-08-16_night_run.md §1). The probe hunt
-   (docs/suggestedtasks.md #1, chip task_843cfb7f) is THE unlock — Friday
-   proved the engine can pay (91s vs 154s boots). Expected Speedometer
-   effect: large, across every CPU row.
-2. **16-bit data bus** (LCII heritage): every longword = 2 bus cycles.
-   The real P600's bus is 32-bit. A true 32-bit VASP bus is the big
-   architectural project (addrController/dataController/sdram/peripheral
-   muxes/both tops). Expected effect: up to ~2x on memory-bound rows.
-3. **No D-cache** (`USE_68030_DCACHE=0`, arrays are fabric regs — didn't
-   fit; M10K rework = the path, and unlocks after #1's fill fix since
-   D-fills use the same engine).
-4. **Slot-grid DTACK**: CPU waits for its bus slot (3-of-4 slots CPU,
-   slot-start ack). Effective wait states on every access. Micro-lever:
-   audit slot rotation / dead phases; historical +50% ack-rate win exists
-   (H1 note in MacIIvi.sv dtack glue).
-5. PMMU ATC-8 (was 22): minor; walk rate is low in flat System 7 mapping.
+1. **Both 030 on-chip caches missing** (I-cache parked
+   `USE_68030_CACHE=0`; D-cache never fitted `USE_68030_DCACHE=0`) — the
+   dominant term per the LC II evidence: together with wait-states this
+   is the ~2.5x real-LCII delta, concentrated in exactly our worst rows.
+   The fill-engine probe hunt (docs/suggestedtasks.md #1, chip
+   task_843cfb7f) is THE unlock (Friday proved fills can pay: 91s vs
+   154s boots); D-cache needs the M10K array rework after it. This is
+   worth MORE than everything else combined — target the Sieve/Puzzle/
+   Queens rows as the measurement.
+2. **Slot-grid DTACK wait states**: the CPU waits for its slot in the
+   rotation with slot-start ack — cycles the real LC II's chipset doesn't
+   burn the same way. Micro-audit slot rotation/dead phases (the H1 note
+   in MacIIvi.sv dtack glue documents a historical +50% ack-rate win).
+   Cheap, measurable, kernel-free.
+3. **16-bit data bus**: real per-longword cost, but bounded by the
+   P600-vs-LCII residual (7.136/4.471 = 1.6x = what the real 32-bit bus
+   + 32MHz + L2 buy TOGETHER). The true 32-bit VASP bus remains the big
+   architectural project — worth it only after 1+2 land.
+4. PMMU ATC-8 (was 22): minor; walk rate is low in flat System 7 mapping.
 
-Video 0.523x Mac II — all in the mdc824 write path:
+Video 0.523x Mac II (owner's table anchors: real LC/LCII onboard ≈1.25,
+real Mac II ≈1.27, real P600 ≈1.622 — every physical machine is 2.4-3.1x
+our card) — all in the mdc824 write path:
 - Every QuickDraw write crosses the NuBus card FSM ~4-6 clk_sys per
   16-bit half + **RMW read for byte masking** + DDR3 VRAM domain crossing
   (MDC_VRAM_DDR). The real machine writes 32-bit words straight into
@@ -78,15 +96,21 @@ Video 0.523x Mac II — all in the mdc824 write path:
 
 ## Attack ladder (next session order)
 
-1. Exact deltas: owner's physical-P600 numbers into this doc.
-2. **Cache probe hunt** (suggestedtasks #1) → fix fills → re-enable
-   I-cache → re-run Speedometer. Single biggest CPU lever, already
-   scoped, evidence-rich.
+1. **Cache probe hunt** (suggestedtasks #1) → fix fills → re-enable
+   I-cache → Speedometer re-run (watch Sieve/Puzzle/Queens — the
+   cache-signature rows). The single biggest lever by the LC II evidence.
+2. **Slot/DTACK micro-audit** (cheap, kernel-free, measurable) — the
+   other half of the real-LCII 2.5x delta.
 3. **mdc824 write-path RMW/posted-write audit** — self-contained video
-   project, likely the biggest video lever, no kernel risk.
-4. Slot/DTACK micro-audit (cheap, measurable by Speedometer re-run).
-5. D-cache via M10K rework (after 2), 32-bit bus (the big one, own
-   branch, plan first in docs/VASP_RETARGET.md style).
+   project, the 3.1x video gap lives here, no kernel risk.
+4. D-cache via M10K rework (after 1 — same fill engine).
+5. 32-bit bus (the big one, own branch, plan first in
+   docs/VASP_RETARGET.md style; bounded win ~1.6x-class per the
+   P600-vs-LCII residual).
+
+Target: real-LC II parity (4.47) is the honest near-term goal —
+caches + wait-states get us there without touching bus width. P600
+parity (7.14) needs the full ladder.
 
 Measurement discipline: Speedometer on the games volume is now the
 canonical A/B (owner's saved-run folder on the desktop names the
