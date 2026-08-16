@@ -74,7 +74,8 @@ floppy stack (`rtl/swim.v`, `rtl/floppy.v`, `rtl/mfm_track_encoder.v`,
 
 3-WAY (apply the MacLC delta, preserve the documented MacIIvi fixups):
 - `rtl/ncr5380.sv` + `rtl/dataController_top.sv` — fixups: CD_RING_LOG=2,
-  disk RING_LOG i==0?5:4, local comments. (TB_ADDRW i==0?12:8 now MATCHES
+  disk RING_LOG i==0?6:4 (boot ring 32KB since 2026-08-15, owner request;
+  was 5), local comments. (TB_ADDRW i==0?12:8 now MATCHES
   MacLC — 12 is load-bearing: scsi.v TB_SEND_CAP/CAP_LARGE_SEND gate on it.)
 - `rtl/via6522.sv` — IIvi-local hunks flagged "MacIIvi-local" in-file: the
   ORB output-latch read merge (POST root cause #6 — sad Mac $0F/$33 without

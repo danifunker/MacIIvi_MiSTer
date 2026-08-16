@@ -814,11 +814,16 @@ module ncr5380
 			// target is at ID 3 (cdrom_target above). Slot i -> SCSI ID i.
 			//
 			// M10K budget: the mdc824 card VRAM fills block RAM, so adding the CD
-			// read-ring means freeing M10K here. The BOOT disk (ID 0) keeps
-			// RING_LOG=5 — that depth fixed the #2 heavy-read stall on cold 7.5.5
-			// extension loading. The 2nd disk (ID 1, not the boot path) drops to 4
-			// (16-sector / 8KB ring, still 2x the old stall-prone 8), which frees
-			// the M10K the CD's CD_RING_LOG=2 ring needs. Net M10K decreases.
+			// read-ring means freeing M10K here. The BOOT disk (ID 0) runs
+			// RING_LOG=6 (64-sector / 32KB ring — MacIIvi-local 2026-08-15 owner
+			// request: deeper HPS look-ahead for app-load streams; RING_LOG=5
+			// fixed the #2 heavy-read stall on cold 7.5.5 extension loading, and
+			// the old "RING_LOG=6 needs 600 M10K" note in scsi.v predates the
+			// repack that dropped the ram_c/ram_d mirror copies — post-repack the
+			// step is ~13 M10K against 112 free). The 2nd disk (ID 1, not the
+			// boot path) stays at 4 (16-sector / 8KB ring, still 2x the old
+			// stall-prone 8), which frees the M10K the CD's CD_RING_LOG=2 ring
+			// needs.
 			//
 			// TOOLBOX_ENABLE(i==0): the BlueSCSI Toolbox vendor command set is
 			// answered by the boot disk (ID 0) here — MacLC standardized to the
@@ -834,7 +839,7 @@ module ncr5380
 			// (scsi.v TB_SEND_CAP gates on TB_ADDRW >= 12 — do not lower this
 			// while TB_CAPS bit 1 is set). +4 KB of M10K vs the old 11; gate the
 			// next fit on icon integrity per the marginality-anchor law.
-			scsi #(.ID(i[2:0]), .RING_LOG(i == 0 ? 5 : 4), .TOOLBOX_ENABLE(i == 0),
+			scsi #(.ID(i[2:0]), .RING_LOG(i == 0 ? 6 : 4), .TOOLBOX_ENABLE(i == 0),
 			       .TB_ADDRW(i == 0 ? 12 : 8)) target
 			(
 				.clk    ( clk ),
