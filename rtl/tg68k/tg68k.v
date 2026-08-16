@@ -115,7 +115,19 @@ wire  [1:0] tg68_busstate;
 // cache subsystem is in the generate `else` arm (cache_read_hit tied 0), so
 // the bus FSM is provably identical to the uncached design.
 // ---------------------------------------------------------------------------
-localparam USE_68030_CACHE = 1'b1;
+// PARKED 2026-08-16 (owner-sleep session): the fill engine is a measured NET
+// LOSS on HW — same-night, same-volume, same-UI-state, same-CD A/B: no-cache
+// dea200c6 settles ~100s where every 2026-08-15 cache build (poison/retry/
+// kernel-point-v2 captures alike) runs 213-225s, ~2x. All three capture
+// variants land within seconds of each other, so the drag is NOT the capture
+// policy — the open question is when sdram ram_ready actually rises for a
+// fill-BORROWED read on HW (sim's combinational serve cannot answer it; a
+// JTAG counter probe build can: count ready-at-capture hits vs retries vs
+// installs). Friday's 91s-vs-154s same-day win stands as evidence the engine
+// CAN pay — do not delete it; re-enable = flip this + the probe hunt.
+// Stability is NOT the issue: 17 consecutive clean 48MB boots across the
+// three cache builds (capture-v2's clean-only install invariant held).
+localparam USE_68030_CACHE = 1'b0;
 wire        cache_read_hit;     // current CPU access is a cacheable read that HIT the cache
 wire [15:0] cache_kernel_data;  // 16-bit word fed to the kernel on a cache hit (skips the bus)
 wire        cache_fill_pending; // a line-fill request is latched awaiting service (gates turbo)
