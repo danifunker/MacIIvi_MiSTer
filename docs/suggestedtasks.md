@@ -48,7 +48,16 @@ poison (compare per-attempt slot cost), fill borrow slots not actually
 reaching an SDRAM service slot (addrController slot rotation), or ready
 synchronizer lag.
 
-## 2. Fix scsi_bench sweep rot (532 failing cells)
+## 2. ~~Fix scsi_bench sweep rot (532 failing cells)~~ RESOLVED 2026-08-16
+
+**One line: the 2026-08-06 family-sync (965039c) wholesale-recopied the
+bench from MacLC and clobbered the July `--id` default back to 6** — our
+generate maps slot i to SCSI ID i, so id 6 selects nothing and every cell
+is S (the exact July m10k-repack signature, hit a second time). Default
+restored to 0 with a loud comment for the next sync; full sweep = 0
+failing cells again. Chip task_5f610038 superseded. Original text below.
+
+### (historical) 2. Fix scsi_bench sweep rot (532 failing cells)
 
 **Why it matters: CLAUDE.md names this sweep the fast regression gate for
 the whole SCSI read/write path — right now it can't bless anything** (the
