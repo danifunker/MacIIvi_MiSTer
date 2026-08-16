@@ -59,7 +59,7 @@ set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 # 880, cdrom_target 4.8k vs 5.8k, egret ~5.1k both) — the overflow is device
 # fullness, not a port regression. HIGH = maximum register packing density.
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT HIGH
-set_global_assignment -name SEED 6
+set_global_assignment -name SEED 7
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -419,6 +419,10 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 # 4 -> -0.038, 5 -> -0.031 (all HDMI-divclk-only, clk_sys >= +2.1;
 # raw margin positive under the 50ps pad but under policy), 6 -> +0.106
 # PADDED ALL MET. SEED 6.
+# Posted-write mdc824 netlist (capture-on-ready cache + posted VRAM ack,
+# 2026-08-16): 6 -> HDMI divclk -0.122 padded (everything else met,
+# clk_sys +2.081). 2 -> -0.214 (worse). 7 -> +0.094 PADDED ALL MET
+# (ALM 93%). SEED 7.
 # capture-v2+ring netlist (962d60c + 3e7dd2b, +16 M10K ring): 7 -> -0.129
 # (HDMI divclk, clk_sys +2.1); 2 -> +0.091 PADDED all met FIRST ROLL,
 # ALM 93%. SEED 2.
