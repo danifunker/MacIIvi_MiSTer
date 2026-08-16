@@ -4,7 +4,17 @@ Logged 2026-08-16 from the night-run session (see
 `docs/resume_2026-08-16_night_run.md` for the full context). Each entry is
 self-contained enough to start cold.
 
-## 1. Probe why 68030 cache fills drag instead of paying on HW
+## 1. ~~Probe why 68030 cache fills drag instead of paying on HW~~ RESOLVED 2026-08-16
+
+**Closed analytically the same day — no probe build was needed.** See
+`docs/resume_2026-08-16_capture_on_ready.md`: ram_ready is AS-gated-decode
++ extra-slot-clobber + latched-din constrained, the old fixed sample
+points were structurally blind, and the capture-on-strobe rewrite
+(commit on update-CPU) re-enabled the I-cache with Speedometer CPU
+1.805→3.435 / video 0.523→0.711 on HW. The chip task_843cfb7f is
+superseded. Original text kept below for the record.
+
+### (historical) 1. Probe why 68030 cache fills drag instead of paying on HW
 
 **Why it matters: this is the unlock for re-enabling the I-cache** (and the
 path to Friday-class −41% boots, later the D-cache via M10K rework).
