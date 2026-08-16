@@ -96,9 +96,12 @@ our card) — all in the mdc824 write path:
 
 ## Attack ladder (next session order)
 
-1. **Cache probe hunt** (suggestedtasks #1) → fix fills → re-enable
-   I-cache → Speedometer re-run (watch Sieve/Puzzle/Queens — the
-   cache-signature rows). The single biggest lever by the LC II evidence.
+1. ~~**Cache probe hunt**~~ **DONE 2026-08-16** — closed analytically
+   (capture-on-strobe, `docs/resume_2026-08-16_capture_on_ready.md`):
+   Speedometer CPU 1.805 → 3.435, video 0.523 → 0.711 on HW. Gap to the
+   physical P600 now 2.08x CPU / 2.28x video. The SANE FP rows dip 10-13%
+   (fill stall on low-locality code — suggestedtasks #3, word-granular
+   fill yield).
 2. **Slot/DTACK micro-audit** (cheap, kernel-free, measurable) — the
    other half of the real-LCII 2.5x delta.
 3. **mdc824 write-path RMW/posted-write audit** — self-contained video

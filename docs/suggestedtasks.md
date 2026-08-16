@@ -66,3 +66,18 @@ model in `scsi_bench.cpp`). Diagnose why the matrix fails uniformly
 (likely harness/handshake mismatch, not RTL corruption — the same RTL
 passes on real hardware), fix the bench or its C++ HPS model, and restore
 the 0-failing-cells baseline so the gate is trustworthy again.
+
+## 3. Word-granular fill yield (cut the FP-row dip)
+
+Logged 2026-08-16 (capture-on-ready session). The I-cache fills STALL the
+CPU for the whole 8-word borrow (clkena held by `fill_active` in
+rtl/tg68k/tg68k.v) — on low-locality code (Speedometer KWhet/FFT/FPMatrix,
+the SANE software-FP rows) fills are frequent and rarely pay, measuring a
+10-13% REGRESSION vs no-cache while the tight-loop rows gain 2.5-3.9x.
+Design sketch: make the fill engine yield the bus between words — the
+kernel's own cycles take priority, fill words steal only genuinely parked
+windows (the fill stretches; the CPU never waits). Touchy pieces: per-word
+arbitration of the eff_* muxes, the turbo phi2 arm gate
+(cache_fill_pending), and the FILL FSM's word-cycle restart. Expect it to
+recover most of the FP dip and cut the (already-small) fill cost of the
+cache-hot rows further. Measure with the same Speedometer A/B rows.
