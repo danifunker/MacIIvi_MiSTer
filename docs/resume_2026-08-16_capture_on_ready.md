@@ -126,11 +126,11 @@ parked numbers from the owner's morning session/table):
 |---|---:|---:|---:|---:|
 | KWhetstones/sec | 24.213 | 3.316 | 21.770 | 2.982 |
 | Dhrystones/sec | 1344.086 | 1.379 | 1469.867 | 1.508 |
-| Towers (sec) | 7.883 | 1.319 | 6.883 | ~1.51 |
-| Quick Sort | 6.300 | 1.362 | 3.450 | ~2.49 |
-| Bubble Sort | 8.000 | 1.688 | 2.183 | ~6.19 |
-| Queens | 5.967 | 1.279 | 2.283 | ~3.34 |
-| Puzzle | 14.917 | 1.480 | 5.483 | ~4.03 |
+| Towers (sec) | 7.883 | 1.319 | 6.883 | 1.511 |
+| Quick Sort | 6.300 | 1.362 | 3.450 | 2.488 |
+| Bubble Sort | 8.000 | 1.688 | 2.183 | 6.183 |
+| Queens | 5.967 | 1.279 | 2.283 | 3.343 |
+| Puzzle | 14.917 | 1.480 | 5.483 | 4.027 |
 | Permutations | 14.600 | 1.272 | 8.083 | 2.297 |
 | Fast Fourier | 88.433 | 2.213 | 101.967 | 1.919 |
 | F.P. Matrix | 49.367 | 2.190 | 57.917 | 1.867 |
@@ -138,8 +138,7 @@ parked numbers from the owner's morning session/table):
 | Sieve | 16.300 | 1.911 | 4.200 | **7.417** |
 | **Average** | | **1.805** | | **3.435** |
 
-(~ rows were covered by the done-dialog in the first grab; derived as
-parked_rat x parked_abs / cache_abs — confirm from the clean grab.)
+(All ratios confirmed from the redrawn-window grab the owner requested.)
 
 **CPU average 1.805 → 3.435 (+90%).** Gap to the physical P600 (7.136):
 3.95x → **2.08x**. Gap to the physical LC II (4.471): 2.48x → **1.30x**.
