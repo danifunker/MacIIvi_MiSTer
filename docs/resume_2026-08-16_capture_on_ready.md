@@ -215,10 +215,12 @@ Recovery: 6061d52d (validated cache build) redeployed, settled canonical
 
 ## Handoff for the next session (owner: "later this week")
 
-1. **SEED 5 fit of the posted-write netlist was cooking at session end**
-   (auto_compile log in output_files/) — check STA; if met, gate on
-   2 boots + icons + Speedometer BEFORE trusting it (STA alone proved
-   insufficient twice now). Seed history in the qsf.
+1. **SEED 5 posted-write candidate is READY: rbf `dd024dc5`, STA
+   all-met (+0.021 HDMI, thin)** — sitting in output_files/ and NOT
+   deployed. Gate on 2 boots + icons + Speedometer BEFORE trusting it
+   (SEED 7 was STA-met and still a corrupted-fetch netlist). If it
+   fails the same way, stop the seed lottery and shed ALMs (ATC 22->8)
+   or extend the marginality anchors to the fetch path.
 2. If seed-lottery keeps failing: consider the marginality-anchor
    approach (the always-on SCSI anchors precedent) for the fetch path,
    or shed ALMs (PMMU ATC 22→8 is the known ~free knob, evaluated
