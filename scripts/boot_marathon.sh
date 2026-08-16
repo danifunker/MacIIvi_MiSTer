@@ -35,11 +35,28 @@ mean_lum() { # mean luminance of a PNG, integer
   python -c "import sys,numpy as np;from PIL import Image;print(int(np.array(Image.open(sys.argv[1]).convert('L')).mean()))" "$1"
 }
 
-clean_shutdown() { # MacAtrium ESC Quick-Launch menu -> Shut Down (validated path)
-  log "clean shutdown via MacAtrium ESC menu"
-  python scripts/mister_ws.py --delay 0.4 back sleep:1.5 \
-      down down down down down down down down confirm >>"$LOG" 2>&1
+clean_shutdown() { # VERIFIED guest shutdown (owner rule 2026-08-16: never
+  # load_core over a running guest; the old blind ESC-menu sequence was a
+  # landmine — ESC at the carousel is an INSTANT clean Restart, not a menu).
+  # Path: quit MacAtrium (Cmd-Q + confirm) -> Finder -> Special/Shut Down via
+  # the proven mouse drag -> VERIFY the safe-off screen (black, lum ~15-25)
+  # before returning. Verification failure ABORTS the marathon (exit 3) —
+  # never fall back to a dirty load_core.
+  log "verified clean shutdown: quit MacAtrium -> Finder -> Special/Shut Down"
+  python scripts/mac_kbd.py cmd:q sleep:2 key:enter >>"$LOG" 2>&1
+  sleep 6
+  MOUSE_DEV=${MOUSE_DEV:-/dev/input/event13} bash scripts/mac_clean_shutdown.sh >>"$LOG" 2>&1
   sleep "$SHUTDOWN_WAIT"
+  for try in 1 2 3; do
+    if bash scripts/grab_fresh.sh "$OUT/shutdown_verify.png" >>"$LOG" 2>&1; then
+      slum=$(mean_lum "$OUT/shutdown_verify.png")
+      log "shutdown verify: lum=$slum (safe-off screen is ~15-25)"
+      [ "$slum" -lt 45 ] && return 0
+    fi
+    sleep 8
+  done
+  log "ABORT: could not verify the safe-off screen — refusing to dirty-boot"
+  exit 3
 }
 
 fails=0
