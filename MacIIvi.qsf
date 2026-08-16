@@ -429,6 +429,9 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 # write RTL (a protocol bug would fail deterministically at the same
 # probe). Rolling 5 for a different placement; gate any candidate on
 # 2 clean boots + icons + Speedometer, never STA alone.
+# 5 -> +0.021 PADDED all met (thin) = the NEXT-SESSION CANDIDATE, rbf
+# dd024dc5 in output_files — UNVALIDATED (SEED 7 proved STA-met can
+# still be a corrupted-fetch netlist). SEED 5.
 # capture-v2+ring netlist (962d60c + 3e7dd2b, +16 M10K ring): 7 -> -0.129
 # (HDMI divclk, clk_sys +2.1); 2 -> +0.091 PADDED all met FIRST ROLL,
 # ALM 93%. SEED 2.
