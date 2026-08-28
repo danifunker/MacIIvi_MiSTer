@@ -59,7 +59,7 @@ set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 # 880, cdrom_target 4.8k vs 5.8k, egret ~5.1k both) — the overflow is device
 # fullness, not a port regression. HIGH = maximum register packing density.
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT HIGH
-set_global_assignment -name SEED 2
+set_global_assignment -name SEED 6
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -454,6 +454,13 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 # first attempt DIED after a successful 29-min fit because the qsf was
 # edited (a comment!) while the flow ran — error 125085 rewrites the
 # qsf and aborts; asm+sta were run standalone on the surviving db.
+# enet-cache netlist (3f1fb0f, +u64 read cache: ~90 regs + tag compare,
+# all clk_sys, 0 M10K): full sweep — 2 -> -0.020 TNS -0.02, 3 -> -0.016,
+# 4 -> -0.181, 5 -> -0.242, 7 -> -0.387, 6 -> +0.108 PADDED ALL MET
+# (hold +0.242; clk_sys >= +1.57 on every roll, misses HDMI-divclk-only
+# as always). The ~90-ALM cache visibly re-knifed the HDMI edge (~0.19ns
+# off seed 2 vs the pre-cache netlist). ALM 97% (40,746), RAM 63% bits.
+# SEED 6 = the HW-gated build (RBF 1a37587f).
 #
 # BUILD NOTE (2026-08-10): db/ in the repo holds 3 stale version-
 # incompatible files locked by dead quartus_map handles, so Quartus
