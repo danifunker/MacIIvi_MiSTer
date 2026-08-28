@@ -797,6 +797,15 @@ module emu
 	wire        enet_mem_rd, enet_mem_we;
 	wire [63:0] enet_mem_wdata, enet_mem_rdata;
 	wire        enet_mem_rvalid, enet_mem_busy;
+`ifdef DISABLE_ETHERNET
+	assign enet_card_sel = 1'b0;
+	assign enet_card_ack = 1'b0;
+	assign enet_dout     = 16'hFFFF;
+	assign enet_irq      = 1'b0;
+	assign {enet_mem_addr, enet_mem_burst, enet_mem_be,
+	        enet_mem_rd, enet_mem_we, enet_mem_wdata} = 0;
+	assign {enet_mem_rdata, enet_mem_rvalid, enet_mem_busy} = 0;
+`else
 	nubus_enetnbtp nubus_enet (
 		.clk_sys   (clk_sys),
 		.rst_core  (~pll_locked | reset),
@@ -834,6 +843,7 @@ module emu
 		.rvalid(enet_mem_rvalid),
 		.busy  (enet_mem_busy)
 	);
+`endif
 
 	// Ethernet ahead of the mdc824 in the slot mux; a claimed cycle freezes
 	// the open-bus timeout (DDR3-paced cycles can outlast 32 clk) — the

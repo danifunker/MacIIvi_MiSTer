@@ -84,6 +84,10 @@ set_global_assignment -name SEED 7
 # Disable ALSA audio output to save some resources
 #set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
 
+# Compile out the NuBus Ethernet card (slot $C reverts to open-bus; the
+# DDRAM port idles). For CPU-mission fits that want the smaller netlist.
+#set_global_assignment -name VERILOG_MACRO "DISABLE_ETHERNET=1"
+
 # Use real 68HC05 CPU + Egret ROM instead of state machine (cuda_maclc.sv)
 set_global_assignment -name VERILOG_MACRO "USE_EGRET_CPU=1"
 # JTAG forensic probe deck (PSDT/PRST/PFHx/PFLX + dbg_probes): ~2.5-3.5K ALMs.

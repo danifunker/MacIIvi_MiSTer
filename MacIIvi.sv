@@ -98,14 +98,17 @@ module emu
 		"SC4,ISOTO*CUEBINCHD,Mount CD-ROM;",
 		"OI,CD-ROM Drive,Enabled,Disabled;",
 		"-;",
+`ifndef DISABLE_ETHERNET
 		// NuBus Ethernet (slot $C, Apple Ethernet NB Twisted Pair). The
 		// iface/MAC options are Main-owned status bits (mac_eth.cpp reads
 		// them; the FPGA never does) — SAME addresses as the MacLC core so
-		// one Main services both card families.
+		// one Main services both card families. DISABLE_ETHERNET (qsf
+		// VERILOG_MACRO) compiles the whole card out for CPU-mission fits.
 		"OJ,Ethernet,Off,On;",
 		"o45,Net interface,eth0,tap0,macvlan,eth1;",
 		"o03,MAC suffix,0,1,2,3,4,5,6,7,8,9,A,B,C,D,E,F;",
 		"-;",
+`endif
 		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 		"OA,Monitor,640x480 VGA,512x384 12in RGB;",
@@ -1680,8 +1683,18 @@ module emu
 	// otherwise slot $C keeps the open-bus $FFFF timeout below. Card cycles
 	// complete via the existing slot-space stretched-DTACK path (never VPA);
 	// its DDR3 mailbox owns the DDRAM port (assigns at the top of the file).
+	// DISABLE_ETHERNET compiles the card out: the tie-offs below reduce the
+	// slot mux and timeout to exactly the pre-ethernet wiring.
 	// Keep in sync with verilator/sim.v (sim_ddr3-backed there).
 	// ------------------------------------------------------------------------
+`ifdef DISABLE_ETHERNET
+	assign enet_card_sel = 1'b0;
+	assign enet_card_ack = 1'b0;
+	assign enet_dout     = 16'hFFFF;
+	assign enet_irq      = 1'b0;
+	assign {enet_mem_addr, enet_mem_burst, enet_mem_be,
+	        enet_mem_rd, enet_mem_we, enet_mem_wdata} = 0;
+`else
 	nubus_enetnbtp nubus_enet (
 		.clk_sys   (clk_sys),
 		.rst_core  (~pll_locked_s | RESET),
@@ -1707,6 +1720,7 @@ module emu
 		.mem_rvalid(DDRAM_DOUT_READY),
 		.mem_busy  (DDRAM_BUSY)
 	);
+`endif
 
 	// Ethernet ahead of the mdc824 in the slot mux: the cards decode disjoint
 	// slots ($C vs $E), so enet_card_sel is simply "this cycle is the eth
