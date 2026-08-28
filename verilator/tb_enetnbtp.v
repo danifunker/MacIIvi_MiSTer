@@ -37,6 +37,9 @@
  *   9. OSD gate at reset; MAGIC removal mid-session (or across a warm reset)
  *      does NOT drop a latched presence — only OSD-off-at-reset or a core
  *      reload does; the host's startup purge owns stale-MAGIC un-arming.
+ *  10. Card-RAM u64 read cache: a same-u64 re-read (and its $C2 alias)
+ *      serves with no DDR3 trip, any guest card-RAM write invalidates,
+ *      and a host-side poke is stale only inside the ~255-cycle TTL.
  *
  * Build + run (Verilator 5.x, from verilator/):
  *   verilator --binary -j 0 -Wno-fatal --timescale 1ns/1ps \
@@ -143,6 +146,7 @@ module tb_enetnbtp;
 	reg [15:0] rd; reg cl;
 	reg [63:0] e;
 	reg [31:0] wp0;
+	integer nrd0, nrd1;
 
 	initial begin
 		// ── reset, no host ───────────────────────────────────────────────
@@ -257,6 +261,35 @@ module tb_enetnbtp;
 		check(cl && rd == 16'hF00D, "top RAM word round-trips");
 		cpu_cycle(32'hFC020000, 1, 1, 1, 0, 0, rd, cl);
 		check(!cl, "$020000 (past card RAM) is not claimed");
+
+		// ── card-RAM u64 read cache ──────────────────────────────────────
+		// A re-read of the same u64 serves with NO DDR3 trip (the copy-loop
+		// case); any guest card-RAM write invalidates; a host poke lands
+		// within the TTL as documented staleness and reads fresh past it;
+		// the $C2 alias shares the line.
+		dd.poke64(W_CARD + 15'd4, 64'h4847_4645_4443_4241);   // u64 index 4
+		nrd0 = dd.rd_count;
+		cpu_cycle(32'hFC000020, 1, 1, 1, 0, 1, rd, cl);
+		check(cl && rd == 16'h4142, "cache: miss fills and serves lane 0");
+		nrd1 = dd.rd_count;
+		check(nrd1 > nrd0, "cache: the fill issued a DDR3 read");
+		cpu_cycle(32'hFC000026, 1, 1, 1, 0, 1, rd, cl);
+		check(cl && rd == 16'h4748, "cache: same-u64 read serves lane 6");
+		check(dd.rd_count == nrd1, "cache: the hit issued NO DDR3 read");
+		cpu_cycle(32'hFC000030, 0, 1, 1, 16'h9999, 1, rd, cl);   // any RAM write
+		dd.poke64(W_CARD + 15'd4, 64'h5857_5655_5453_5251);
+		cpu_cycle(32'hFC000020, 1, 1, 1, 0, 1, rd, cl);
+		check(cl && rd == 16'h5152, "cache: a guest write invalidates (fresh fetch)");
+		dd.poke64(W_CARD + 15'd4, 64'h6867_6665_6463_6261);
+		cpu_cycle(32'hFC000022, 1, 1, 1, 0, 1, rd, cl);
+		check(cl && rd == 16'h5354, "cache: in-TTL hit holds the cached u64 (bounded staleness)");
+		repeat (300) @(negedge clk);   // > the 255-cycle TTL
+		cpu_cycle(32'hFC000022, 1, 1, 1, 0, 1, rd, cl);
+		check(cl && rd == 16'h6364, "cache: post-TTL read fetches fresh");
+		nrd1 = dd.rd_count;
+		cpu_cycle(32'hFCC20024, 1, 1, 1, 0, 1, rd, cl);
+		check(cl && rd == 16'h6566, "cache: $C2 alias read of the same u64 hits");
+		check(dd.rd_count == nrd1, "cache: the alias hit issued NO DDR3 read");
 
 		// ── declaration ROM (byteLanes $D2: lane-1 x4 expansion) ─────────
 		dd.poke64(W_ROM,           64'hC000_0081_0C00_0001);   // raw bytes 0..7

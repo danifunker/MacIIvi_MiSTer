@@ -186,6 +186,25 @@ module nubus_enetnbtp #(parameter [3:0] SLOT_ID = 4'hC) (
 	                                            : shad_rdata;
 	reg  [16:0] irq_supp;       // irq-suppression countdown (see the FSM decls)
 
+	// ── card-RAM u64 read cache ─────────────────────────────────────────
+	// Every card RAM read is a full DDR3 round trip for 16 of a u64's 64
+	// bits — the guest's RX copy loop fetches each u64 FOUR times, and that
+	// per-word tax is the bulk of this card's CPU cost next to the PDS card
+	// (whose frames land in guest RAM). Cache the last u64 read: tag = card
+	// u64 index (the $C2 alias shares sub[16:3], so it hits the same line —
+	// correct, same RAM). Coherence with the ARM's concurrent writes leans
+	// on the descriptor protocol — payload and descriptor words are final
+	// BEFORE the status publish, and the guest reads them only AFTER its
+	// interrupt, milliseconds later — plus a TTL that bounds any polled-
+	// word staleness to ~7.9 us. Any guest card-RAM write invalidates.
+	// Fill only from a non-aborted DDR3 answer: a watchdog-abandoned read
+	// lands after req_sub has moved on and must not tag the next address.
+	reg  [63:0] rc_data;
+	reg  [13:0] rc_tag;         // card u64 index = sub[16:3]
+	reg         rc_valid;
+	reg  [7:0]  rc_ttl;         // ~7.9 us at clk_sys ~32.5 MHz
+	reg         rc_hit;         // registered verdict for the request in flight
+
 	// ── CPU-side request handshake (all clk_sys, no CDC) ────────────────────
 	localparam H_IDLE = 2'd0, H_RUN = 2'd1, H_DONE = 2'd2;
 	reg  [1:0] hstate;
@@ -320,6 +339,11 @@ module nubus_enetnbtp #(parameter [3:0] SLOT_ID = 4'hC) (
 			irq_supp    <= 17'h0;
 			isr_mask    <= 16'h0;
 			isr_mask_tmr<= 17'h0;
+			rc_data     <= 64'h0;
+			rc_tag      <= 14'h0;
+			rc_valid    <= 1'b0;
+			rc_ttl      <= 8'h0;
+			rc_hit      <= 1'b0;
 			for (i = 0; i < 16; i = i + 1) shad[i] <= 64'h0;
 		end else begin
 			mem_rd <= 0;
@@ -342,6 +366,18 @@ module nubus_enetnbtp #(parameter [3:0] SLOT_ID = 4'hC) (
 			end
 			else if (isr_mask_tmr != 0) isr_mask_tmr <= isr_mask_tmr - 17'd1;
 			else                        isr_mask     <= 16'h0;
+
+			// read-cache lifetime: the TTL bounds ARM-write staleness, any
+			// guest card-RAM write invalidates. The DDR3-answer fill in
+			// S_MEM_RD_D below is later in the block, so a same-cycle fill
+			// wins over the expiry — and a fill can never coincide with a
+			// write's classification (one CPU request at a time).
+			if (rc_valid) begin
+				if (rc_ttl == 8'd0) rc_valid <= 1'b0;
+				else                rc_ttl   <= rc_ttl - 8'd1;
+			end
+			if (hstate == H_IDLE && req && sel_ram && !_cpuRW)
+				rc_valid <= 1'b0;
 
 			// presence can only change while the guest is held in reset; once
 			// running it is frozen so the Slot Manager never sees the card
@@ -369,6 +405,8 @@ module nubus_enetnbtp #(parameter [3:0] SLOT_ID = 4'hC) (
 				req_be    <= {~_cpuUDS, ~_cpuLDS};
 				req_wdata <= cpuDataIn;
 				dout_r    <= 16'hFFFF;
+				// registered cache verdict for this request (consumed in H_RUN)
+				rc_hit    <= rc_valid && _cpuRW && sel_ram && (rc_tag == sub[16:3]);
 				// classify. declROM: only guest bytes 4k/4k+1 carry data (the
 				// lane-1 x4 expansion), so words at sub[1]==1 are a constant
 				// $0000 with no DDR3 trip.
@@ -408,7 +446,13 @@ module nubus_enetnbtp #(parameter [3:0] SLOT_ID = 4'hC) (
 					dout_r <= 16'hFFFF;
 					hstate <= H_DONE;
 				end
-				default: ;   // K_ROM / K_RAMRD / K_RAMWR complete via the mailbox FSM
+				K_RAMRD: if (rc_hit) begin
+					// cache hit: serve the lanes straight from the held u64
+					dout_r[15:8] <= rc_data[{lane,        3'b000} +: 8];
+					dout_r[7:0]  <= rc_data[{lane + 3'd1, 3'b000} +: 8];
+					hstate <= H_DONE;
+				end
+				default: ;   // K_ROM / K_RAMRD-miss / K_RAMWR complete via the mailbox FSM
 				endcase
 			end
 			H_DONE: begin
@@ -441,7 +485,7 @@ module nubus_enetnbtp #(parameter [3:0] SLOT_ID = 4'hC) (
 					mem_addr <= rom_word;
 					mem_rd   <= 1;
 					state    <= S_MEM_RD_W;
-				end else if (hstate == H_RUN && req_kind == K_RAMRD) begin
+				end else if (hstate == H_RUN && req_kind == K_RAMRD && !rc_hit) begin
 					mem_addr <= ram_word;
 					mem_rd   <= 1;
 					state    <= S_MEM_RD_W;
@@ -511,6 +555,12 @@ module nubus_enetnbtp #(parameter [3:0] SLOT_ID = 4'hC) (
 						end else begin
 							dout_r[15:8] <= mem_rdata[{lane,        3'b000} +: 8];
 							dout_r[7:0]  <= mem_rdata[{lane + 3'd1, 3'b000} +: 8];
+							// cache fill: the u64 this answer carries (K_RAMRD
+							// only — h_abort answers never land here)
+							rc_data  <= mem_rdata;
+							rc_tag   <= req_sub[16:3];
+							rc_valid <= 1'b1;
+							rc_ttl   <= 8'd255;
 						end
 						hstate <= H_DONE;
 					end

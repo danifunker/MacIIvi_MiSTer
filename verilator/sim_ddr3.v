@@ -46,11 +46,15 @@ module sim_ddr3 (
 			$readmemh(romfile, mem, 15'h4000, 15'h4FFF);
 	end
 
+	// TB observable: DDR3 reads issued (the read-cache checks count trips)
+	integer rd_count = 0;
+
 	always @(posedge clk) begin
 		rvalid <= 0;
 		if (rd) begin
 			rdata  <= mem[off];
 			rvalid <= 1;
+			rd_count = rd_count + 1;
 		end
 		if (we) begin
 			for (i = 0; i < 8; i = i + 1)
