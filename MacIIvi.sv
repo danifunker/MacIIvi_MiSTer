@@ -28,7 +28,16 @@ module emu
 	// USER_OUT is driven by the mt32pi instance (user-port MIDI + I2C);
 	// unused user-port pins are held at '1 inside sys/mt32pi.sv.
 
-	assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
+	// DDR3 port: wholly owned by the NuBus Ethernet card's shared-memory
+	// mailbox (rtl/nubus/nubus_enetnbtp.sv — Main's mac_eth service serves
+	// the other side).
+	assign DDRAM_CLK      = clk_sys;
+	assign DDRAM_BURSTCNT = enet_mem_burst;
+	assign DDRAM_ADDR     = enet_mem_addr;
+	assign DDRAM_DIN      = enet_mem_wdata;
+	assign DDRAM_BE       = enet_mem_be;
+	assign DDRAM_RD       = enet_mem_rd;
+	assign DDRAM_WE       = enet_mem_we;
 	assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
 	assign LED_USER  = dio_download || (disk_act ^ |diskMotor);
@@ -88,6 +97,14 @@ module emu
 		// translation layer — a 2048-byte-sector .bin also works mounted directly.
 		"SC4,ISOTO*CUEBINCHD,Mount CD-ROM;",
 		"OI,CD-ROM Drive,Enabled,Disabled;",
+		"-;",
+		// NuBus Ethernet (slot $C, Apple Ethernet NB Twisted Pair). The
+		// iface/MAC options are Main-owned status bits (mac_eth.cpp reads
+		// them; the FPGA never does) — SAME addresses as the MacLC core so
+		// one Main services both card families.
+		"OJ,Ethernet,Off,On;",
+		"o45,Net interface,eth0,tap0,macvlan,eth1;",
+		"o03,MAC suffix,0,1,2,3,4,5,6,7,8,9,A,B,C,D,E,F;",
 		"-;",
 		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
@@ -806,6 +823,13 @@ module emu
 	wire [15:0] nubusDataOut;   // slot-space read data (card or open-bus $FFFF)
 	wire        nubusAck_n;     // slot-space DTACK (card ack or open-bus ack)
 	wire        nubus_nmrq_n;   // card VBL IRQ (active low) -> pseudoVIA slot $E
+	// NuBus slot $C: Apple Ethernet NB Twisted Pair (rtl/nubus/nubus_enetnbtp.sv)
+	wire        enet_card_sel, enet_card_ack, enet_irq;
+	wire [15:0] enet_dout;
+	wire [28:0] enet_mem_addr;
+	wire  [7:0] enet_mem_burst, enet_mem_be;
+	wire        enet_mem_rd, enet_mem_we;
+	wire [63:0] enet_mem_wdata;
 	wire [7:0] pseudovia_dout;
 	wire pseudovia_irq;
 
@@ -1513,8 +1537,9 @@ module emu
 		.we(selectPseudoVIA && !_cpuRW && cpuBusControl),
 		.req(selectPseudoVIA && cpuBusControl),
 		.vblank_irq(v8_vblank_s),   // 2FF-synced from the clk_vid scanout domain
-		// NuBus slot IRQs: only slot $E is populated (mdc824 VBL, active low)
-		.slot_irq_c(1'b0),
+		// NuBus slot IRQs: $E = mdc824 VBL (active low), $C = Ethernet SONIC
+		// INT (active high from the card), $D empty
+		.slot_irq_c(enet_irq),
 		.slot_irq_d(1'b0),
 		.slot_irq_e(~nubus_nmrq_n),
 		.asc_irq(asc_irq),
@@ -1648,8 +1673,51 @@ module emu
 		.dout_b(mdc_vram_scan_data)
 	);
 
-	// Empty-slot open bus: slots $C/$D (and any slot cycle the card doesn't
-	// claim) — after 32 clk_sys with no card ack, answer $FFFF with DTACK. The
+	// ------------------------------------------------------------------------
+	// NuBus slot $C — Apple Ethernet NB Twisted Pair (docs/enetnbtp_scope.md).
+	// Claims $FC00'0000-region cycles ONLY when Main's mac_eth service has
+	// published MAGIC (sampled at guest reset) and the OSD option is On —
+	// otherwise slot $C keeps the open-bus $FFFF timeout below. Card cycles
+	// complete via the existing slot-space stretched-DTACK path (never VPA);
+	// its DDR3 mailbox owns the DDRAM port (assigns at the top of the file).
+	// Keep in sync with verilator/sim.v (sim_ddr3-backed there).
+	// ------------------------------------------------------------------------
+	nubus_enetnbtp nubus_enet (
+		.clk_sys   (clk_sys),
+		.rst_core  (~pll_locked_s | RESET),
+		.rst_guest (~_cpuReset | ~_cpuReset_o),
+		.ena_osd   (status[19]),   // OJ list is Off,On -> bit SET = On (default Off)
+		.cpuAddr   (cpuAddr),
+		.cpuDataIn (cpuDataOut),
+		._cpuAS    (_cpuAS),
+		._cpuUDS   (_cpuUDS),
+		._cpuLDS   (_cpuLDS),
+		._cpuRW    (_cpuRW),
+		.card_sel  (enet_card_sel),
+		.card_ack  (enet_card_ack),
+		.card_dout (enet_dout),
+		.irq       (enet_irq),
+		.mem_addr  (enet_mem_addr),
+		.mem_burst (enet_mem_burst),
+		.mem_rd    (enet_mem_rd),
+		.mem_we    (enet_mem_we),
+		.mem_wdata (enet_mem_wdata),
+		.mem_be    (enet_mem_be),
+		.mem_rdata (DDRAM_DOUT),
+		.mem_rvalid(DDRAM_DOUT_READY),
+		.mem_busy  (DDRAM_BUSY)
+	);
+
+	// Ethernet ahead of the mdc824 in the slot mux: the cards decode disjoint
+	// slots ($C vs $E), so enet_card_sel is simply "this cycle is the eth
+	// card's". Its DDR3-paced cycles can legitimately outlast the 32-clk
+	// open-bus horizon, so a claimed cycle also FREEZES the timeout — the
+	// card's own ~4 ms watchdog bounds a dead-DDR3 stall instead.
+	wire [15:0] nubusDataOut_mux = enet_card_sel ? enet_dout      : nubusDataOut_card;
+	wire        nubusAck_mux     = enet_card_sel ? ~enet_card_ack : nubusAck_card;
+
+	// Empty-slot open bus: slots $C/$D (and any slot cycle no card claims) —
+	// after 32 clk_sys with no card ack, answer $FFFF with DTACK. The
 	// Slot Manager reads the $FF "format byte" as slot-empty and moves on
 	// (lbmactwo-validated; TG68 BERR frames are not handler-recoverable, so
 	// no arbiter-timeout BERR here). Was 4 clk: the card's cold-tail ext
@@ -1658,12 +1726,12 @@ module emu
 	reg [5:0] nubus_timeout;
 	always @(posedge clk_sys) begin
 		if (_cpuAS) nubus_timeout <= 6'd0;
-		else if (slot_space && nubusAck_card && !nubus_timeout[5])
+		else if (slot_space && nubusAck_mux && !enet_card_sel && !nubus_timeout[5])
 			nubus_timeout <= nubus_timeout + 6'd1;
 	end
-	wire nubus_no_card = slot_space && nubusAck_card && nubus_timeout[5];
-	assign nubusDataOut = nubus_no_card ? 16'hFFFF : nubusDataOut_card;
-	assign nubusAck_n   = nubus_no_card ? 1'b0    : nubusAck_card;
+	wire nubus_no_card = slot_space && nubusAck_mux && !enet_card_sel && nubus_timeout[5];
+	assign nubusDataOut = nubus_no_card ? 16'hFFFF : nubusDataOut_mux;
+	assign nubusAck_n   = nubus_no_card ? 1'b0    : nubusAck_mux;
 
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video) + the
 	// fetch-history/reset-source forensic recorders. FPGA-only — never in

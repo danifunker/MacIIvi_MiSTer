@@ -783,6 +783,64 @@ module emu
 		.dout_b(mdc_vram_scan_data)
 	);
 
+	// ------------------------------------------------------------------------
+	// NuBus slot $C — Apple Ethernet NB Twisted Pair (mirror of MacIIvi.sv —
+	// keep both tops identical). Backing store is the behavioral sim_ddr3
+	// model instead of the DDRAM port; with no "host" (MAGIC absent) the card
+	// is invisible and slot space behaves exactly as before. +eth_magic /
+	// +eth_rom=<hex> stage the window (scripts/gen_enetnbtp_rom.py --hex).
+	// ------------------------------------------------------------------------
+	wire        enet_card_sel, enet_card_ack, enet_irq;
+	wire [15:0] enet_dout;
+	wire [28:0] enet_mem_addr;
+	wire  [7:0] enet_mem_burst, enet_mem_be;
+	wire        enet_mem_rd, enet_mem_we;
+	wire [63:0] enet_mem_wdata, enet_mem_rdata;
+	wire        enet_mem_rvalid, enet_mem_busy;
+	nubus_enetnbtp nubus_enet (
+		.clk_sys   (clk_sys),
+		.rst_core  (~pll_locked | reset),
+		.rst_guest (~_cpuReset | ~_cpuReset_o),
+		.ena_osd   (1'b1),
+		.cpuAddr   (cpuAddr),
+		.cpuDataIn (cpuDataOut),
+		._cpuAS    (_cpuAS),
+		._cpuUDS   (_cpuUDS),
+		._cpuLDS   (_cpuLDS),
+		._cpuRW    (_cpuRW),
+		.card_sel  (enet_card_sel),
+		.card_ack  (enet_card_ack),
+		.card_dout (enet_dout),
+		.irq       (enet_irq),
+		.mem_addr  (enet_mem_addr),
+		.mem_burst (enet_mem_burst),
+		.mem_rd    (enet_mem_rd),
+		.mem_we    (enet_mem_we),
+		.mem_wdata (enet_mem_wdata),
+		.mem_be    (enet_mem_be),
+		.mem_rdata (enet_mem_rdata),
+		.mem_rvalid(enet_mem_rvalid),
+		.mem_busy  (enet_mem_busy)
+	);
+	sim_ddr3 sim_ddr3 (
+		.clk   (clk_sys),
+		.addr  (enet_mem_addr),
+		.burst (enet_mem_burst),
+		.rd    (enet_mem_rd),
+		.we    (enet_mem_we),
+		.wdata (enet_mem_wdata),
+		.be    (enet_mem_be),
+		.rdata (enet_mem_rdata),
+		.rvalid(enet_mem_rvalid),
+		.busy  (enet_mem_busy)
+	);
+
+	// Ethernet ahead of the mdc824 in the slot mux; a claimed cycle freezes
+	// the open-bus timeout (DDR3-paced cycles can outlast 32 clk) — the
+	// card's own ~4 ms watchdog bounds a dead-DDR3 stall instead.
+	wire [15:0] nubusDataOut_mux = enet_card_sel ? enet_dout      : nubusDataOut_card;
+	wire        nubusAck_mux     = enet_card_sel ? ~enet_card_ack : nubusAck_card;
+
 	// Empty-slot open bus (slots $C/$D): 32 clk with no card ack -> $FFFF+DTACK.
 	// (Was 4 clk — the card's cold-tail ext accesses ride the SDRAM cpu-slot
 	// and ack in ~10-20 clk, which the old horizon would have eaten. Real
@@ -790,12 +848,12 @@ module emu
 	reg [5:0] nubus_timeout;
 	always @(posedge clk_sys) begin
 		if (_cpuAS) nubus_timeout <= 6'd0;
-		else if (slot_space && nubusAck_card && !nubus_timeout[5])
+		else if (slot_space && nubusAck_mux && !enet_card_sel && !nubus_timeout[5])
 			nubus_timeout <= nubus_timeout + 6'd1;
 	end
-	wire nubus_no_card = slot_space && nubusAck_card && nubus_timeout[5];
-	assign nubusDataOut = nubus_no_card ? 16'hFFFF : nubusDataOut_card;
-	assign nubusAck_n   = nubus_no_card ? 1'b0    : nubusAck_card;
+	wire nubus_no_card = slot_space && nubusAck_mux && !enet_card_sel && nubus_timeout[5];
+	assign nubusDataOut = nubus_no_card ? 16'hFFFF : nubusDataOut_mux;
+	assign nubusAck_n   = nubus_no_card ? 1'b0    : nubusAck_mux;
 
 `ifdef SIMULATION
 	// [PROBE] peripheral read logger for the POST identity-check hunt
