@@ -20,7 +20,7 @@
 // Usage: ./obj_dir/Vscsi_bench_top                 full sweep matrix
 //        ... --mode word --ds 0 --gap 2 --detail   single run, per-read log
 //        ... --sectors 4 --hps 6000                transfer size / HPS latency
-//        ... --id 0                                target SCSI ID (slot 0 = ID 0 here; MacLC HEAD uses 6)
+//        ... --id 6                                target SCSI ID (slot 0 = 6 @HEAD)
 
 #include <cstdio>
 #include <cstdint>
@@ -1951,16 +1951,7 @@ int main(int argc, char** argv) {
 	top = new Vscsi_bench_top;
 
 	// defaults
-	int sectors = 2, hps_lat = 600, scsi_id = 0, id_slot = 0;
-	// ^ scsi_id DEFAULT 0, NOT 6 (2026-08-16, second occurrence of the same
-	// rot): this bench arrives by wholesale family-sync from MacLC, whose
-	// tree defaults --id 6; OUR generate maps slot i -> SCSI ID i (family
-	// contract: disks 0/1, CD 3), so id 6 selects NOTHING and every cell
-	// reports S (the July 2026 m10k-repack session hit and fixed exactly
-	// this; the 2026-08-06 sync 965039c clobbered it back to 6 = the "532
-	// failing cells" rot, chip task_5f610038). If a future family-sync
-	// recopies this file, re-apply: the sweep going all-S uniform is THE
-	// signature.
+	int sectors = 2, hps_lat = 600, scsi_id = 6, id_slot = 0;
 	int one_ds = -1, one_gap = -1;
 	const char* one_mode = nullptr;
 	bool detail = false;

@@ -93,14 +93,6 @@ module emu
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 		"OA,Monitor,640x480 VGA,512x384 12in RGB;",
 		"-;",
-		// Machine (O1 = status[1], reset-latched like Memory): selects the
-		// box-ID longword ($5FFFFFFC = $A55A2016 IIvi / $A55A2015 IIvx — the
-		// Performa 600 is a rebadged IIvx and the invented $2017 ID was
-		// HW-falsified, see dataController) AND the CPU speed — the 32 MHz
-		// machine runs the kernel's off-bus beats on both phi edges ("32 MHz"
-		// core on the 16 MHz bus, the real IIvx/P600 shape; tg68k.v
-		// cpu_turbo). Takes effect at the next reset only (R0 below).
-		"O1,Machine,Mac IIvi (16MHz),Performa 600 (32MHz);",
 		// Memory: one line per SDRAM-module tier (O234 = status[4:2]), so only
 		// sizes the fitted module can back are offered. menumask bit 0 = module
 		// >=64MB (from hps_io sdram_sz; H hides when the bit is SET, h when CLEAR).
@@ -177,17 +169,11 @@ module emu
 	always @(posedge clk_sys) if (dio_download && dio_index == 0) rom_loaded <= 1'b1;
 
 	reg [2:0] status_mem = 3'b000;       // latched memory selection (status[4:2])
-	// Machine select (O1, re-added 2026-08-15 for the P600 32MHz mode): latched
-	// at reset exactly like Memory — a live OSD change does nothing until the
-	// next reset ("takes effect between reboots"). Drives BOTH the box-ID
-	// ($A55A2016 IIvi / $A55A2015 IIvx-family P600) and tg68k's cpu_turbo (32 MHz core on
-	// the 16 MHz bus — phi grid, E/VIA pacing and every peripheral rate are
-	// untouched, matching the real P600's 32 MHz 68030 on the IIvi bus).
-	// History: the ORIGINAL O1 machine option was removed 2026-07-13 when P600
-	// mode had no CPU-speed effect; its old status[4] second bit is long since
-	// the Memory field's 3rd bit (O234) — O1 here is a single-bit option.
-	reg       status_machine = 1'b0;     // latched: 0 = IIvi 16MHz, 1 = P600 32MHz
-	localparam [1:0] status_cpu = 2'b10; // TG68K CPU type: 2'b10 = 68030
+	// Machine is hardwired to Mac IIvi ($A55A2016); the Performa 600 OSD option
+	// was removed for the release (P600's 32MHz CPU mode was never enabled — it
+	// ran at 16MHz like the IIvi anyway). status[4] freed by that removal and now
+	// reused as the Memory field's 3rd bit (O234, five sizes 8/20/36/48/68).
+	localparam [1:0] status_cpu = 2'b10; // 68020
 	reg       n_reset = 0;
 	reg       pram_force_reset = 1'b0;  // "Reset PRAM & Core" -> system reset pulse
 	wire      egret_reset_680x0_w;      // Egret HC05 holding 68k in reset (#3 probe)
@@ -214,7 +200,6 @@ module emu
 			else if(rst_cnt) begin
 				rst_cnt     <= rst_cnt - 1'd1;
 				status_mem  <= status[4:2];
-				status_machine <= status[1];
 			end
 			else begin
 				n_reset <= 1;
@@ -990,23 +975,9 @@ module emu
 	reg  dtack_en, mem_latch_d;
 	wire sdram_ram_ready;       // SDRAM read-data-valid (from sdram.v)
 	wire cpu_walk_cycle;        // PMMU walker borrowing the bus (from tg68k dbg_walk_cycle_o)
-	wire cpu_fill_cycle;        // cache line-fill borrowing the bus (tg68k dbg_fill_cycle_o)
 	// SURGICAL gate: ONLY the borrowed PMMU-walk descriptor read waits for real
-	// SDRAM data-valid. Every normal access keeps the fast slot-start ack, so
-	// the known-good cpu-cycle timing (that booted reliably) is left
-	// unperturbed. Cache line-fill reads deliberately do NOT take this gate:
-	// the first cut did (fill_read & sdram_ram_ready) and the build WEDGED in
-	// the boot gray phase on HW, both boots, while sim (no such gate) and STA
-	// were clean — a fill stalled on ram_ready freezes the CPU outright, since
-	// clkena is held for the whole fill. Fills instead ack at slot start like
-	// every normal CPU read and tg68k.v CAPTURES each word on the qualified
-	// strobe edges (fill_data_valid at the tg68k instance below: ram_ready
-	// + cpu-slot + memoryLatch passthrough + RAM/ROM decode, no download/
-	// card-ext override) with a sticky per-word served flag; the end-of-cycle
-	// verdict reads the flag. An unserved word re-runs its slot on a per-line
-	// budget, a spent budget poisons the line and the fill is dropped, never
-	// installed — the stale-dout class costs a retry, not corruption, and can
-	// never stall.
+	// SDRAM data-valid. Every normal access keeps the fast slot-start ack, so the
+	// known-good cpu-cycle timing (that booted reliably) is left unperturbed.
 	wire walk_read = cpu_walk_cycle & (selectRAM | selectVRAM) & _cpuRW;
 	always @(posedge clk_sys) begin
 		if (!_cpuReset) begin
@@ -1364,28 +1335,6 @@ module emu
 		.phi1       ( cpu_en_p  ),
 		.phi2       ( cpu_en_n  ),
 		.cpu        ( 2'b10 ),  // 68030 (Mac LC II); old selectable form: {status_cpu[1], |status_cpu}
-		.cpu_turbo  ( status_machine ),   // P600: 2x off-bus beats (reset-latched)
-		.ram_size_bytes ( ram_size_bytes ),  // bounds the cacheable-RAM decode
-		// Line-fill capture strobe: TRUE only on edges where din is the LIVE
-		// passthrough of the fill word's just-served SDRAM data. Every term is
-		// load-bearing (2026-08-16 root cause of the parked-era 2x drag):
-		//   sdram_ram_ready       — dout holds the word addr currently presented;
-		//   cpuBusControl         — extra slots mux memoryAddr to the floppy
-		//                           staging address UNCONDITIONALLY (idle too) and
-		//                           their read clobbers dout: ready there refers
-		//                           to the FLOPPY word, not ours;
-		//   memoryLatch           — dataController's cpu_data latch passes
-		//                           memoryDataIn through combinationally ONLY on
-		//                           this edge (once per CPU slot); off it, din is
-		//                           a stale latch even while ready is true;
-		//   ~download_cycle,
-		//   ~card_ext_slot        — both override the sdram addr mux entirely;
-		//   selectRAM|selectROM   — the AS-gated decode must be presenting OUR
-		//                           (cacheable) address for the compare to refer
-		//                           to it. Keep in sync with verilator/sim.v.
-		.fill_data_valid ( sdram_ram_ready & cpuBusControl & memoryLatch
-		                   & ~download_cycle & ~card_ext_slot
-		                   & (selectRAM | selectROM) ),
 
 		.dtack_n    ( _cpuDTACK  ),
 		.rw_n       ( tg68_rw    ),
@@ -1425,7 +1374,6 @@ module emu
 				.dbg_pmmu_wdd_o     ( cpu_pmmu_wdd ),
 				.dbg_pmmu_st_o      ( cpu_pmmu_st ),
 				.dbg_walk_cycle_o   ( cpu_walk_cycle ),
-				.dbg_fill_cycle_o   ( cpu_fill_cycle ),
 				.dbg_fline_first_pc ( cpu_fline_first_pc ),
 				.dbg_fline_first_op ( cpu_fline_first_op ),
 				.dbg_fline_last_pc  ( cpu_fline_last_pc  ),
@@ -2176,7 +2124,7 @@ module emu
 		.selectPseudoVIA(selectPseudoVIA),
 		.pseudovia_data_in(pseudovia_dout),
 		.selectBoxID(selectBoxID),
-		.machine_p600(status_machine),   // OSD Machine (O1), reset-latched: box-ID $A55A2015 (IIvx) when P600
+		.machine_p600(1'b0),   // hardwired Mac IIvi (Performa OSD option removed)
 		.selectUnmapped(selectUnmapped),
 		
 		// peripherals

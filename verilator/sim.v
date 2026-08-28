@@ -480,31 +480,12 @@ module emu
 	end
 `endif
 
-	// +p600 plusarg = the FPGA's OSD Machine select (MacIIvi.sv status_machine):
-	// P600 box-ID + cpu_turbo (2x off-bus clkena). Constant through a sim run,
-	// mirroring the reset-latched semantics.
-	reg sim_p600;
-	initial sim_p600 = ($test$plusargs("p600") != 0);
 	tg68k tg68k (
 		.clk        ( clk_sys      ),
 		.reset      ( !_cpuReset ),
 		.phi1       ( cpu_en_p  ),
 		.phi2       ( cpu_en_n  ),
 		.cpu        ( 2'b10 ),  // 68030 (Mac LC II); old selectable form: {status_cpu[1], |status_cpu}
-		.cpu_turbo  ( sim_p600 ),           // P600: 2x off-bus beats
-		.ram_size_bytes ( ram_size_bytes ), // bounds the cacheable-RAM decode
-		// Line-fill capture strobe, sim twin of the MacIIvi.sv expression minus
-		// sdram_ram_ready (sim_ram serves every read in-slot, combinationally —
-		// there is no serve race to detect). The OTHER terms are NOT optional in
-		// sim: din goes through the same dataController cpu_data latch, so it is
-		// the live word only on cpuBusControl && memoryLatch passthrough edges,
-		// and only while the AS-gated decode presents the fill's RAM/ROM address.
-		// An unconditional 1'b1 here would capture stale-latch/open-bus data at
-		// off-window edges (including s7-phi1, after AS drop) and poison every
-		// line in sim. Keep in sync with MacIIvi.sv.
-		.fill_data_valid ( cpuBusControl & memoryLatch
-		                   & ~download_cycle & ~card_ext_slot
-		                   & (selectRAM | selectROM) ),
 
 		.dtack_n    ( _cpuDTACK  ),
 		.rw_n       ( tg68_rw    ),
@@ -1075,9 +1056,9 @@ module emu
 		.selectPseudoVIA(selectPseudoVIA),
 		.pseudovia_data_in(pseudovia_dout),
 		.selectBoxID(selectBoxID),
-		// +p600: Performa 600 identity ($A55A2015, IIvx family) + cpu_turbo 32MHz mode —
-		// the sim twin of MacIIvi.sv's reset-latched OSD Machine (O1) select.
-		.machine_p600(sim_p600),
+		// sim boots as a Mac IIvi; flip to 1'b1 for Performa 600 identity
+		// ($A55A2017) — CLI plumb can come later if A/B runs need it
+		.machine_p600(1'b0),
 		// was left unconnected in the LC II sim (floated 0) — the IIvi RAM
 		// probe depends on unmapped reads returning open-bus $FFFF
 		.selectUnmapped(selectUnmapped),

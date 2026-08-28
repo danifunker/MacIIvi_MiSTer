@@ -130,28 +130,17 @@ int main(int argc, char** argv, char** env) {
     // (0 to 15), so ghdl packs reg index 0 (D0) in the HIGH word: arch register
     // i (0..7 = D0..D7, 8..15 = A0..A7) is Verilator word (15 - i).
     // (Confirmed: debug_regfile_d0 = regfile[511:480], _a7 = regfile[31:0].)
-    // 2026-08-15 (latest 030_mmu kernel): the kernel grew a regfile_shadow
-    // (fault-replay register restore), so ghdl now emits `regfile` as a
-    // combinationally-reloaded VIEW of the true register n17490_q (shadow:
-    // n17492_q) — poking `regfile` is overwritten on the next eval. Inject into
-    // BOTH _q registers (they must stay coherent) plus the view for immediate
-    // readback. These names are POSITIONAL like the usp one — re-derive with
-    //   grep -n "regfile = n\|regfile_shadow = n" rtl/tg68k/TG68KdotC_Kernel.v
-    // after every reconvert and update tg68k_tests.vlt to match.
     auto set_reg = [](int i, uint32_t v) {
-        VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__n17490_q[15 - i] = v;
-        VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__n17492_q[15 - i] = v;
         VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__regfile[15 - i] = v;
     };
     auto get_reg = [](int i) -> uint32_t {
         return VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__regfile[15 - i];
     };
     // USP storage. The kernel's `usp` is a wire fed by an internal register that
-    // ghdl names n17652_q (`assign usp = n17652_q;` in TG68KdotC_Kernel.v). The
+    // ghdl names n16619_q (`assign usp = n16619_q;` in TG68KdotC_Kernel.v). The
     // name is POSITIONAL and changes on every reconvert — re-derive with
     //   grep "assign usp = " rtl/tg68k/TG68KdotC_Kernel.v
-    // and update tg68k_tests.vlt to match. (n15135 -> n16595_q -> n17652_q ->
-    // n17652_q, 2026-08-15 ATC-8 reconvert.) The
+    // and update tg68k_tests.vlt to match. (n15135 -> n16595_q -> n16619_q.) The
     // bench runs in supervisor mode, so USP must be injected separately from the
     // A-regs. If a reconvert renames it, re-derive from that assign and update.
     //
@@ -161,7 +150,7 @@ int main(int argc, char** argv, char** env) {
     // (CCR/D/A/PC/SR) is correct. A proper fix needs a debug-load port on the
     // kernel or a MOVEC-based USP preamble. The non-USP census is the real one.
     auto set_usp = [](uint32_t v) {
-        VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__n17652_q = v;
+        VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__n16619_q = v;
     };
 
     // ---- Register-path probe (--probe-regs) ---------------------------
@@ -187,8 +176,6 @@ int main(int argc, char** argv, char** env) {
         // Immediately inject D0 = 0xDEADBEEF before kernel decodes MOVE.L.
         // regfile is one packed [511:0] signal; D0 is the HIGH word (15).
         const uint32_t d0 = 0xDEADBEEFu;
-        VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__n17490_q[15] = d0;
-        VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__n17492_q[15] = d0;
         VERTOPINTERN->tg68k_tests__DOT__cpu__DOT__regfile[15] = d0;
         std::cerr << "Injected D0 = 0x" << std::hex << d0 << std::dec
                   << " before bus startup\n";

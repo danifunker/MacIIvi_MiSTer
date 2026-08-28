@@ -36,17 +36,9 @@ Key references:
 
 ## Hard rules
 
-- **CPU sync rule** (re-pinned 2026-08-15 by owner request): the CPU upstream
-  is now `../Minimig-AGA_MiSTer` (the 030_mmu lineage, BUG #447–#470 era +
-  LASTWRITE frame fix) — the VHDL in `rtl/tg68k/` is a wholesale LF-normalized
-  copy of their `rtl/tg68k/` (kernel/ALU/PMMU/Cache/Pack + CacheCtrl kept as
-  reference). Kernel fixes land in Minimig-AGA first, then get re-copied —
-  never fork the kernel here. `tg68k.v` (the Mac bus wrapper) is OURS and
-  carries the integration contract: clkena held across the walker-request
-  window and PMMU-busy, force-released on pmmu_fault with beat_valid=0, bus
-  FSM parked during busy/fault, berr-hold with walk_cycle gating, E-clock/VMA,
-  BR/BG/BGACK, autovectoring. The pre-2026-08 MacLCII pin (`a254a02` era, the
-  in-kernel walk-hold gates) is history — see git log of rtl/tg68k/.
+- **CPU sync rule**: `rtl/tg68k/` must stay byte-identical to
+  `../MacLCII_MiSTer` at the pinned commit (currently `a254a02`). CPU fixes
+  land in MacLCII first, then get re-copied. Never fork the kernel here.
 - **Line endings**: repo policy is LF (`core.autocrlf=false`, enforced for
   *.sh via .gitattributes). The sim toolchain runs under **WSL** — CRLF in a
   shell script or Makefile breaks it.
@@ -74,8 +66,7 @@ floppy stack (`rtl/swim.v`, `rtl/floppy.v`, `rtl/mfm_track_encoder.v`,
 
 3-WAY (apply the MacLC delta, preserve the documented MacIIvi fixups):
 - `rtl/ncr5380.sv` + `rtl/dataController_top.sv` — fixups: CD_RING_LOG=2,
-  disk RING_LOG i==0?6:4 (boot ring 32KB since 2026-08-15, owner request;
-  was 5), local comments. (TB_ADDRW i==0?12:8 now MATCHES
+  disk RING_LOG i==0?5:4, local comments. (TB_ADDRW i==0?12:8 now MATCHES
   MacLC — 12 is load-bearing: scsi.v TB_SEND_CAP/CAP_LARGE_SEND gate on it.)
 - `rtl/via6522.sv` — IIvi-local hunks flagged "MacIIvi-local" in-file: the
   ORB output-latch read merge (POST root cause #6 — sad Mac $0F/$33 without
@@ -189,28 +180,9 @@ rows, MAME-captured + IIcx-silicon-adjudicated). The tg68k Verilator bench:
 
 - ROM: 1MB `4957eb49` (CRC32 61be06e5) = `rom/MacIIvx-IIvi-Performa600.rom`;
   loads at CPU $40000000; overlay mirrors it at $0 until first ROM-region read.
-- Box ID: $5FFFFFFC reads $A55A2016 (Mac IIvi) or $A55A2015 (IIvx — the
-  OSD "Machine" O1 32MHz option, reset-latched like Memory; ROM masks #$7
-  → BoxFlag table $4084AB4A). MAME defines ONLY 2015/2016 on this ROM;
-  the old $A55A2017 "Performa 600" guess was HW-falsified 2026-08-15
-  (every System rejects it — the real P600 is a rebadged IIvx and boots
-  with the IIvx ID). The 32MHz machine also runs the CPU at "32 MHz":
-  tg68k.v cpu_turbo pulses kernel clkena on BOTH phi edges for off-bus
-  beats (internal micro-cycles + cache hits) — bus cycles, phi grid, E/VIA
-  pacing and every peripheral rate are untouched (the real P600 shape:
-  32 MHz 68030 on the IIvi's 16 MHz bus).
-- 68030 on-chip I-cache (256B, TG68K_Cache_030) ENABLED 2026-08-15:
-  logical-tagged, physical line fill, CACR-controlled. Cacheable = fitted
-  RAM + ROM only (IIvi 32-bit map decode in tg68k.v); FC=7 (CPU space,
-  the ROM's must-BERR moves probes) and PMMU-busy/fault windows excluded.
-  D-cache present but tied off (USE_68030_DCACHE=0 — did not fit: fabric
-  regs; re-enable = M10K rework). Line-fill reads borrow the parked bus
-  with NORMAL slot-start DTACK; each captured word is retro-checked
-  against sdram_ram_ready and a dirty line is dropped, never installed
-  (fills must never stall the CPU — the DTACK-gated first cut froze HW).
-  Hits bypass the bus only at s_state 0 (cache_hit_beat): an unqualified
-  hit racing a fill-install stranded AS asserted and wedged HW while sim
-  stayed green — the orphaned-AS tripwire in tg68k.v guards this forever.
+- Box ID: $5FFFFFFC reads $A55A2016 (Mac IIvi) or $A55A2017 (Performa 600,
+  OSD "Machine" select; ROM masks #$7 → BoxFlag table $4084AB4A). Both
+  machines run 16MHz for now; P600 32MHz CPU mode is a tracked follow-up.
 - RAM: contiguous at $0 — OSD options 8/20/36/48MB, gated by the fitted
   SDRAM module (hps_io sdram_sz; 36MB+48MB need a 64MB+ module — undersized
   selections clamp; sim: `--ram 4|8|20|36|48|68`, `--sdram-module 32|64|128`

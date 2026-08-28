@@ -1,6 +1,4 @@
 `verilator_config
 public_flat_rw -module "TG68KdotC_Kernel" -var "regfile"
-public_flat_rw -module "TG68KdotC_Kernel" -var "n17490_q"
-public_flat_rw -module "TG68KdotC_Kernel" -var "n17492_q"
-public_flat_rw -module "TG68KdotC_Kernel" -var "n17652_q"
+public_flat_rw -module "TG68KdotC_Kernel" -var "n16619_q"
 // Docs: see the header of SingleStepTests/tg68k/Makefile.

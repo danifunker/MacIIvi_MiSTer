@@ -531,25 +531,15 @@ module nubus_video_mdc824 #(
             if (ack_delay == 3'd1)
                 ack_n <= 1'b0;
 
-            // AS-rise ack release, hoisted out of S_IDLE (2026-08-16 posted
-            // writes): with write acks issued at ACCEPT, the FSM can still be
-            // in a commit state when the CPU ends its cycle — the release
-            // must not wait for S_IDLE or back-to-back writes pay a dead
-            // re-arm clock. Runs after the countdown so its ack_delay <= 0
-            // wins the edge; accept (needs !cpu_as_n) and release (needs
-            // cpu_as_n) are mutually exclusive, and `select` is AS-gated so
-            // the S_IDLE bus_key_changed release below can't fire same-edge.
-            if (cpu_as_n && !ack_n) begin
-                ack_n <= 1'b1;
-                ack_delay <= 3'd0;
-            end
-
             case (state)
                 S_IDLE: begin
                     port_rd_r <= 1'b0;
                     port_wr_r <= 1'b0;
 
-                    if (select && in_our_slot && !ack_n && ack_delay == 3'd0 && bus_key_changed) begin
+                    if (cpu_as_n && !ack_n) begin
+                        ack_n <= 1'b1;
+                        ack_delay <= 3'd0;
+                    end else if (select && in_our_slot && !ack_n && ack_delay == 3'd0 && bus_key_changed) begin
                         ack_n <= 1'b1;
                     end
 
@@ -568,27 +558,14 @@ module nubus_video_mdc824 #(
                                 vram_addr <= VRAM_BASE + {5'd0, cpu_vram_word};
                                 cpu_write_data <= data_in;
                                 cpu_write_strobes <= uds_lds;
-                                // POSTED WRITE (2026-08-16, ladder #3): ack at
-                                // ACCEPT — the commit (S_CPU_WRITE / RMW chain)
-                                // runs in the background while the CPU finishes
-                                // its cycle. Ordering is free: accepts happen
-                                // only in S_IDLE, so any subsequent read or
-                                // write waits until this commit finished (the
-                                // PrimaryInit write-$AAAAAAAA-read-back sizing
-                                // probe stays correct). Write data/strobes are
-                                // latched HERE, so the bus moving on is safe.
-                                // Previously the ack came from
-                                // S_CPU_WRITE_WAIT after port_ready — the CPU
-                                // paid the whole commit latency on every
-                                // QuickDraw store (the dominant term of the
-                                // video-benchmark gap).
-                                ack_delay <= 3'd2;
                                 if (uds_lds == 2'b11) begin
                                     cpu_write_merged <= data_in;
                                     vram_dout <= data_in;
                                     state <= S_CPU_WRITE;
                                 end else if (uds_lds != 2'b00) begin
                                     state <= S_CPU_RMW_READ;
+                                end else begin
+                                    ack_delay <= 3'd2;
                                 end
                             end else begin
                                 ack_delay <= 3'd2;
@@ -646,15 +623,9 @@ module nubus_video_mdc824 #(
                 end
 
                 S_CPU_WRITE_WAIT: begin
-                    // Posted: the ack for this write went out at accept —
-                    // just retire the commit and free the FSM for the next
-                    // accept (which is what actually paces back-to-back
-                    // writes now: BRAM commits finish well inside one CPU
-                    // bus cycle, cold-tail SDRAM commits stall the NEXT
-                    // access at accept, exactly like the old pre-ack stall
-                    // but one access later).
                     if (port_ready) begin
                         port_wr_r <= 1'b0;
+                        ack_delay <= 3'd2;
                         state <= S_IDLE;
                     end
                 end
