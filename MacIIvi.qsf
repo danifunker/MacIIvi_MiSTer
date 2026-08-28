@@ -59,7 +59,7 @@ set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 # 880, cdrom_target 4.8k vs 5.8k, egret ~5.1k both) — the overflow is device
 # fullness, not a port regression. HIGH = maximum register packing density.
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT HIGH
-set_global_assignment -name SEED 7
+set_global_assignment -name SEED 2
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -443,6 +443,17 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 # presented, + soft-reboot + 4:3 + egret): 2 -> +0.078 PADDED all met
 # FIRST ROLL; ALM 94%, RAM 436/553 (79% — the framebuffer is back in
 # M10K, which is the proof vram_ram infers again). SEED 2.
+# enetnbtp netlist (NuBus Ethernet card, ~900 LUT / 1.4k regs, all
+# clk_sys, 0 M10K): 7 -> +0.165 PADDED all met first roll (clk_sys
+# +1.226); 2 -> +0.173 PADDED all met (clk_sys +2.024, better across
+# the board). ALM 97% (40,765), RAM 441/553 unchanged. SEED 2 = the
+# HW-gated build. Judgment lesson: a grab_fresh capture taken right
+# after load_core reads 640x1 (the scaler measuring the still-
+# unconfigured mdc824) — that transient briefly indicted seed 7's
+# video; judge fits on the settled boot screen only. Flow lesson: the
+# first attempt DIED after a successful 29-min fit because the qsf was
+# edited (a comment!) while the flow ran — error 125085 rewrites the
+# qsf and aborts; asm+sta were run standalone on the surviving db.
 #
 # BUILD NOTE (2026-08-10): db/ in the repo holds 3 stale version-
 # incompatible files locked by dead quartus_map handles, so Quartus
