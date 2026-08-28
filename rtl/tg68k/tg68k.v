@@ -8,6 +8,34 @@ module tg68k (
 	input phi1,
 	input phi2,
 	input [1:0] cpu,
+	// Performa 600 mode (latched at core reset by the top): pulse the kernel's
+	// clkena on BOTH phi edges for beats that never touch the Mac bus (internal
+	// busstate=01 micro-cycles and cache read-hits) — "32 MHz" core, 16 MHz bus.
+	// That is the real P600/IIvx shape: 32 MHz 68030 on the IIvi's 16 MHz bus,
+	// so bus cycles, the phi grid, E/VIA pacing and every peripheral rate are
+	// UNTOUCHED. With cpu_turbo=0 the arm is inert and the design is the IIvi.
+	input cpu_turbo,
+	// Contiguous RAM size (from the top's OSD-latched memory config): bounds the
+	// cacheable-region decode so the open-bus tail of the $0xxxxxxx RAM window
+	// ($FFFF pattern-probe space) can never be cached.
+	input [26:0] ram_size_bytes,
+	// Line-fill capture STROBE (level, may be true on several edges per word
+	// cycle): "the SDRAM dout currently holds THIS cycle's word AND din is the
+	// live passthrough of it". MacIIvi.sv wires sdram_ram_ready & cpuBusControl
+	// & memoryLatch & ~download_cycle & ~card_ext_slot & (selectRAM|selectROM);
+	// the sim twin drops ram_ready (sim_ram serves combinationally). Every
+	// term is load-bearing: ram_ready's compare is against the LIVE sdram addr
+	// input, which follows the floppy staging address through every extra slot
+	// and collapses when AS deasserts, and din is a LATCH except during the
+	// memoryLatch passthrough edge — an unqualified ram_ready can be true for
+	// ANOTHER master's word. Fill bus cycles keep the NORMAL slot-start DTACK
+	// (a fill must never be able to stall the CPU); the FILL FSM latches the
+	// word + a sticky served flag on any strobe-true edge and the end-of-cycle
+	// verdict reads the flag. Unserved word -> per-line-budget retry; budget
+	// spent -> line poisoned and dropped at completion, never installed (a
+	// dropped fill is only a future miss; a poisoned line would be silent
+	// corruption).
+	input fill_data_valid,
 
 	input  dtack_n,
 	output rw_n,
@@ -37,6 +65,11 @@ module tg68k (
 
 	// Debug outputs
 	output [1:0] busstate,
+	// 1 while the cache line-fill engine is borrowing the bus. The top's DTACK
+	// glue gates fill READS on real SDRAM data-valid, exactly like the PMMU
+	// walker's dbg_walk_cycle_o: both are borrowed, phase-misaligned accesses
+	// that would otherwise latch stale SDRAM dout (the 10MB-boot Sad Mac class).
+	output        dbg_fill_cycle_o,
 	// continue-past first-fault diagnostic taps (-> dbg_probes)
 	output        dbg_make_berr,
 	output [31:0] dbg_berr_frame_pc,
@@ -68,27 +101,114 @@ module tg68k (
 );
 
 	assign dbg_walk_cycle_o = walk_cycle;
+	assign dbg_fill_cycle_o = fill_active;
+
+	// The latest 030_mmu kernel removed these two forensic taps (replaced by the
+	// debug_rte_fmt_a_* family); keep the wrapper ports for the probe deck.
+	assign dbg_berr_frame_pc = 32'h0;
+	assign dbg_berr_opcode   = 16'h0;
+	assign dbg_exe_opcode    = k_opcode;   // live opcode register (debug_opcode)
 
 wire  [1:0] tg68_busstate;
 
 // ---------------------------------------------------------------------------
 // 68030 on-chip I/D cache enable (TG68K_Cache_030).
-//   0 = run uncached (today's behaviour, every fetch/load hits the Mac bus)
+//   0 = run uncached (every fetch/load hits the Mac bus)
 //   1 = caches live (read-hit bypass + line fill).
-// Kept at 0 until the Phase 5 sim+MAME+FPGA validation. With it 0 the cache
-// subsystem below is in the generate `else` arm (cache_read_hit tied 0), so the
-// bus FSM is provably identical to the uncached design.
+// ENABLED 2026-08-15 (speed session Phase 1) after the glue audit fixed:
+// IIvi 32-bit cacheable decode (was the stale V8 24-bit map), xlate_ready
+// gating (stale-phys fill hazard in the PMMU busy window), FC=7 exclusion
+// (a cached CPU-space line would complete the ROM's MOVES probes that MUST
+// bus-error), and the halfword serve/write byte-lane maps. With it 0 the
+// cache subsystem is in the generate `else` arm (cache_read_hit tied 0), so
+// the bus FSM is provably identical to the uncached design.
 // ---------------------------------------------------------------------------
-localparam USE_68030_CACHE = 1'b0;
+// RE-ENABLED 2026-08-16 (capture-on-ready): the 2026-08-15 "fills never
+// install on HW" mystery is CLOSED, analytically. ram_ready (sdram.v:173,
+// dout_valid && dout_addr == addr) is address-compare-qualified against the
+// LIVE addr input, and three top-level mechanisms make it structurally ZERO
+// at the old fixed sample points:
+//   1. the addrDecoder is AS-gated, so the moment the fill cycle deasserts
+//      AS (s_state 6 phi2) every select drops and memoryAddr collapses —
+//      capture-v2's s7-phi1 sample point read a CONSTANT 0 on HW;
+//   2. dskReadAckInt/Ext assert UNCONDITIONALLY during every extra slot
+//      (idle floppy included), which both muxes memoryAddr away AND issues a
+//      real SDRAM read that OVERWRITES dout with the staging word — dout
+//      persistence dies every 4th slot;
+//   3. the CPU din path is LATCHED in dataController (cpu_data): din equals
+//      live sdram dout ONLY during the cpuBusControl && memoryLatch
+//      passthrough edge (once per CPU slot — exactly the old s6-phi2 edge),
+//      so sampling "later where it's safe" was never an option.
+// Friday's s6-phi2 single-sample (91s boots) worked because it hit the one
+// edge where compare + live data coincide — a razor. The fix removes the
+// point-sample entirely: fill_data_valid is now the QUALIFIED strobe
+// (ram_ready & cpuBusControl & memoryLatch & ~download & ~card_ext &
+// RAM|ROM selects, wired in MacIIvi.sv/sim.v) and the FILL FSM captures
+// on ANY strobe-true edge with a sticky per-word served flag; the s7
+// verdict reads the flag. A word served late persists in dout (writes are
+// the only invalidator) so the retry cycle's first passthrough edge
+// recaptures it without re-racing the SDRAM — self-healing. Stability
+// invariants unchanged: slot-start DTACK (fills can never stall), per-line
+// retry budget, clean-only install (25/25 sad-Mac-free boots night-of).
+localparam USE_68030_CACHE = 1'b1;
 wire        cache_read_hit;     // current CPU access is a cacheable read that HIT the cache
 wire [15:0] cache_kernel_data;  // 16-bit word fed to the kernel on a cache hit (skips the bus)
+wire        cache_fill_pending; // a line-fill request is latched awaiting service (gates turbo)
+// A hit may bypass the bus ONLY while no cycle has launched (s_state 0). The
+// unqualified form wedged real hardware (2026-08-15, both boots, sim+STA
+// clean): a fill's install pulse lands on a phi2 edge; if that same edge
+// advances s_state 0->1 for the still-pending missed access (pre-install
+// i_hit=0), the next phi1 asserts AS at s_state 1 while the now-visible hit
+// forces s_state back to 0 — AS is stranded asserted with the FSM parked,
+// nothing reaches the s_state 6 deassert, and dtack_en latches early off the
+// stale AS-low window, so the NEXT real cycle passes s_state 4 instantly and
+// captures data the SDRAM hasn't served (sim_ram serves combinationally, so
+// simulation cannot see it). With the s_state==0 qualifier a just-launched
+// cycle simply completes on the bus — same fresh data, one redundant read.
+wire        cache_hit_beat = cache_read_hit & (s_state == 3'd0);
 
-// Suppress clkena while the walker is borrowing the bus so the (stalled) CPU
-// pipeline does not advance during a page-table walk. On a cache read-hit the
-// access completes with no bus cycle, so clkena pulses immediately (like a
-// busstate=01 no-access cycle) instead of waiting for s_state 7.
-wire        tg68_clkena = phi1 && (s_state == 7 || tg68_busstate == 2'b01 || cache_read_hit)
-                          && !walk_cycle && !fill_active;
+// clkena discipline for the 030_mmu LATEST kernel (Minimig lineage, imported
+// 2026-08-15). The old LCII kernel carried in-kernel "walk-hold" latch gates so
+// clkena edges during a page-table walk were harmless; the new kernel dropped
+// those in favor of a WRAPPER-side contract (mirrors Minimig cpu_wrapper.v):
+//  - hold clkena while the walker has an outstanding request (pmmu_walker_req),
+//    not just while the borrowed transfer runs (walk_cycle): between descriptor
+//    levels the kernel must NOT advance, or stream latches re-fire on walk
+//    edges and consume descriptor words as opcodes/extension words.
+//  - hold clkena while the PMMU is busy translating (covers the 1-cycle ATC-miss
+//    gap before the walker request rises, their BUG #407) UNLESS it faulted:
+//    on pmmu_fault the CPU must advance to dispatch the bus-error exception.
+//  - a pmmu_fault force-released beat carries NO real data; beat_valid=0 marks
+//    it (see below) so the kernel consumes nothing from the bus.
+wire        kernel_pmmu_busy;                        // kernel debug_pmmu_busy
+wire        kernel_pmmu_fault = dbg_pmmu_fault_o;    // kernel debug_pmmu_fault
+// cpu_turbo (Performa 600 mode) adds a phi2 beat for OFF-BUS work only:
+// internal busstate=01 micro-cycles and cache read-hits, i.e. the kernel core
+// runs at the 32.5 MHz phi-edge rate while every bus cycle keeps the 16 MHz
+// grid (s_state 7 completion and the pmmu_fault force-release stay phi1-only,
+// preserving the proven cycle-start parity). All hold terms (walker request,
+// walk/fill bus borrow, PMMU busy) gate both arms identically.
+// ~cache_fill_pending on the phi2 arm: the line-fill engine samples its start
+// window (busstate=01 @ phi1, s_state 0) at phi1 only — an ungated turbo arm
+// consumes every 1-beat internal window at phi2 first, so fills STARVE and the
+// cache never populates (measured: 14 fills/18 hits vs 200 fills/2M hits over
+// the same boot window). With a fill pending, internal beats fall back to phi1
+// pace until the line is filled; fills are rare once the working set is warm.
+wire        tg68_clkena = (   (phi1 && (s_state == 7 || tg68_busstate == 2'b01 || cache_hit_beat
+                                        || kernel_pmmu_fault))
+                           || (cpu_turbo && phi2 && s_state == 3'd0
+                               && (tg68_busstate == 2'b01 || cache_hit_beat)
+                               && !cache_fill_pending) )
+                          && !walk_cycle && !fill_active
+                          && !pmmu_walker_req
+                          && (!kernel_pmmu_busy || kernel_pmmu_fault);
+// TRUE ready-ack qualifier (new-kernel beat_valid contract): high only when the
+// beat completed via a REAL ack — a bus cycle that reached s_state 7 (DTACK- or
+// BERR-terminated), an internal no-memaccess cycle, or a cache read-hit. The
+// pmmu_fault force-release arm of clkena above is NOT a real ack: beat_valid=0
+// there, so stream latches, extension capture, directPC and opcode retire all
+// skip the garbage beat (their hardware capture: $1B00/$FFFF junk as opcodes).
+wire        tg68_beat_valid = (s_state == 7) || (tg68_busstate == 2'b01) || cache_hit_beat;
 wire [31:0] tg68_addr;
 wire [15:0] tg68_din;
 reg  [15:0] tg68_din_r;
@@ -141,7 +261,7 @@ wire  [3:0] dbg_rf_waddr;
 wire  [7:0] dbg_ustate;
 wire        dbg_use_base;
 wire  [1:0] dbg_setstate, dbg_state;
-wire        dbg_pmmu_busy;        // kernel pmmu_busy (the bsr.w-hold gate)
+wire        dbg_pmmu_busy = kernel_pmmu_busy;  // kernel pmmu_busy (now tapped unconditionally)
 wire [31:0] dbg_memaddr_drega;    // memaddr_delta_rega (held by the bsr.w fix)
 // move.b decode-sequence probes: find where the absolute-EA (ld_nn / set_addrlong)
 // transition is lost when the instruction fetch stalls on a PMMU walk.
@@ -248,10 +368,13 @@ always @(posedge clk) begin
 			if (s_state != 4 && s_state != 3'd0) s_state <= s_state + 1'd1;
 			if (busreq_ack || bus_granted) s_state <= s_state;
 			if (eff_busstate == 2'b01) s_state <= 0;
-			// Cache read-hit: no external bus cycle — hold s_state at 0 (exactly
-			// like a busstate=01 no-access cycle); clkena pulses this phi1 and the
-			// cache supplies the data via the kernel data_in mux below.
-			if (cache_read_hit) s_state <= 0;
+			// Cache read-hit BEAT (hit qualified with s_state==0 — see the
+			// cache_hit_beat note): no external bus cycle — hold s_state at 0
+			// exactly like a busstate=01 no-access cycle; clkena pulses this
+			// phi1 and the cache supplies the data via the kernel data_in mux.
+			// A hit that appears after a cycle launched does NOT park the FSM
+			// (that stranded AS asserted and wedged HW); the cycle completes.
+			if (cache_hit_beat) s_state <= 0;
 
 			case (s_state)
 				1: if (eff_busstate != 2'b01) begin
@@ -278,7 +401,15 @@ always @(posedge clk) begin
 				s_state <= s_state + 1'd1;
 			if ((busreq_ack || bus_granted) && !busrel_ack) s_state <= s_state;
 			if (eff_busstate == 2'b01) s_state <= 0;
-			if (cache_read_hit) s_state <= 0;   // cache read-hit: no bus cycle (see phi1 branch)
+			if (cache_hit_beat) s_state <= 0;   // qualified hit only (see phi1 branch)
+			// PMMU busy/fault: park the bus FSM at s_state 0 so no cycle launches
+			// with an untranslated/stale physical address, and a FAULTED access
+			// runs no bus cycle at all (the new kernel dispatches the exception
+			// off the force-released clkena; mirrors Minimig pmmu_suppress_bus).
+			// Only ever parks — the s_state==0 guard means a cycle already in
+			// flight always completes. walk_cycle/fill_active own the FSM for
+			// borrowed walker/line-fill transfers and are exempt.
+			if (pmmu_bus_park) s_state <= 0;
 
 			case (s_state)
 
@@ -402,6 +533,10 @@ end
 	// (USE_68030_CACHE=0), so this stays cache-free and matches LCII's
 	// expression verbatim for future syncs.
 	wire berr_kernel_cycle = berr & ~walk_cycle & ~fill_active;
+	// Bus-FSM park term for the clkena contract above (declared here, next to
+	// its sibling berr gate; used in the phi2 branch of the s_state FSM).
+	wire pmmu_bus_park = (kernel_pmmu_busy | kernel_pmmu_fault)
+	                     & ~walk_cycle & ~fill_active & (s_state == 3'd0);
 	reg berr_hold;
 	always @(posedge clk) begin
 		if (reset)
@@ -437,10 +572,11 @@ end
 		.clk            ( clk           ),
 		.nReset         ( ~reset        ),
 		.clkena_in      ( tg68_clkena   ),
-		// On a cache read-hit the kernel takes data straight from the cache
-		// (no bus cycle ran, so tg68_din_r is stale); otherwise the latched
-		// bus word. cache_read_hit is constant 0 when USE_68030_CACHE=0.
-		.data_in        ( cache_read_hit ? cache_kernel_data : tg68_din_r ),
+		.beat_valid     ( tg68_beat_valid ),
+		// On a cache read-hit BEAT the kernel takes data straight from the
+		// cache (no bus cycle ran, so tg68_din_r is stale); otherwise the
+		// latched bus word. cache_hit_beat is constant 0 when USE_68030_CACHE=0.
+		.data_in        ( cache_hit_beat ? cache_kernel_data : tg68_din_r ),
 		.IPL            ( ipl           ),
 		.IPL_autovector ( 1'b0          ),
 		.berr           ( berr_held     ),
@@ -471,6 +607,10 @@ end
 		.debug_make_berr ( kernel_make_berr ),
 		.debug_trap_berr ( kernel_trap_berr ),
 
+		// PMMU busy: clkena hold while a translation is pending (new-kernel
+		// contract, their BUG #407 — see the tg68_clkena block above).
+		.debug_pmmu_busy ( kernel_pmmu_busy ),
+
 		// 68030 cache control + PMMU address taps (consumed by the cache below).
 		.pmmu_addr_log      ( cache_addr_log     ),
 		.pmmu_addr_phys     ( cache_addr_phys    ),
@@ -484,11 +624,12 @@ end
 		.cache_op_scope     ( cache_op_scope     ),
 		.cache_op_cache     ( cache_op_cache     ),
 		.cache_op_addr      ( cache_op_addr      ),
-		// continue-past diagnostic taps (always connected)
-		.debug_berr_frame_pc ( dbg_berr_frame_pc ),
+		// continue-past diagnostic taps (always connected). The latest kernel
+		// dropped debug_berr_frame_pc/debug_exe_opcode/debug_berr_opcode (the
+		// richer debug_rte_fmt_a_* family replaced them); the wrapper-level
+		// taps are kept for the MacIIvi.sv/dbg_probes deck — frame-PC and
+		// berr-opcode tie off, exe_opcode maps to the live opcode register.
 		.debug_exe_PC        ( dbg_exe_pc         ),
-		.debug_exe_opcode    ( dbg_exe_opcode     ),
-		.debug_berr_opcode   ( dbg_berr_opcode    ),
 
 		// F-line trap capture taps (always connected; latch block below)
 		.debug_trap_1111           ( k_trap_1111     ),
@@ -518,7 +659,6 @@ end
 		.debug_use_base      ( dbg_use_base  ),
 		.debug_setstate      ( dbg_setstate  ),
 		.debug_state         ( dbg_state     ),
-		.debug_pmmu_busy     ( dbg_pmmu_busy ),
 		.debug_memaddr_delta_rega ( dbg_memaddr_drega ),
 		.debug_next_micro_state ( dbg_next_ustate ),
 		.debug_last_opc_read ( dbg_last_opc    ),
@@ -608,20 +748,55 @@ end
 	generate if (USE_68030_CACHE) begin : gen_cache
 
 		wire        is_030      = (cpu == 2'b10);
-		// Phase 3 wires the real PMMU busy/fault here. During a page-table walk
-		// the kernel forces busstate=01, so i_req/d_req are already 0 and a hit
-		// cannot occur mid-walk regardless of this gate.
-		wire        xlate_ready = 1'b1;
+		// D-cache disabled for AREA (2026-08-15): with both caches the design
+		// needs 4353 LABs on a 4191-LAB device (fitter 170012). The measured
+		// boot win is entirely I-side (the ROM enables only CACR.IE; dhit=0
+		// across the whole 40-frame window), while the D side carries the
+		// heaviest fabric — 2.5k array regs + the 16-line alias-invalidate
+		// comparators. Tying DE off INTO the cache instance sweeps the whole
+		// D side at synthesis with zero VHDL changes (kernel sync law intact);
+		// the kernel's CACR register still accepts and reads back DE writes,
+		// so software-visible semantics are unchanged (a D-cache that never
+		// hits is architecturally transparent). Re-enable path: M10K-backed
+		// cache arrays (follow-up), then flip this localparam.
+		localparam  USE_68030_DCACHE = 1'b0;
+		wire        cacr_de_eff = cacr_de & USE_68030_DCACHE;
+		// Translation freshness: the cache module latches i/d_fill_addr from
+		// cache_addr_phys AT MISS-DETECT TIME. While the PMMU is busy (the 1-2
+		// clk ATC-hit freshness window after the kernel presents a new address,
+		// their BUG #416) cache_addr_phys is STALE — a miss latched there would
+		// fill the new logical tag from the OLD physical page. And a FAULTED
+		// access has no physical address at all (and must consume nothing: a
+		// logical-tag hit on a faulted translation would hand the kernel data
+		// for an access that is dispatching a bus-error). Gate every cache
+		// request on a settled, successful translation.
+		wire        xlate_ready = ~kernel_pmmu_busy & ~kernel_pmmu_fault;
 
 		wire i_req = is_030 & cacr_ie & (tg68_busstate == 2'b00) & xlate_ready;
-		wire d_req = is_030 & cacr_de & (tg68_busstate == 2'b10 || tg68_busstate == 2'b11) & xlate_ready;
+		// FC=7 (CPU space) is never cached on a real 68030. Critically for the
+		// Mac: the ROM's hardware-presence probes are `moves` reads in CPU space
+		// at ordinary RAM addresses that MUST terminate in a bus error (the top
+		// suppresses DTACK). A cached FC=7 line would complete a later probe
+		// from the cache — no bus cycle, no BERR, machine-config corruption.
+		wire d_req = is_030 & cacr_de_eff & (tg68_busstate == 2'b10 || tg68_busstate == 2'b11)
+		             & (fc != 3'b111) & xlate_ready;
 		wire d_we  = (tg68_busstate == 2'b11);
 
-		// Cacheable physical regions on the V8 24-bit map (rtl/addrDecoder.v):
-		// RAM $000000-$9FFFFF + ROM $A00000-$AFFFFF. Excludes unmapped $B-$E and
-		// I/O + VRAM ($F). As on the real 030, cache-inhibit (CI) blocks new
-		// ALLOCATION, not hits on already-present lines.
-		wire        phys_cacheable = (cache_addr_phys[23:20] <= 4'hA);
+		// Cacheable physical regions on the IIvi 32-bit VASP map (must mirror
+		// rtl/addrDecoder.v): fitted RAM (contiguous at $00000000, bounded by
+		// ram_size_bytes so the open-bus probe tail of the $0xxxxxxx window
+		// stays uncached) + ROM ($40000000-$4FFFFFFF, 1MB mirrored). Everything
+		// else — VASP I/O $50xxxxxx, box-ID $5FFFFFFC, onboard VRAM $6xxxxxxx,
+		// NuBus super/slot space $C-$E/$FC-$FE (the mdc824 framebuffer lives
+		// there), unmapped open bus — is never cacheable. The OS's 24-bit-mode
+		// I/O mirrors are PMMU pages onto $50xxxxxx, so they are excluded here
+		// by their PHYSICAL address (and carry CI in the MMU tables besides).
+		// As on the real 030, cache-inhibit blocks new ALLOCATION, not hits on
+		// already-present lines.
+		wire        phys_cacheable =
+		            ((cache_addr_phys[31:27] == 5'b00000) &&
+		             (cache_addr_phys[26:0] < ram_size_bytes))    // RAM
+		          || (cache_addr_phys[31:28] == 4'h4);            // ROM
 		wire        fill_inhibit   = cache_inhibit_pmmu | ~phys_cacheable;
 
 		wire [31:0] i_data, d_data_out;
@@ -640,6 +815,9 @@ end
 		reg          fill_is_i;      // 1 = fill the I-cache, 0 = the D-cache
 		reg  [31:0]  fill_base;      // line-aligned (16-byte) physical base (cache's i/d_fill_addr)
 		reg  [127:0] fill_buf;       // accumulates the 8 read words (word k -> [16k +: 16])
+		reg          fill_dirty;     // a word FAILED past its retry budget -> drop the line
+		reg   [2:0]  fill_retry;     // per-line retry budget spent (a late word re-reads its slot)
+		reg          fill_served;    // sticky: THIS word was captured off a strobe-true edge
 		reg          i_fill_valid_r, d_fill_valid_r;
 
 		assign       fill_active   = (fill_st == FILL_READ);             // bus-owning read phase
@@ -650,24 +828,32 @@ end
 		wire         i_fill_valid = i_fill_valid_r;
 		wire         d_fill_valid = d_fill_valid_r;
 
-		// Write-through byte lane into the D-cache (kernel write data + UDS/LDS).
-		// Inert in Phase 2 (no present lines); Phase 4 makes write-through live.
+		// Write-through byte lanes into the D-cache. The cache line stores the
+		// eight bus words verbatim (fill_buf packing below): 32-bit cache word j
+		// = {bus word 2j+1, bus word 2j}, each bus word = {even byte [15:8],
+		// odd byte [7:0]} exactly as on the 68k bus. A write beat is therefore
+		// fully described by WHICH bus word (addr[1] picks the halfword) and
+		// the UDS/LDS lanes — addr[0] carries no extra information (the bus
+		// encodes it in the strobes), and keying data placement on it corrupted
+		// the offset-3 lanes in the original map (audited 2026-08-15, was
+		// unvalidated Phase-4 scaffolding).
 		reg  [31:0] d_data_in;
 		reg  [3:0]  d_be;
 		always @* begin
-			case (cache_addr_log[1:0])
-				2'b00: begin d_data_in = {16'h0000,   tg68_dout_k};      d_be = {2'b00, ~tg68_uds_n, ~tg68_lds_n}; end
-				2'b01: begin d_data_in = {24'h000000, tg68_dout_k[7:0]}; d_be = {3'b000, ~tg68_lds_n};             end
-				2'b10: begin d_data_in = {tg68_dout_k, 16'h0000};        d_be = {~tg68_uds_n, ~tg68_lds_n, 2'b00}; end
-				2'b11: begin d_data_in = {tg68_dout_k[7:0], 24'h000000}; d_be = {~tg68_uds_n, 3'b000};             end
-			endcase
+			if (!cache_addr_log[1]) begin
+				d_data_in = {16'h0000, tg68_dout_k};
+				d_be      = {2'b00, ~tg68_uds_n, ~tg68_lds_n};
+			end else begin
+				d_data_in = {tg68_dout_k, 16'h0000};
+				d_be      = {~tg68_uds_n, ~tg68_lds_n, 2'b00};
+			end
 		end
 
 		TG68K_Cache_030 cache_inst (
 			.clk             ( clk             ),
 			.nreset          ( ~reset          ),
 			.cacr_ie         ( cacr_ie         ),
-			.cacr_de         ( cacr_de         ),
+			.cacr_de         ( cacr_de_eff     ),   // tied 0: D side swept (area; see above)
 			.cacr_ifreeze    ( cacr_ifreeze    ),
 			.cacr_dfreeze    ( cacr_dfreeze    ),
 			.cacr_wa         ( cacr_wa         ),
@@ -704,24 +890,23 @@ end
 			.d_fill_valid    ( d_fill_valid    )
 		);
 
-		// 16-bit data demux from the 32-bit cache word, matched to how
-		// TG68K_Cache_030 stores/serves words (ported from upstream
-		// TG68K_CacheCtrl_030 — the controller paired with this exact cache).
-		reg [15:0] data_out_16;
-		always @* begin
-			case (cache_addr_log[1:0])
-				2'b00: data_out_16 = (tg68_busstate == 2'b00) ? i_data[15:0]  : d_data_out[15:0];
-				2'b10: data_out_16 = (tg68_busstate == 2'b00) ? i_data[31:16] : d_data_out[31:16];
-				2'b01: data_out_16 = {8'h00, d_data_out[15:8]};
-				2'b11: data_out_16 = {8'h00, d_data_out[31:24]};
-			endcase
-		end
+		// 16-bit serve demux from the 32-bit cache word: hand the kernel the
+		// FULL bus halfword containing the addressed byte(s), exactly as RAM
+		// would drive both lanes — the kernel then picks its own lane per the
+		// access (even byte from [15:8], odd from [7:0], words whole), which is
+		// the identical contract to a real bus read. addr[1] selects the bus
+		// word inside the 32-bit cache word; addr[0] is deliberately unused
+		// (the original per-byte {8'h00, x} cases served the WRONG byte for
+		// odd addresses — audited 2026-08-15).
+		wire [31:0] serve_word   = (tg68_busstate == 2'b00) ? i_data : d_data_out;
+		wire [15:0] data_out_16  = cache_addr_log[1] ? serve_word[31:16] : serve_word[15:0];
 
 		// Read-hit = present I-line on a fetch, or present D-line on a data read
 		// (never a write). Suppressed during a walk and during a fill.
 		assign cache_read_hit    = ~walk_cycle & ~fill_active &
 		                           ((i_hit & i_req) | (d_hit & d_req & ~d_we));
 		assign cache_kernel_data = data_out_16;
+		assign cache_fill_pending = i_fill_req | d_fill_req;
 
 		// Line-fill FSM. The cache asserts i_fill_req/d_fill_req (with i/d_fill_addr,
 		// line-aligned physical) on a read miss and holds it until filled. We service
@@ -739,6 +924,9 @@ end
 				fill_is_i      <= 1'b0;
 				fill_base      <= 32'd0;
 				fill_buf       <= 128'd0;
+				fill_dirty     <= 1'b0;
+				fill_retry     <= 3'd0;
+				fill_served    <= 1'b0;
 				i_fill_valid_r <= 1'b0;
 				d_fill_valid_r <= 1'b0;
 			end else begin
@@ -746,29 +934,110 @@ end
 				d_fill_valid_r <= 1'b0;
 				case (fill_st)
 					FILL_IDLE:
+						// fc != 7: if the kernel's FC output lingers in CPU space on
+						// this internal beat, the top's fc7_berr would suppress DTACK
+						// on the fill's bus reads and the line would fill with junk.
 						if (phi1 && s_state == 3'd0 && tg68_busstate == 2'b01 &&
+						    fc != 3'b111 &&
 						    !walk_cycle && !pmmu_walker_req && (i_fill_req | d_fill_req)) begin
-							fill_st   <= FILL_READ;
-							fill_word <= 3'd0;
-							fill_is_i <= i_fill_req;                        // I-cache has priority
-							fill_base <= i_fill_req ? i_fill_addr : d_fill_addr;
+							fill_st     <= FILL_READ;
+							fill_word   <= 3'd0;
+							fill_dirty  <= 1'b0;
+							fill_retry  <= 3'd0;
+							fill_served <= 1'b0;
+							fill_is_i   <= i_fill_req;                       // I-cache has priority
+							fill_base   <= i_fill_req ? i_fill_addr : d_fill_addr;
 						end
 					FILL_READ: begin
-						if (phi2 && s_state == 3'd6)
-							fill_buf[fill_word*16 +: 16] <= din;     // capture line word k
+						// CAPTURE-ON-STROBE (2026-08-16, the fix for the parked-era
+						// 2x drag): fill_data_valid is the qualified "din is the
+						// live passthrough of THIS word's just-served data" strobe
+						// (see the port comment). Latch the word and the sticky
+						// served flag on ANY strobe-true edge of the word's cycle —
+						// there is exactly one passthrough edge per CPU slot
+						// (memoryLatch), and a word served late persists in sdram
+						// dout (writes are the only invalidator), so the RETRY
+						// cycle recaptures it on its first passthrough edge without
+						// re-racing the SDRAM: self-healing. The parked-era designs
+						// point-sampled ram_ready at one fixed edge instead:
+						// s7-phi1 is structurally AFTER the AS-gated decode
+						// collapses memoryAddr (a constant-0 sample — the cache
+						// never installed, 213-225s boots), and s6-phi2 was the
+						// single coinciding edge (a razor — 91s boots, mostly).
+						// Capture and verdict are now different edges, so neither
+						// races the SDRAM completion.
+						if (fill_data_valid) begin
+							fill_buf[fill_word*16 +: 16] <= din;   // live line word k
+							fill_served <= 1'b1;
+						end
+						// End-of-cycle verdict at phi1 && s_state 7 (the fill
+						// cycle's fixed completion point — slot-start DTACK pacing,
+						// a fill can never stall). Reads the sticky flag, never the
+						// live level (0 here by construction: AS dropped at s6-phi2
+						// and the decode collapsed with it).
 						if (phi1 && s_state == 3'd7) begin
-							if (fill_word != 3'd7)
-								fill_word <= fill_word + 1'b1;       // next word
+							if (!fill_served && fill_retry != 3'd7)
+								fill_retry <= fill_retry + 1'b1;     // unserved: re-run this word's slot
 							else begin
-								fill_st <= FILL_IDLE;                 // 16 bytes read -> populate + done
-								if (fill_is_i) i_fill_valid_r <= 1'b1;
-								else           d_fill_valid_r <= 1'b1;
+								if (!fill_served) fill_dirty <= 1'b1; // budget spent -> poison
+								fill_served <= 1'b0;                  // consume for the next word
+								if (fill_word != 3'd7)
+									fill_word <= fill_word + 1'b1;   // next word
+								else begin
+									fill_st <= FILL_IDLE;             // 16 bytes read -> done
+									// Install only a fully-clean line (fill_dirty =
+									// earlier words, fill_served = THIS word). The
+									// cache holds i/d_fill_req asserted until a
+									// valid pulse arrives (BUG #132 keeps the same
+									// latched line/addr), so a dropped line simply
+									// RETRIES on a later idle window — future
+									// misses, never corruption. (cache_fill_pending
+									// keeps the turbo phi2 arm off meanwhile.)
+									if (!fill_dirty && fill_served) begin
+										if (fill_is_i) i_fill_valid_r <= 1'b1;
+										else           d_fill_valid_r <= 1'b1;
+									end
+								end
 							end
 						end
 					end
 				endcase
 			end
 		end
+
+`ifdef SIMULATION
+		// Cache effectiveness counters (2026-08-15 speed-session measurement
+		// harness): one line per 2^22 clk (~4 frames) — per-window beat/hit/
+		// fill rates + cumulative totals. Costs nothing in synthesis.
+		reg [31:0] cs_cyc;
+		reg [31:0] cs_ihit, cs_dhit, cs_ifill, cs_dfill, cs_beats, cs_busbeats;
+		reg [31:0] ct_ihit, ct_dhit, ct_ifill, ct_dfill;
+		always @(posedge clk) begin
+			if (reset) begin
+				cs_cyc<=0; cs_ihit<=0; cs_dhit<=0; cs_ifill<=0; cs_dfill<=0;
+				cs_beats<=0; cs_busbeats<=0;
+				ct_ihit<=0; ct_dhit<=0; ct_ifill<=0; ct_dfill<=0;
+			end else begin
+				cs_cyc <= cs_cyc + 1'b1;
+				if (tg68_clkena) begin
+					cs_beats <= cs_beats + 1'b1;
+					if (cache_hit_beat) begin
+						if (tg68_busstate == 2'b00) begin cs_ihit <= cs_ihit+1'b1; ct_ihit <= ct_ihit+1'b1; end
+						else                        begin cs_dhit <= cs_dhit+1'b1; ct_dhit <= ct_dhit+1'b1; end
+					end
+					if (s_state == 3'd7) cs_busbeats <= cs_busbeats + 1'b1;
+				end
+				if (i_fill_valid_r) begin cs_ifill <= cs_ifill+1'b1; ct_ifill <= ct_ifill+1'b1; end
+				if (d_fill_valid_r) begin cs_dfill <= cs_dfill+1'b1; ct_dfill <= ct_dfill+1'b1; end
+				if (cs_cyc[21:0] == 22'h3FFFFF) begin
+					$display("CACHE STAT win: beats=%0d bus=%0d ihit=%0d dhit=%0d ifill=%0d dfill=%0d | cum ihit=%0d dhit=%0d ifill=%0d dfill=%0d cacr(ie=%b de=%b) @%0t",
+						cs_beats, cs_busbeats, cs_ihit, cs_dhit, cs_ifill, cs_dfill,
+						ct_ihit, ct_dhit, ct_ifill, ct_dfill, cacr_ie, cacr_de, $time);
+					cs_ihit<=0; cs_dhit<=0; cs_ifill<=0; cs_dfill<=0; cs_beats<=0; cs_busbeats<=0;
+				end
+			end
+		end
+`endif
 
 `ifdef CACHE_TRACE
 		// Cache fill-FSM probe: every state transition (capped) + a stuck-detector
@@ -800,6 +1069,7 @@ end
 	end else begin : no_cache
 		assign cache_read_hit    = 1'b0;
 		assign cache_kernel_data = 16'h0;
+		assign cache_fill_pending = 1'b0;
 		assign fill_active       = 1'b0;
 		assign fill_bus_addr     = 32'd0;
 	end endgenerate
@@ -877,6 +1147,25 @@ end
 			$display("TG68: FETCH PC=%h opcode=%h @%0t", tg68_addr, tg68_din_r, $time);
 	end
 	`endif
+
+`ifdef SIMULATION
+	// Orphaned-AS tripwire (permanent guard; found 2026-08-15): AS asserted
+	// while the bus FSM is parked at s_state 0 with no borrowed master means a
+	// launched cycle was abandoned — the exact hit-vs-launch race that wedged
+	// hardware while simulation stayed green (sim_ram's combinational serve
+	// masks the resulting early-DTACK data hazard, so only this invariant
+	// makes the bug visible in sim). Capped, loud, non-fatal.
+	reg [7:0] orphan_as_cnt = 8'd0;
+	always @(posedge clk) begin
+		if (reset) orphan_as_cnt <= 8'd0;
+		else if (!as_n_r && s_state == 3'd0 && !walk_cycle && !fill_active &&
+		         orphan_as_cnt != 8'hFF) begin
+			orphan_as_cnt <= orphan_as_cnt + 8'd1;
+			$display("TG68K *** ORPHANED AS *** s_state=0 as_n=0 busstate=%b addr=%h hit=%b @%0t",
+			         tg68_busstate, tg68_addr, cache_read_hit, $time);
+		end
+	end
+`endif
 
 	`ifdef PMMU_TRACE
 	// Focused PMMU table-walk + stall probe (does NOT spam per-fetch).

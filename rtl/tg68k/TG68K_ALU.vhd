@@ -1404,15 +1404,17 @@ PROCESS (clk, Reset, exe_opcode, exe_datatype, Flags, last_data_read, OP2out, OP
 				ELSIF Z_error='1' THEN
 					IF micro_state = trap0 THEN
 						IF CPU(1)='1' THEN
-							IF div_word_latched='1' THEN
-								IF div_signed_latched='0' THEN
-									Flags(3 downto 0) <= divu_divzero_flags_68020(div_dividend_latched(47 downto 16), true);
-								ELSE
-									Flags(3 downto 0) <= divs_divzero_flags_68020(Flags(3 downto 0));
-								END IF;
-							ELSIF div_signed_latched='0' THEN
-								Flags(3 downto 0) <= divu_divzero_flags_68020(div_dividend_latched(31 downto 0), false);
-							ELSE
+							-- MC68030: real silicon leaves the CCR COMPLETELY UNCHANGED on an
+							-- UNSIGNED divide-by-zero. Adjudicated on a Macintosh IIcx
+							-- (SingleStepTests maciicx_cpu_2026-06-13, re-read 2026-08-15): all
+							-- four zero-divide rows preserve the pre-trap CCR, including
+							-- DIVU.L with a NONZERO dividend (D0=$100 -> CCR stays $04), which
+							-- refutes the WinUAE dividend-derived N/Z + V=1 model this block
+							-- used to apply (divu_divzero_flags_68020, kept above for
+							-- reference). Musashi/MAME agree (flags untouched). DIVS keeps the
+							-- WinUAE forced N=0/Z=1/C=0/V-kept model - indistinguishable from
+							-- "unchanged" on every silicon row captured so far.
+							IF div_signed_latched='1' THEN
 								Flags(3 downto 0) <= divs_divzero_flags_68020(Flags(3 downto 0));
 							END IF;
 						ELSE

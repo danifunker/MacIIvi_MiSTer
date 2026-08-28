@@ -1,0 +1,34 @@
+[02:19:50] === BOOT 1/3: load_core (cold boot) ===
+FRESH hw_gate/marathon_final/boot1_40s.png (9026 bytes) <- MacIIvi/20260816_022038-screen.png
+[02:20:41]   boot1 +40s lum=147 md5=3847facc
+FRESH hw_gate/marathon_final/boot1_63s.png (10251 bytes) <- MacIIvi/20260816_022055-screen.png
+[02:20:57]   boot1 +63s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_final/boot1_80s.png (6106 bytes) <- MacIIvi/20260816_022112-screen.png
+[02:21:14]   boot1 +80s lum=166 md5=ae044d2b
+FRESH hw_gate/marathon_final/boot1_96s.png (7815 bytes) <- MacIIvi/20260816_022128-screen.png
+[02:21:31]   boot1 +96s lum=248 md5=27710948
+FRESH hw_gate/marathon_final/boot1_113s.png (31261 bytes) <- MacIIvi/20260816_022145-screen.png
+[02:21:47] BOOT 1 verdict: SETTLED at 113s
+[02:21:47] === BOOT 2/3: load_core (cold boot) ===
+FRESH hw_gate/marathon_final/boot2_40s.png (8529 bytes) <- MacIIvi/20260816_022230-screen.png
+[02:22:32]   boot2 +40s lum=147 md5=c39b4fdf
+FRESH hw_gate/marathon_final/boot2_56s.png (10251 bytes) <- MacIIvi/20260816_022246-screen.png
+[02:22:49]   boot2 +56s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_final/boot2_73s.png (6106 bytes) <- MacIIvi/20260816_022303-screen.png
+[02:23:06]   boot2 +73s lum=166 md5=ae044d2b
+FRESH hw_gate/marathon_final/boot2_90s.png (13301 bytes) <- MacIIvi/20260816_022320-screen.png
+[02:23:22]   boot2 +90s lum=190 md5=25c205ed
+FRESH hw_gate/marathon_final/boot2_106s.png (31261 bytes) <- MacIIvi/20260816_022336-screen.png
+[02:23:39] BOOT 2 verdict: SETTLED at 106s
+[02:23:39] === BOOT 3/3: load_core (cold boot) ===
+FRESH hw_gate/marathon_final/boot3_40s.png (8529 bytes) <- MacIIvi/20260816_022421-screen.png
+[02:24:24]   boot3 +40s lum=147 md5=c39b4fdf
+FRESH hw_gate/marathon_final/boot3_57s.png (10251 bytes) <- MacIIvi/20260816_022438-screen.png
+[02:24:40]   boot3 +57s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_final/boot3_73s.png (6106 bytes) <- MacIIvi/20260816_022454-screen.png
+[02:24:57]   boot3 +73s lum=166 md5=ae044d2b
+FRESH hw_gate/marathon_final/boot3_90s.png (13095 bytes) <- MacIIvi/20260816_022511-screen.png
+[02:25:14]   boot3 +90s lum=188 md5=a20e5927
+FRESH hw_gate/marathon_final/boot3_107s.png (31261 bytes) <- MacIIvi/20260816_022528-screen.png
+[02:25:30] BOOT 3 verdict: SETTLED at 107s
+[02:25:30] MARATHON PASS: 3 consecutive clean settles

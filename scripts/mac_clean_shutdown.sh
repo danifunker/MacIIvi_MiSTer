@@ -26,7 +26,15 @@ if [ -r scripts/local.env ]; then . scripts/local.env; fi
 : "${MISTER_HOST:?set MISTER_HOST in scripts/local.env}"
 : "${MISTER_SSH_KEY:?set MISTER_SSH_KEY in scripts/local.env}"
 
-MOUSE_DEV=${MOUSE_DEV:-/dev/input/event9}   # mrext-mouse on .143
+# mrext-mouse renumbers on every MiSTer reboot (event9 in July, event13 on
+# 2026-08-16) — auto-detect it from /proc/bus/input/devices unless MOUSE_DEV
+# is set explicitly.
+if [ -z "${MOUSE_DEV:-}" ]; then
+  MOUSE_DEV=$(ssh -i "$MISTER_SSH_KEY" -o StrictHostKeyChecking=no "root@$MISTER_HOST" \
+    "awk '/Name=\"mrext-mouse\"/{f=1} f&&/Handlers/{for(i=1;i<=NF;i++)if(\$i~/^event/)print \"/dev/input/\"\$i; exit}' /proc/bus/input/devices")
+  [ -n "$MOUSE_DEV" ] || { echo "ERROR: could not auto-detect mrext-mouse device"; exit 1; }
+fi
+echo "mouse device: $MOUSE_DEV"
 
 python - <<'PYEOF' | ssh -i "$MISTER_SSH_KEY" "root@$MISTER_HOST" "cat > $MOUSE_DEV && echo SHUTDOWN_STREAM_DELIVERED"
 import struct, sys, time

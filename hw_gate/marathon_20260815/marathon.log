@@ -1,0 +1,180 @@
+[21:45:51] === BOOT 1/5: load_core (cold boot) ===
+FRESH hw_gate/marathon_20260815/boot1_40s.png (5031 bytes) <- MacIIvi/20260815_214633-screen.png
+[21:46:36]   boot1 +40s lum=237 md5=cfbc92ac
+FRESH hw_gate/marathon_20260815/boot1_57s.png (5031 bytes) <- MacIIvi/20260815_214650-screen.png
+[21:46:52]   boot1 +57s lum=237 md5=cfbc92ac
+FRESH hw_gate/marathon_20260815/boot1_74s.png (5031 bytes) <- MacIIvi/20260815_214706-screen.png
+[21:47:09]   boot1 +74s lum=237 md5=cfbc92ac
+FRESH hw_gate/marathon_20260815/boot1_90s.png (5031 bytes) <- MacIIvi/20260815_214723-screen.png
+[21:47:26]   boot1 +90s lum=237 md5=cfbc92ac
+FRESH hw_gate/marathon_20260815/boot1_107s.png (5031 bytes) <- MacIIvi/20260815_214740-screen.png
+[21:47:42]   boot1 +107s lum=237 md5=cfbc92ac
+FRESH hw_gate/marathon_20260815/boot1_123s.png (5031 bytes) <- MacIIvi/20260815_214756-screen.png
+[21:47:59]   boot1 +123s lum=237 md5=cfbc92ac
+FRESH hw_gate/marathon_20260815/boot1_140s.png (6309 bytes) <- MacIIvi/20260815_214813-screen.png
+[21:48:16]   boot1 +140s lum=135 md5=4e57cd4e
+FRESH hw_gate/marathon_20260815/boot1_157s.png (7906 bytes) <- MacIIvi/20260815_214829-screen.png
+[21:48:32]   boot1 +157s lum=147 md5=72061d67
+FRESH hw_gate/marathon_20260815/boot1_173s.png (8529 bytes) <- MacIIvi/20260815_214846-screen.png
+[21:48:49]   boot1 +173s lum=147 md5=c39b4fdf
+FRESH hw_gate/marathon_20260815/boot1_190s.png (9026 bytes) <- MacIIvi/20260815_214903-screen.png
+[21:49:06]   boot1 +190s lum=147 md5=3847facc
+FRESH hw_gate/marathon_20260815/boot1_207s.png (10251 bytes) <- MacIIvi/20260815_214920-screen.png
+[21:49:22]   boot1 +207s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_20260815/boot1_223s.png (6221 bytes) <- MacIIvi/20260815_214936-screen.png
+[21:49:39]   boot1 +223s lum=166 md5=e5f83112
+FRESH hw_gate/marathon_20260815/boot1_240s.png (6106 bytes) <- MacIIvi/20260815_214953-screen.png
+[21:49:56]   boot1 +240s lum=166 md5=ae044d2b
+FRESH hw_gate/marathon_20260815/boot1_257s.png (6375 bytes) <- MacIIvi/20260815_215010-screen.png
+[21:50:13]   boot1 +257s lum=250 md5=d88cbe57
+FRESH hw_gate/marathon_20260815/boot1_274s.png (29802 bytes) <- MacIIvi/20260815_215026-screen.png
+[21:50:29]   boot1 +274s lum=221 md5=e87b86bd
+FRESH hw_gate/marathon_20260815/boot1_290s.png (33687 bytes) <- MacIIvi/20260815_215043-screen.png
+[21:50:46] BOOT 1 verdict: SETTLED at 290s
+[21:50:46] clean shutdown via MacAtrium ESC menu
+<< indexStatus:y,n,0,0,
+<< coreRunning:MacIIvi
+>> kbd:back
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:confirm
+<< gameRunning:
+[21:51:10] === BOOT 2/5: load_core (cold boot) ===
+FRESH hw_gate/marathon_20260815/boot2_40s.png (7906 bytes) <- MacIIvi/20260815_215152-screen.png
+[21:51:55]   boot2 +40s lum=147 md5=72061d67
+FRESH hw_gate/marathon_20260815/boot2_57s.png (8529 bytes) <- MacIIvi/20260815_215209-screen.png
+[21:52:12]   boot2 +57s lum=147 md5=c39b4fdf
+FRESH hw_gate/marathon_20260815/boot2_74s.png (9026 bytes) <- MacIIvi/20260815_215225-screen.png
+[21:52:28]   boot2 +74s lum=147 md5=3847facc
+FRESH hw_gate/marathon_20260815/boot2_90s.png (10251 bytes) <- MacIIvi/20260815_215242-screen.png
+[21:52:45]   boot2 +90s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_20260815/boot2_107s.png (9785 bytes) <- MacIIvi/20260815_215259-screen.png
+[21:53:01]   boot2 +107s lum=151 md5=aff48b71
+FRESH hw_gate/marathon_20260815/boot2_124s.png (6106 bytes) <- MacIIvi/20260815_215315-screen.png
+[21:53:18]   boot2 +124s lum=166 md5=ae044d2b
+FRESH hw_gate/marathon_20260815/boot2_140s.png (13247 bytes) <- MacIIvi/20260815_215332-screen.png
+[21:53:35]   boot2 +140s lum=188 md5=7e05e11f
+FRESH hw_gate/marathon_20260815/boot2_157s.png (16056 bytes) <- MacIIvi/20260815_215349-screen.png
+[21:53:51]   boot2 +157s lum=232 md5=27d5c5e6
+FRESH hw_gate/marathon_20260815/boot2_173s.png (33687 bytes) <- MacIIvi/20260815_215405-screen.png
+[21:54:08] BOOT 2 verdict: SETTLED at 173s
+[21:54:08] clean shutdown via MacAtrium ESC menu
+<< indexStatus:y,n,0,0,
+<< coreRunning:MacIIvi
+>> kbd:back
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:confirm
+<< gameRunning:
+[21:54:32] === BOOT 3/5: load_core (cold boot) ===
+FRESH hw_gate/marathon_20260815/boot3_40s.png (7906 bytes) <- MacIIvi/20260815_215514-screen.png
+[21:55:17]   boot3 +40s lum=147 md5=72061d67
+FRESH hw_gate/marathon_20260815/boot3_57s.png (8529 bytes) <- MacIIvi/20260815_215531-screen.png
+[21:55:34]   boot3 +57s lum=147 md5=c39b4fdf
+FRESH hw_gate/marathon_20260815/boot3_74s.png (9026 bytes) <- MacIIvi/20260815_215548-screen.png
+[21:55:50]   boot3 +74s lum=147 md5=3847facc
+FRESH hw_gate/marathon_20260815/boot3_90s.png (10251 bytes) <- MacIIvi/20260815_215604-screen.png
+[21:56:07]   boot3 +90s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_20260815/boot3_107s.png (9568 bytes) <- MacIIvi/20260815_215621-screen.png
+[21:56:24]   boot3 +107s lum=154 md5=af14c21f
+FRESH hw_gate/marathon_20260815/boot3_124s.png (6106 bytes) <- MacIIvi/20260815_215637-screen.png
+[21:56:40]   boot3 +124s lum=166 md5=ae044d2b
+FRESH hw_gate/marathon_20260815/boot3_140s.png (12614 bytes) <- MacIIvi/20260815_215654-screen.png
+[21:56:57]   boot3 +140s lum=189 md5=9f288241
+FRESH hw_gate/marathon_20260815/boot3_157s.png (16056 bytes) <- MacIIvi/20260815_215711-screen.png
+[21:57:14]   boot3 +157s lum=232 md5=27d5c5e6
+FRESH hw_gate/marathon_20260815/boot3_174s.png (33687 bytes) <- MacIIvi/20260815_215728-screen.png
+[21:57:30] BOOT 3 verdict: SETTLED at 174s
+[21:57:30] clean shutdown via MacAtrium ESC menu
+<< indexStatus:y,n,0,0,
+<< coreRunning:MacIIvi
+>> kbd:back
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:confirm
+<< gameRunning:
+[21:57:54] === BOOT 4/5: load_core (cold boot) ===
+FRESH hw_gate/marathon_20260815/boot4_40s.png (7906 bytes) <- MacIIvi/20260815_215836-screen.png
+[21:58:39]   boot4 +40s lum=147 md5=72061d67
+FRESH hw_gate/marathon_20260815/boot4_56s.png (8529 bytes) <- MacIIvi/20260815_215853-screen.png
+[21:58:56]   boot4 +56s lum=147 md5=c39b4fdf
+FRESH hw_gate/marathon_20260815/boot4_73s.png (9026 bytes) <- MacIIvi/20260815_215910-screen.png
+[21:59:13]   boot4 +73s lum=147 md5=3847facc
+FRESH hw_gate/marathon_20260815/boot4_90s.png (10251 bytes) <- MacIIvi/20260815_215927-screen.png
+[21:59:29]   boot4 +90s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_20260815/boot4_106s.png (9935 bytes) <- MacIIvi/20260815_215943-screen.png
+[21:59:46]   boot4 +106s lum=147 md5=43449e4c
+FRESH hw_gate/marathon_20260815/boot4_123s.png (6106 bytes) <- MacIIvi/20260815_220000-screen.png
+[22:00:03]   boot4 +123s lum=166 md5=ae044d2b
+FRESH hw_gate/marathon_20260815/boot4_140s.png (12614 bytes) <- MacIIvi/20260815_220017-screen.png
+[22:00:19]   boot4 +140s lum=189 md5=9f288241
+FRESH hw_gate/marathon_20260815/boot4_156s.png (16056 bytes) <- MacIIvi/20260815_220033-screen.png
+[22:00:36]   boot4 +156s lum=232 md5=27d5c5e6
+FRESH hw_gate/marathon_20260815/boot4_173s.png (33687 bytes) <- MacIIvi/20260815_220050-screen.png
+[22:00:52] BOOT 4 verdict: SETTLED at 173s
+[22:00:52] clean shutdown via MacAtrium ESC menu
+<< indexStatus:y,n,0,0,
+<< coreRunning:MacIIvi
+>> kbd:back
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:confirm
+<< gameRunning:
+[22:01:17] === BOOT 5/5: load_core (cold boot) ===
+FRESH hw_gate/marathon_20260815/boot5_40s.png (7906 bytes) <- MacIIvi/20260815_220159-screen.png
+[22:02:02]   boot5 +40s lum=147 md5=72061d67
+FRESH hw_gate/marathon_20260815/boot5_57s.png (8529 bytes) <- MacIIvi/20260815_220215-screen.png
+[22:02:18]   boot5 +57s lum=147 md5=c39b4fdf
+FRESH hw_gate/marathon_20260815/boot5_73s.png (9026 bytes) <- MacIIvi/20260815_220232-screen.png
+[22:02:35]   boot5 +73s lum=147 md5=3847facc
+FRESH hw_gate/marathon_20260815/boot5_90s.png (10251 bytes) <- MacIIvi/20260815_220249-screen.png
+[22:02:52]   boot5 +90s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_20260815/boot5_107s.png (6221 bytes) <- MacIIvi/20260815_220306-screen.png
+[22:03:09]   boot5 +107s lum=166 md5=e5f83112
+FRESH hw_gate/marathon_20260815/boot5_124s.png (6106 bytes) <- MacIIvi/20260815_220322-screen.png
+[22:03:25]   boot5 +124s lum=166 md5=ae044d2b
+FRESH hw_gate/marathon_20260815/boot5_140s.png (12448 bytes) <- MacIIvi/20260815_220339-screen.png
+[22:03:42]   boot5 +140s lum=189 md5=9b862743
+FRESH hw_gate/marathon_20260815/boot5_157s.png (16239 bytes) <- MacIIvi/20260815_220356-screen.png
+[22:03:59]   boot5 +157s lum=232 md5=93b78bcb
+FRESH hw_gate/marathon_20260815/boot5_174s.png (33687 bytes) <- MacIIvi/20260815_220413-screen.png
+[22:04:15] BOOT 5 verdict: SETTLED at 174s
+[22:04:15] clean shutdown via MacAtrium ESC menu
+<< indexStatus:y,n,0,0,
+<< coreRunning:MacIIvi
+>> kbd:back
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:down
+>> kbd:confirm
+<< gameRunning:
+[22:04:39] MARATHON PASS: 5 consecutive clean settles

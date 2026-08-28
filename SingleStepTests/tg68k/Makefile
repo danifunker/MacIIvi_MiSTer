@@ -10,12 +10,12 @@
 # ★ tg68k_tests.vlt gotcha: its lexer rejects a LEADING comment block (syntax
 #   error at the first line of prose, whatever the wording). Comments AFTER the
 #   directives are fine — which is why the documentation lives here instead.
-# ★ n16619_q is a GHDL-GENERATED, POSITIONAL name: it is the register behind
+# ★ n17577_q is a GHDL-GENERATED, POSITIONAL name: it is the register behind
 #   the kernel's `usp` wire, and EVERY reconvert of TG68KdotC_Kernel.vhd
 #   renumbers it. After a reconvert, re-derive with
 #       grep "assign usp = " ../../rtl/tg68k/TG68KdotC_Kernel.v
 #   and update BOTH tg68k_tests.vlt AND the set_usp lambda in sim_main.cpp.
-#   History: n15135 (bench authored) -> n16595_q -> n16619_q.
+#   History: n15135 (bench authored) -> n16595_q -> n16619_q -> n17577_q.
 V       = verilator
 TOP     = --top-module tg68k_tests
 RTL     = ../../rtl

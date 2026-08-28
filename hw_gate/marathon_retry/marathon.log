@@ -1,0 +1,126 @@
+[22:47:13] === BOOT 1/5: load_core (cold boot) ===
+FRESH hw_gate/marathon_retry/boot1_40s.png (6453 bytes) <- MacIIvi/20260815_224755-screen.png
+[22:47:58]   boot1 +40s lum=127 md5=bff2b0e9
+FRESH hw_gate/marathon_retry/boot1_56s.png (7906 bytes) <- MacIIvi/20260815_224812-screen.png
+[22:48:15]   boot1 +56s lum=147 md5=72061d67
+FRESH hw_gate/marathon_retry/boot1_73s.png (8529 bytes) <- MacIIvi/20260815_224829-screen.png
+[22:48:32]   boot1 +73s lum=147 md5=c39b4fdf
+FRESH hw_gate/marathon_retry/boot1_90s.png (9026 bytes) <- MacIIvi/20260815_224846-screen.png
+[22:48:49]   boot1 +90s lum=147 md5=3847facc
+FRESH hw_gate/marathon_retry/boot1_107s.png (10251 bytes) <- MacIIvi/20260815_224902-screen.png
+[22:49:05]   boot1 +107s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_retry/boot1_123s.png (10251 bytes) <- MacIIvi/20260815_224919-screen.png
+[22:49:22]   boot1 +123s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_retry/boot1_140s.png (6221 bytes) <- MacIIvi/20260815_224936-screen.png
+[22:49:39]   boot1 +140s lum=166 md5=e5f83112
+FRESH hw_gate/marathon_retry/boot1_157s.png (6106 bytes) <- MacIIvi/20260815_224953-screen.png
+[22:49:55]   boot1 +157s lum=166 md5=ae044d2b
+FRESH hw_gate/marathon_retry/boot1_173s.png (8496 bytes) <- MacIIvi/20260815_225009-screen.png
+[22:50:12]   boot1 +173s lum=165 md5=056ed9ef
+FRESH hw_gate/marathon_retry/boot1_190s.png (7369 bytes) <- MacIIvi/20260815_225026-screen.png
+[22:50:29]   boot1 +190s lum=249 md5=e8c3d3f5
+FRESH hw_gate/marathon_retry/boot1_207s.png (17887 bytes) <- MacIIvi/20260815_225043-screen.png
+[22:50:45]   boot1 +207s lum=239 md5=2803cb0c
+FRESH hw_gate/marathon_retry/boot1_223s.png (31261 bytes) <- MacIIvi/20260815_225059-screen.png
+[22:51:02] BOOT 1 verdict: SETTLED at 223s
+[22:51:02] === BOOT 2/5: load_core (cold boot) ===
+FRESH hw_gate/marathon_retry/boot2_40s.png (6453 bytes) <- MacIIvi/20260815_225144-screen.png
+[22:51:47]   boot2 +40s lum=127 md5=bff2b0e9
+FRESH hw_gate/marathon_retry/boot2_57s.png (7906 bytes) <- MacIIvi/20260815_225201-screen.png
+[22:52:04]   boot2 +57s lum=147 md5=72061d67
+FRESH hw_gate/marathon_retry/boot2_74s.png (8529 bytes) <- MacIIvi/20260815_225217-screen.png
+[22:52:20]   boot2 +74s lum=147 md5=c39b4fdf
+FRESH hw_gate/marathon_retry/boot2_90s.png (9026 bytes) <- MacIIvi/20260815_225234-screen.png
+[22:52:37]   boot2 +90s lum=147 md5=3847facc
+FRESH hw_gate/marathon_retry/boot2_107s.png (10251 bytes) <- MacIIvi/20260815_225251-screen.png
+[22:52:54]   boot2 +107s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_retry/boot2_124s.png (10251 bytes) <- MacIIvi/20260815_225308-screen.png
+[22:53:10]   boot2 +124s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_retry/boot2_140s.png (6221 bytes) <- MacIIvi/20260815_225324-screen.png
+[22:53:27]   boot2 +140s lum=166 md5=e5f83112
+FRESH hw_gate/marathon_retry/boot2_157s.png (6106 bytes) <- MacIIvi/20260815_225341-screen.png
+[22:53:44]   boot2 +157s lum=166 md5=ae044d2b
+FRESH hw_gate/marathon_retry/boot2_174s.png (8496 bytes) <- MacIIvi/20260815_225358-screen.png
+[22:54:01]   boot2 +174s lum=165 md5=056ed9ef
+FRESH hw_gate/marathon_retry/boot2_191s.png (7369 bytes) <- MacIIvi/20260815_225415-screen.png
+[22:54:18]   boot2 +191s lum=249 md5=e8c3d3f5
+FRESH hw_gate/marathon_retry/boot2_208s.png (19568 bytes) <- MacIIvi/20260815_225432-screen.png
+[22:54:34]   boot2 +208s lum=238 md5=d14174b1
+FRESH hw_gate/marathon_retry/boot2_224s.png (31261 bytes) <- MacIIvi/20260815_225448-screen.png
+[22:54:51] BOOT 2 verdict: SETTLED at 224s
+[22:54:51] === BOOT 3/5: load_core (cold boot) ===
+FRESH hw_gate/marathon_retry/boot3_40s.png (6453 bytes) <- MacIIvi/20260815_225533-screen.png
+[22:55:36]   boot3 +40s lum=127 md5=bff2b0e9
+FRESH hw_gate/marathon_retry/boot3_57s.png (7906 bytes) <- MacIIvi/20260815_225550-screen.png
+[22:55:53]   boot3 +57s lum=147 md5=72061d67
+FRESH hw_gate/marathon_retry/boot3_74s.png (8529 bytes) <- MacIIvi/20260815_225606-screen.png
+[22:56:09]   boot3 +74s lum=147 md5=c39b4fdf
+FRESH hw_gate/marathon_retry/boot3_90s.png (9026 bytes) <- MacIIvi/20260815_225623-screen.png
+[22:56:26]   boot3 +90s lum=147 md5=3847facc
+FRESH hw_gate/marathon_retry/boot3_107s.png (10251 bytes) <- MacIIvi/20260815_225640-screen.png
+[22:56:43]   boot3 +107s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_retry/boot3_124s.png (10251 bytes) <- MacIIvi/20260815_225656-screen.png
+[22:56:59]   boot3 +124s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_retry/boot3_140s.png (6221 bytes) <- MacIIvi/20260815_225713-screen.png
+[22:57:16]   boot3 +140s lum=166 md5=e5f83112
+FRESH hw_gate/marathon_retry/boot3_157s.png (6106 bytes) <- MacIIvi/20260815_225730-screen.png
+[22:57:33]   boot3 +157s lum=166 md5=ae044d2b
+FRESH hw_gate/marathon_retry/boot3_174s.png (7079 bytes) <- MacIIvi/20260815_225746-screen.png
+[22:57:49]   boot3 +174s lum=165 md5=e7662808
+FRESH hw_gate/marathon_retry/boot3_190s.png (7369 bytes) <- MacIIvi/20260815_225803-screen.png
+[22:58:06]   boot3 +190s lum=249 md5=e8c3d3f5
+FRESH hw_gate/marathon_retry/boot3_207s.png (16026 bytes) <- MacIIvi/20260815_225820-screen.png
+[22:58:23]   boot3 +207s lum=240 md5=de0c673e
+FRESH hw_gate/marathon_retry/boot3_224s.png (31261 bytes) <- MacIIvi/20260815_225837-screen.png
+[22:58:39] BOOT 3 verdict: SETTLED at 224s
+[22:58:39] === BOOT 4/5: load_core (cold boot) ===
+FRESH hw_gate/marathon_retry/boot4_40s.png (6453 bytes) <- MacIIvi/20260815_225921-screen.png
+[22:59:24]   boot4 +40s lum=127 md5=bff2b0e9
+FRESH hw_gate/marathon_retry/boot4_57s.png (7906 bytes) <- MacIIvi/20260815_225938-screen.png
+[22:59:41]   boot4 +57s lum=147 md5=72061d67
+FRESH hw_gate/marathon_retry/boot4_74s.png (8529 bytes) <- MacIIvi/20260815_225955-screen.png
+[22:59:57]   boot4 +74s lum=147 md5=c39b4fdf
+FRESH hw_gate/marathon_retry/boot4_91s.png (9026 bytes) <- MacIIvi/20260815_230011-screen.png
+[23:00:14]   boot4 +91s lum=147 md5=3847facc
+FRESH hw_gate/marathon_retry/boot4_107s.png (10251 bytes) <- MacIIvi/20260815_230028-screen.png
+[23:00:31]   boot4 +107s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_retry/boot4_124s.png (10251 bytes) <- MacIIvi/20260815_230045-screen.png
+[23:00:47]   boot4 +124s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_retry/boot4_141s.png (6221 bytes) <- MacIIvi/20260815_230101-screen.png
+[23:01:04]   boot4 +141s lum=166 md5=e5f83112
+FRESH hw_gate/marathon_retry/boot4_157s.png (6106 bytes) <- MacIIvi/20260815_230118-screen.png
+[23:01:21]   boot4 +157s lum=166 md5=ae044d2b
+FRESH hw_gate/marathon_retry/boot4_174s.png (7229 bytes) <- MacIIvi/20260815_230135-screen.png
+[23:01:38]   boot4 +174s lum=165 md5=7c554666
+FRESH hw_gate/marathon_retry/boot4_191s.png (7369 bytes) <- MacIIvi/20260815_230152-screen.png
+[23:01:55]   boot4 +191s lum=249 md5=e8c3d3f5
+FRESH hw_gate/marathon_retry/boot4_208s.png (18674 bytes) <- MacIIvi/20260815_230209-screen.png
+[23:02:12]   boot4 +208s lum=238 md5=ef2a0124
+FRESH hw_gate/marathon_retry/boot4_225s.png (31261 bytes) <- MacIIvi/20260815_230225-screen.png
+[23:02:28] BOOT 4 verdict: SETTLED at 225s
+[23:02:28] === BOOT 5/5: load_core (cold boot) ===
+FRESH hw_gate/marathon_retry/boot5_40s.png (6453 bytes) <- MacIIvi/20260815_230310-screen.png
+[23:03:13]   boot5 +40s lum=127 md5=bff2b0e9
+FRESH hw_gate/marathon_retry/boot5_57s.png (7906 bytes) <- MacIIvi/20260815_230327-screen.png
+[23:03:30]   boot5 +57s lum=147 md5=72061d67
+FRESH hw_gate/marathon_retry/boot5_74s.png (8529 bytes) <- MacIIvi/20260815_230344-screen.png
+[23:03:47]   boot5 +74s lum=147 md5=c39b4fdf
+FRESH hw_gate/marathon_retry/boot5_91s.png (9026 bytes) <- MacIIvi/20260815_230401-screen.png
+[23:04:04]   boot5 +91s lum=147 md5=3847facc
+FRESH hw_gate/marathon_retry/boot5_108s.png (10251 bytes) <- MacIIvi/20260815_230417-screen.png
+[23:04:20]   boot5 +108s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_retry/boot5_124s.png (10251 bytes) <- MacIIvi/20260815_230434-screen.png
+[23:04:37]   boot5 +124s lum=147 md5=ef05d77f
+FRESH hw_gate/marathon_retry/boot5_141s.png (6221 bytes) <- MacIIvi/20260815_230451-screen.png
+[23:04:54]   boot5 +141s lum=166 md5=e5f83112
+FRESH hw_gate/marathon_retry/boot5_158s.png (6106 bytes) <- MacIIvi/20260815_230508-screen.png
+[23:05:11]   boot5 +158s lum=166 md5=ae044d2b
+FRESH hw_gate/marathon_retry/boot5_175s.png (8496 bytes) <- MacIIvi/20260815_230525-screen.png
+[23:05:27]   boot5 +175s lum=165 md5=056ed9ef
+FRESH hw_gate/marathon_retry/boot5_191s.png (7435 bytes) <- MacIIvi/20260815_230541-screen.png
+[23:05:44]   boot5 +191s lum=248 md5=90a13ae0
+FRESH hw_gate/marathon_retry/boot5_208s.png (22497 bytes) <- MacIIvi/20260815_230558-screen.png
+[23:06:01]   boot5 +208s lum=234 md5=976b07a2
+FRESH hw_gate/marathon_retry/boot5_225s.png (31261 bytes) <- MacIIvi/20260815_230615-screen.png
+[23:06:17] BOOT 5 verdict: SETTLED at 225s
+[23:06:18] MARATHON PASS: 5 consecutive clean settles
